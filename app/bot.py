@@ -49,6 +49,16 @@ class TelegramApp:
         except Exception:
             pass
 
+    async def _reset_panel(self, chat_id: int) -> None:
+        """Move the control panel to the bottom without touching notifications."""
+        if self.panel_message_id is not None:
+            try:
+                await self.bot.delete_message(chat_id, self.panel_message_id)
+            except Exception:
+                # It may already have been deleted manually or by Telegram.
+                pass
+        self.panel_message_id = None
+
     async def _edit_panel(self, text: str, reply_markup=None, chat_id: int | None = None) -> None:
         chat_id = chat_id or self.settings.telegram_allowed_user_id
         if self.panel_message_id is not None:
@@ -218,6 +228,7 @@ class TelegramApp:
         if state:
             await state.clear()
         await self._delete_input(message)
+        await self._reset_panel(message.chat.id)
         await self._home(message.chat.id)
 
     async def help(self, message: Message) -> None:
