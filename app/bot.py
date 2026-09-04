@@ -265,6 +265,7 @@ class TelegramApp:
             return
         parts = (message.text or "").split()
         if len(parts) == 2:
+            await self._delete_input(message)
             await self._save_leader(parts[1], message.chat.id)
         else:
             await state.set_state(LeaderForm.address)
