@@ -1,0 +1,1 @@
+"""PolyCopy application package."""

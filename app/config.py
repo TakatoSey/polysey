@@ -1,0 +1,32 @@
+from decimal import Decimal
+from functools import lru_cache
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    telegram_bot_token: str = Field(alias="TELEGRAM_BOT_TOKEN")
+    telegram_allowed_user_id: int = Field(alias="TELEGRAM_ALLOWED_USER_ID")
+    database_url: str = Field(
+        default="postgresql+asyncpg://polycopy:polycopy@db:5432/polycopy",
+        alias="DATABASE_URL",
+    )
+    paper_initial_balance: Decimal = Field(default=Decimal("100"), alias="PAPER_INITIAL_BALANCE")
+    poll_interval_seconds: float = Field(default=2.0, alias="POLL_INTERVAL_SECONDS")
+    copy_latency_seconds: float = Field(default=1.0, alias="COPY_LATENCY_SECONDS")
+    default_trade_size: Decimal = Field(default=Decimal("5"), alias="DEFAULT_TRADE_SIZE")
+    max_trade_size: Decimal = Field(default=Decimal("10"), alias="MAX_TRADE_SIZE")
+    default_slippage_bps: int = Field(default=500, alias="DEFAULT_SLIPPAGE_BPS")
+    data_api: str = Field(default="https://data-api.polymarket.com", alias="POLYMARKET_DATA_API")
+    clob_api: str = Field(default="https://clob.polymarket.com", alias="POLYMARKET_CLOB")
+    gamma_api: str = Field(default="https://gamma-api.polymarket.com", alias="POLYMARKET_GAMMA")
+    default_leader_address: str | None = Field(default=None, alias="DEFAULT_LEADER_ADDRESS")
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
