@@ -21,7 +21,7 @@
 ## Запуск на VPS
 
 ```bash
-git clone <репозиторий> polycopy
+git clone https://github.com/TakatoSey/polysey.git polycopy
 cd polycopy
 cp .env.example .env
 nano .env
