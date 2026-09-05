@@ -92,10 +92,11 @@ class TelegramApp:
             ("📋 Ордера", "orders"),
             ("⚙️ Настройки", "settings"),
             ("⏸ Пауза" if not paused else "▶️ Старт", "toggle"),
+            ("🔄 Обновить", "home"),
             ("❓ Помощь", "help"),
         ]:
             builder.button(text=text, callback_data=data)
-        builder.adjust(2, 2, 2)
+        builder.adjust(2, 2, 2, 1)
         return builder.as_markup()
 
     def _back(self):
