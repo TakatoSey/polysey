@@ -194,6 +194,22 @@ class TelegramApp:
                     )
                 ).all()
             ) if trade_ids else []
+            token_ids = {trade.token_id for trade in all_trades}
+            if token_ids:
+                settled_orders = list(
+                    (
+                        await session.scalars(
+                            select(PaperOrder).where(
+                                PaperOrder.status == "settled",
+                                PaperOrder.token_id.in_(token_ids),
+                            )
+                        )
+                    ).all()
+                )
+                known_order_ids = {order.id for order in all_orders}
+                all_orders.extend(
+                    order for order in settled_orders if order.id not in known_order_ids
+                )
         if not row:
             await self._leaders_panel(page, chat_id)
             return
