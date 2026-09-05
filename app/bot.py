@@ -18,7 +18,7 @@ from sqlalchemy import select
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import Leader, RiskRule
+from .models import Leader, Position, RiskRule
 from .repository import add_leader, get_leaders, get_or_create_account, orders, positions
 
 log = structlog.get_logger(__name__)
@@ -87,11 +87,11 @@ class TelegramApp:
     def _menu(self, paused: bool = False):
         builder = InlineKeyboardBuilder()
         for text, data in [
-            ("📊 Портфель", "portfolio"),
-            ("👥 Лидеры", "leaders:0"),
-            ("📋 Ордера", "orders"),
+            ("📊 Портфель", "portfolio:0"),
+            ("👥 Копирование", "leaders:0"),
+            ("🧾 История", "orders:0"),
             ("⚙️ Настройки", "settings"),
-            ("⏸ Пауза" if not paused else "▶️ Старт", "toggle"),
+            ("⏸ Приостановить" if not paused else "▶️ Возобновить", "toggle"),
             ("🔄 Обновить", "home"),
             ("❓ Помощь", "help"),
         ]:
@@ -108,15 +108,18 @@ class TelegramApp:
         async with SessionLocal() as session:
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
             leaders = await get_leaders(session)
+            open_positions = await positions(session)
             await session.commit()
-        state = "⏸ остановлен" if account.paused else "▶️ работает"
+        state = "⏸ приостановлено" if account.paused else "▶️ активно"
         text = (
-            "<b>PolyCopy Paper</b>\n\n"
-            f"Баланс: <b>${account.paper_balance:.2f}</b>\n"
-            f"Старт: ${account.starting_balance:.2f}\n"
-            f"Состояние: {state}\n"
-            f"Активных лидеров: {sum(1 for row in leaders if row.active)}\n"
-            f"Realized PNL: <b>${account.realized_pnl:.2f}</b>"
+            "<b>POLYSEY · PAPER</b>\n\n"
+            f"Свободно: <b>${account.paper_balance:.2f}</b>\n"
+            f"Стартовый капитал: ${account.starting_balance:.2f}\n"
+            f"Состояние копирования: {state}\n"
+            f"Активных трейдеров: <b>{sum(1 for row in leaders if row.active)}</b>\n"
+            f"Открытых позиций: <b>{len(open_positions)}</b>\n"
+            f"Зафиксированный PNL: <b>${account.realized_pnl:+.2f}</b>\n\n"
+            "Стоимость открытых позиций доступна в разделе «Портфель»."
         )
         await self._edit_panel(text, self._menu(account.paused), chat_id)
 
@@ -128,24 +131,145 @@ class TelegramApp:
         page = max(0, min(page, total_pages - 1))
         current = rows[page * per_page : (page + 1) * per_page]
         lines = [
-            f"<b>👥 Лидеры</b> ({len(rows)})",
-            "Нажми ▶/⏸ чтобы включить/выключить копирование.",
+            f"<b>👥 Копирование</b> · {len(rows)} трейдеров",
+            "Выбери трейдера для просмотра и управления.",
         ]
         builder = InlineKeyboardBuilder()
         for row in current:
             icon = "🟢" if row.active else "⚪"
             short = f"{row.address[:8]}…{row.address[-6:]}"
             lines.append(f"{icon} <code>{row.address}</code>")
-            builder.button(text=f"{icon} {short}", callback_data=f"leader_toggle:{row.id}:{page}")
-            builder.button(text="🗑 Удалить", callback_data=f"leader_remove:{row.id}:{page}")
+            builder.button(text=f"{icon} {short}", callback_data=f"leader_view:{row.id}:{page}")
+            builder.button(
+                text="⏸" if row.active else "▶️", callback_data=f"leader_toggle:{row.id}:{page}"
+            )
         builder.button(text="➕ Добавить лидера", callback_data="leader_add")
         if page > 0:
             builder.button(text="◀️", callback_data=f"leaders:{page - 1}")
         if page + 1 < total_pages:
             builder.button(text="▶️", callback_data=f"leaders:{page + 1}")
-        builder.button(text="⬅️ Назад", callback_data="home")
+        builder.button(text="⬅️ На главную", callback_data="home")
         builder.adjust(2)
         await self._edit_panel("\n".join(lines), builder.as_markup(), chat_id)
+
+    async def _leader_detail(self, leader_id: int, page: int, chat_id: int) -> None:
+        async with SessionLocal() as session:
+            row = await session.get(Leader, leader_id)
+        if not row:
+            await self._leaders_panel(page, chat_id)
+            return
+        status = "🟢 активно" if row.active else "⚪ приостановлено"
+        label = html.escape(row.label or f"Трейдер #{row.id}")
+        text = (
+            f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
+            f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
+            "Все новые сделки этого адреса будут копироваться по общим настройкам."
+        )
+        builder = InlineKeyboardBuilder()
+        builder.button(
+            text="⏸ Приостановить" if row.active else "▶️ Возобновить",
+            callback_data=f"leader_toggle:{row.id}:{page}",
+        )
+        builder.button(text="🗑 Удалить", callback_data=f"leader_remove:{row.id}:{page}")
+        builder.button(text="⬅️ К списку", callback_data=f"leaders:{page}")
+        builder.adjust(1, 1, 1)
+        await self._edit_panel(text, builder.as_markup(), chat_id)
+
+    async def _portfolio_data_v2(self):
+        async with SessionLocal() as session:
+            rows = await positions(session)
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            await session.commit()
+        return rows, account
+
+    async def _portfolio_text_v2(self, page: int = 0) -> str:
+        rows, account = await self._portfolio_data_v2()
+        per_page = 5
+        total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        current = rows[page * per_page : (page + 1) * per_page]
+        lines = [
+            "<b>📊 ПОРТФЕЛЬ · PAPER</b>",
+            f"Свободно: <b>${account.paper_balance:.2f}</b>",
+            f"Зафиксированный PNL: ${account.realized_pnl:+.2f}",
+        ]
+        if not rows:
+            lines.append("\nОткрытых позиций нет.")
+            return "\n".join(lines)
+        for row in current:
+            quote = None
+            try:
+                quote = await self.engine.client.get_resolution(
+                    row.condition_id, row.outcome, row.token_id
+                )
+                if quote is None:
+                    book = await self.engine.client.get_book(row.token_id)
+                    quote = book.bids[0][0] if book.bids else None
+            except Exception as exc:
+                log.warning("portfolio_quote_unavailable", token_id=row.token_id, error=str(exc))
+            value = row.shares * quote if quote is not None else None
+            mark = f"${value:.2f}" if value is not None else "—"
+            pnl = f" · PNL ${value - row.cost_basis:+.2f}" if value is not None else ""
+            lines.append(
+                f"\n<b>{html.escape(row.title[:95])}</b>\n{html.escape(row.outcome)} · {row.shares:.3f} shares · вход ${row.average_price:.4f}\nОценка: <b>{mark}</b>{pnl}"
+            )
+        lines.append(f"\nСтраница {page + 1}/{total_pages}. Нажмите на позицию для деталей.")
+        return "\n".join(lines)
+
+    def _portfolio_keyboard_v2(self, rows, page: int = 0):
+        per_page = 5
+        total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        builder = InlineKeyboardBuilder()
+        for row in rows[page * per_page : (page + 1) * per_page]:
+            builder.button(text=f"📌 {row.outcome[:18]}", callback_data=f"position:{row.id}:{page}")
+        if page > 0:
+            builder.button(text="◀️", callback_data=f"portfolio:{page - 1}")
+        if page + 1 < total_pages:
+            builder.button(text="▶️", callback_data=f"portfolio:{page + 1}")
+        builder.button(text="⬅️ На главную", callback_data="home")
+        builder.adjust(1, 2, 1)
+        return builder.as_markup()
+
+    async def _position_detail_v2(self, position_id: int) -> str:
+        async with SessionLocal() as session:
+            row = await session.get(Position, position_id)
+        if not row:
+            return "<b>Позиция не найдена</b>"
+        quote = None
+        resolved = False
+        try:
+            quote = await self.engine.client.get_resolution(
+                row.condition_id, row.outcome, row.token_id
+            )
+            resolved = quote is not None
+            if quote is None:
+                book = await self.engine.client.get_book(row.token_id)
+                quote = book.bids[0][0] if book.bids else None
+        except Exception:
+            pass
+        value = row.shares * quote if quote is not None else None
+        status = (
+            "✅ победа · выплата $1/share"
+            if resolved and quote == 1
+            else "❌ проигрыш"
+            if resolved
+            else "⏳ рынок не определён"
+        )
+        lines = [
+            f"<b>📌 {html.escape(row.title)}</b>",
+            f"Исход: <b>{html.escape(row.outcome)}</b>",
+            f"Количество: {row.shares:.6f} shares",
+            f"Средняя цена: ${row.average_price:.6f}",
+            f"Затрачено: ${row.cost_basis:.4f}",
+            f"Статус: {status}",
+        ]
+        lines.append(
+            f"Текущая оценка: ${value:.4f}"
+            if value is not None
+            else "Текущая цена: нет доступного bid"
+        )
+        return "\n".join(lines)
 
     async def _portfolio_text(self) -> str:
         async with SessionLocal() as session:
@@ -209,6 +333,92 @@ class TelegramApp:
             length += len(line) + 1
         return "\n".join(rendered)
 
+    async def _orders_text_v2(self, page: int = 0, status_filter: str = "all") -> str:
+        async with SessionLocal() as session:
+            rows = await orders(session)
+        mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
+        filtered = [
+            r
+            for r in rows
+            if status_filter == "all" or r.status in mapping.get(status_filter, set())
+        ]
+        per_page = 8
+        total_pages = max(1, (len(filtered) + per_page - 1) // per_page)
+        page = max(0, min(page, total_pages - 1))
+        current = filtered[page * per_page : (page + 1) * per_page]
+        labels = {
+            "filled": "исполнен",
+            "partial": "частично",
+            "rejected": "пропущен",
+            "settled": "выплата",
+            "submitted": "ожидает",
+        }
+        reasons = {
+            "no_liquidity_within_slippage": "цена вышла за slippage",
+            "no_liquidity": "нет ликвидности",
+            "below_min_order_size": "меньше минимума",
+            "insufficient_balance": "недостаточно средств",
+        }
+        lines = [
+            "<b>🧾 ИСТОРИЯ · PAPER</b>",
+            "Сделки и пропуски копирования — без технического шума.",
+        ]
+        if not current:
+            lines.append("\nЗаписей в этом фильтре нет.")
+        for row in current:
+            when = row.created_at.strftime("%d.%m %H:%M") if row.created_at else "—"
+            reason = reasons.get(row.reason or "", row.reason or "")
+            suffix = f" · {html.escape(reason)}" if reason and row.status == "rejected" else ""
+            lines.append(
+                f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>\n{row.filled_shares:.4f} shares @ ${row.average_fill_price:.4f}{suffix}"
+            )
+        lines.append(f"\nСтраница {page + 1}/{total_pages}")
+        return "\n".join(lines)
+
+    async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):
+        async with SessionLocal() as session:
+            rows = await orders(session)
+        mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
+        filtered_count = sum(
+            1
+            for r in rows
+            if status_filter == "all" or r.status in mapping.get(status_filter, set())
+        )
+        total_pages = max(1, (filtered_count + 7) // 8)
+        builder = InlineKeyboardBuilder()
+        for label, key in [
+            ("Все", "all"),
+            ("Исполнены", "done"),
+            ("Пропуски", "skip"),
+            ("Выплаты", "settled"),
+        ]:
+            builder.button(
+                text=("· " if key == status_filter else "") + label, callback_data=f"orders:0:{key}"
+            )
+        if page > 0:
+            builder.button(text="◀️", callback_data=f"orders:{page - 1}:{status_filter}")
+        if page + 1 < total_pages:
+            builder.button(text="▶️", callback_data=f"orders:{page + 1}:{status_filter}")
+        builder.button(text="⬅️ На главную", callback_data="home")
+        builder.adjust(2, 2, 2)
+        return builder.as_markup()
+
+    async def _settings_text_v2(self) -> str:
+        async with SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            await session.commit()
+        return (
+            "<b>⚙️ НАСТРОЙКИ</b>\n\n"
+            "<b>Размер копирования</b>\n"
+            f"Базовая сумма: <b>${account.trade_size:.2f}</b> · максимум ${account.max_trade_size:.2f}\n"
+            f"От свободного баланса: {self.settings.copy_balance_pct * 100:.1f}% · масштаб лидера: {self.settings.leader_order_scale * 100:.1f}%\n\n"
+            "<b>Исполнение и риск</b>\n"
+            f"Минимум сделки: ${self.settings.min_copy_notional:.2f} · максимум на исход: ${self.settings.max_outcome_exposure:.2f}\n"
+            f"Допустимое отклонение цены: <b>{account.slippage_bps / 100:.2f}%</b>\n"
+            "Дневной лимит: выключен · Buy-only: выключен\n\n"
+            "Изменить параметры можно кнопками ниже или командами /setsize, /setmax, /setslippage, /risk."
+        )
+
     async def _orders_text(self) -> str:
         async with SessionLocal() as session:
             rows = await orders(session)
@@ -220,6 +430,16 @@ class TelegramApp:
                 f"{row.side} {row.status}: {row.filled_shares:.4f} @ ${row.average_fill_price:.4f} ({html.escape(row.reason or 'copy')})"
             )
         return "\n".join(lines)
+
+    def _settings_keyboard_v2(self):
+        builder = InlineKeyboardBuilder()
+        builder.button(text="💵 Размер сделки", callback_data="settings:sizing")
+        builder.button(text="📏 Лимиты", callback_data="settings:limits")
+        builder.button(text="📉 Slippage", callback_data="settings:slippage")
+        builder.button(text="🛡️ Stop-loss / TP", callback_data="settings:risk")
+        builder.button(text="⬅️ На главную", callback_data="home")
+        builder.adjust(2, 2, 1)
+        return builder.as_markup()
 
     async def _settings_text(self) -> str:
         async with SessionLocal() as session:
@@ -286,7 +506,10 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(await self._portfolio_text(), self._back(), message.chat.id)
+        rows, _ = await self._portfolio_data_v2()
+        await self._edit_panel(
+            await self._portfolio_text_v2(0), self._portfolio_keyboard_v2(rows, 0), message.chat.id
+        )
 
     async def leaders(self, message: Message) -> None:
         if not self._allowed(message):
@@ -298,13 +521,19 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(await self._orders_text(), self._back(), message.chat.id)
+        await self._edit_panel(
+            await self._orders_text_v2(0, "all"),
+            await self._orders_keyboard_v2(0, "all"),
+            message.chat.id,
+        )
 
     async def settings_cmd(self, message: Message) -> None:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(await self._settings_text(), self._back(), message.chat.id)
+        await self._edit_panel(
+            await self._settings_text_v2(), self._settings_keyboard_v2(), message.chat.id
+        )
 
     async def addleader(self, message: Message, state: FSMContext) -> None:
         if not self._allowed(message):
@@ -464,13 +693,49 @@ class TelegramApp:
         data = query.data or "home"
         chat_id = query.from_user.id
         if data == "home":
+            await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
             await self._home(chat_id)
-        elif data == "portfolio":
-            await self._edit_panel(await self._portfolio_text(), self._back(), chat_id)
-        elif data == "orders":
-            await self._edit_panel(await self._orders_text(), self._back(), chat_id)
+        elif data == "portfolio" or data.startswith("portfolio:"):
+            page = int(data.split(":")[1]) if ":" in data else 0
+            rows, _ = await self._portfolio_data_v2()
+            await self._edit_panel(
+                await self._portfolio_text_v2(page),
+                self._portfolio_keyboard_v2(rows, page),
+                chat_id,
+            )
+        elif data == "orders" or data.startswith("orders:"):
+            parts = data.split(":")
+            page = int(parts[1]) if len(parts) > 1 and parts[1] else 0
+            status_filter = parts[2] if len(parts) > 2 else "all"
+            await self._edit_panel(
+                await self._orders_text_v2(page, status_filter),
+                await self._orders_keyboard_v2(page, status_filter),
+                chat_id,
+            )
+        elif data.startswith("position:"):
+            _, raw_id, raw_page = data.split(":")
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ К портфелю", callback_data=f"portfolio:{raw_page}")
+            builder.button(text="🏠 На главную", callback_data="home")
+            builder.adjust(2)
+            await self._edit_panel(
+                await self._position_detail_v2(int(raw_id)), builder.as_markup(), chat_id
+            )
         elif data == "settings":
-            await self._edit_panel(await self._settings_text(), self._back(), chat_id)
+            await self._edit_panel(
+                await self._settings_text_v2(), self._settings_keyboard_v2(), chat_id
+            )
+        elif data.startswith("settings:"):
+            section = data.split(":", 1)[1]
+            details = {
+                "sizing": "💵 <b>Размер сделки</b>\nСумма считается от нашего свободного баланса и ограничивается максимумом.\n\nКоманды: /setsize 5 · /setmax 30",
+                "limits": "📏 <b>Лимиты</b>\nДневной лимит выключен. Ограничение на один исход защищает от концентрации.",
+                "slippage": "📉 <b>Slippage</b>\nМаксимальное отклонение цены при копировании. Изменить: /setslippage 5",
+                "risk": "🛡️ <b>Stop-loss / Take-profit</b>\nНастраиваются для конкретного token_id: /risk TOKEN sl=0.2 tp=0.25 trail=0.1",
+            }
+            await self._edit_panel(
+                details.get(section, "Раздел не найден"), self._settings_keyboard_v2(), chat_id
+            )
         elif data == "help":
             await self._edit_panel(
                 "<b>❓ Помощь</b>\nИспользуй кнопки панели. Команды настройки доступны из меню.",
@@ -485,6 +750,9 @@ class TelegramApp:
             await self._home(chat_id)
         elif data.startswith("leaders:"):
             await self._leaders_panel(int(data.split(":", 1)[1]), chat_id)
+        elif data.startswith("leader_view:"):
+            _, raw_id, raw_page = data.split(":")
+            await self._leader_detail(int(raw_id), int(raw_page), chat_id)
         elif data == "leader_add":
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).set_state(LeaderForm.address)
             await self._edit_panel(
@@ -492,7 +760,27 @@ class TelegramApp:
                 self._back(),
                 chat_id,
             )
-        elif data.startswith("leader_toggle:") or data.startswith("leader_remove:"):
+        elif data.startswith("leader_remove_confirm:"):
+            _, raw_id, raw_page = data.split(":")
+            async with SessionLocal() as session:
+                row = await session.get(Leader, int(raw_id))
+                if row:
+                    row.active = False
+                await session.commit()
+            await self._leaders_panel(int(raw_page), chat_id)
+        elif data.startswith("leader_remove:"):
+            _, raw_id, raw_page = data.split(":")
+            builder = InlineKeyboardBuilder()
+            builder.button(
+                text="Да, удалить", callback_data=f"leader_remove_confirm:{raw_id}:{raw_page}"
+            )
+            builder.button(text="Отмена", callback_data=f"leader_view:{raw_id}:{raw_page}")
+            await self._edit_panel(
+                "<b>Удалить трейдера?</b>\nКопирование новых сделок будет остановлено. История и позиции сохранятся.",
+                builder.as_markup(),
+                chat_id,
+            )
+        elif data.startswith("leader_toggle:"):
             action, raw_id, raw_page = data.split(":")
             leader_id, page = int(raw_id), int(raw_page)
             async with SessionLocal() as session:
