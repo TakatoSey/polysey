@@ -18,7 +18,7 @@ from sqlalchemy import select
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import Leader, Position, RiskRule
+from .models import CopyTrade, Leader, Position, RiskRule
 from .repository import add_leader, get_leaders, get_or_create_account, orders, positions
 
 log = structlog.get_logger(__name__)
@@ -111,6 +111,17 @@ class TelegramApp:
             open_positions = await positions(session)
             await session.commit()
         state = "⏸ приостановлено" if account.paused else "▶️ активно"
+        max_next_buy = min(
+            account.trade_size,
+            account.max_trade_size,
+            account.paper_balance * self.settings.copy_balance_pct,
+        )
+        cash_warning = (
+            "\n\n⚠️ Новые покупки сейчас невозможны: расчётная сумма сделки "
+            f"${max_next_buy:.2f} ниже минимума ${self.settings.min_copy_notional:.2f}."
+            if not account.paused and max_next_buy < self.settings.min_copy_notional
+            else ""
+        )
         text = (
             "<b>POLYSEY · PAPER</b>\n\n"
             f"Свободно: <b>${account.paper_balance:.2f}</b>\n"
@@ -120,6 +131,7 @@ class TelegramApp:
             f"Открытых позиций: <b>{len(open_positions)}</b>\n"
             f"Зафиксированный PNL: <b>${account.realized_pnl:+.2f}</b>\n\n"
             "Стоимость открытых позиций доступна в разделе «Портфель»."
+            f"{cash_warning}"
         )
         await self._edit_panel(text, self._menu(account.paused), chat_id)
 
@@ -155,15 +167,37 @@ class TelegramApp:
     async def _leader_detail(self, leader_id: int, page: int, chat_id: int) -> None:
         async with SessionLocal() as session:
             row = await session.get(Leader, leader_id)
+            recent = list(
+                (
+                    await session.scalars(
+                        select(CopyTrade)
+                        .where(CopyTrade.leader_id == leader_id)
+                        .order_by(CopyTrade.created_at.desc())
+                        .limit(20)
+                    )
+                ).all()
+            )
         if not row:
             await self._leaders_panel(page, chat_id)
             return
         status = "🟢 активно" if row.active else "⚪ приостановлено"
         label = html.escape(row.label or f"Трейдер #{row.id}")
+        executed = sum(1 for trade in recent if trade.status == "executed")
+        rejected = sum(1 for trade in recent if trade.status in {"skipped", "failed"})
+        last_result = "событий пока нет"
+        if recent:
+            last = recent[0]
+            last_result = (
+                "скопировано"
+                if last.status == "executed"
+                else html.escape(last.skip_reason or last.status)
+            )
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
-            "Все новые сделки этого адреса будут копироваться по общим настройкам."
+            f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
+            f"Последний результат: <b>{last_result}</b>\n\n"
+            "Все новые сделки этого адреса обрабатываются по общим настройкам."
         )
         builder = InlineKeyboardBuilder()
         builder.button(
@@ -357,7 +391,12 @@ class TelegramApp:
             "no_liquidity_within_slippage": "цена вышла за slippage",
             "no_liquidity": "нет ликвидности",
             "below_min_order_size": "меньше минимума",
+            "below_min_copy_notional": "расчётная сумма ниже нашего минимума",
             "insufficient_balance": "недостаточно средств",
+            "no_position_to_sell": "у нас нет позиции для повторения продажи",
+            "invalid_size_or_price": "некорректный размер или цена",
+            "market_data:market_not_accepting_orders": "рынок уже не принимает ордера",
+            "market_data:unsupported_fee_exponent": "устаревший расчёт комиссии",
         }
         lines = [
             "<b>🧾 ИСТОРИЯ · PAPER</b>",
@@ -367,7 +406,12 @@ class TelegramApp:
             lines.append("\nЗаписей в этом фильтре нет.")
         for row in current:
             when = row.created_at.strftime("%d.%m %H:%M") if row.created_at else "—"
-            reason = reasons.get(row.reason or "", row.reason or "")
+            raw_reason = row.reason or ""
+            reason = reasons.get(raw_reason, raw_reason)
+            if raw_reason.startswith("book_error:"):
+                reason = "не удалось получить актуальный стакан"
+            elif raw_reason.startswith("market_data:") and raw_reason not in reasons:
+                reason = "не удалось подтвердить параметры рынка"
             suffix = f" · {html.escape(reason)}" if reason and row.status == "rejected" else ""
             lines.append(
                 f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>\n{row.filled_shares:.4f} shares @ ${row.average_fill_price:.4f}{suffix}"

@@ -30,6 +30,29 @@ class CopyEngine:
         except asyncio.QueueFull:
             log.warning("notification_queue_full")
 
+    @staticmethod
+    def record_rejection(
+        session,
+        copy_trade: CopyTrade,
+        event: LeaderActivity,
+        reason: str,
+        requested_shares: Decimal = Decimal(0),
+    ) -> None:
+        """Persist every skipped event so an active bot can never fail silently."""
+        session.add(
+            PaperOrder(
+                copy_trade_id=copy_trade.id,
+                token_id=event.token_id,
+                side=event.side,
+                requested_shares=requested_shares,
+                filled_shares=Decimal(0),
+                average_fill_price=Decimal(0),
+                fee=Decimal(0),
+                status="rejected",
+                reason=reason[:240],
+            )
+        )
+
     async def run(self) -> None:
         while not self.stop_event.is_set():
             # Settlement must run even when an unrelated trade/feed fails.
@@ -135,7 +158,9 @@ class CopyEngine:
                 raise ValueError("invalid_market_delay")
         except Exception as exc:
             copy_trade.status = "failed"
-            copy_trade.skip_reason = f"market_data_unavailable:{type(exc).__name__}"
+            detail = str(exc) or type(exc).__name__
+            copy_trade.skip_reason = f"market_data:{detail}"
+            self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             await self.update_leader_position(session, leader.id, event, leader_pos)
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
             return
@@ -162,6 +187,7 @@ class CopyEngine:
             if buy_budget < self.settings.min_copy_notional:
                 copy_trade.status = "skipped"
                 copy_trade.skip_reason = "below_min_copy_notional"
+                self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
                 await self.update_leader_position(session, leader.id, event, leader_pos)
                 return
             target_shares = buy_budget / event.price if event.price else Decimal(0)
@@ -170,6 +196,7 @@ class CopyEngine:
             if not position or position.shares <= 0 or before_leader_shares <= 0:
                 copy_trade.status = "skipped"
                 copy_trade.skip_reason = "no_position_to_sell"
+                self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
                 await self.update_leader_position(session, leader.id, event, leader_pos)
                 return
             sell_ratio = min(Decimal(1), event.size / before_leader_shares)
@@ -179,6 +206,7 @@ class CopyEngine:
         if target_shares <= 0:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = "invalid_size_or_price"
+            self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             return
         await asyncio.sleep(delay + self.settings.copy_latency_seconds)
         try:
@@ -202,7 +230,9 @@ class CopyEngine:
                 )
         except Exception as exc:
             copy_trade.status = "failed"
-            copy_trade.skip_reason = f"book_error:{type(exc).__name__}"
+            detail = str(exc) or type(exc).__name__
+            copy_trade.skip_reason = f"book_error:{detail}"
+            self.record_rejection(session, copy_trade, event, copy_trade.skip_reason, target_shares)
             return
 
         order = PaperOrder(

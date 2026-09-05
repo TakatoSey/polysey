@@ -170,15 +170,28 @@ class PolymarketClient:
                 raise ValueError("fee_market_identity_mismatch")
             schedule = info.get("fd")
             if not isinstance(schedule, dict) or "r" not in schedule or "e" not in schedule:
-                raise ValueError("fee_schedule_unavailable")
+                raise LookupError("fee_schedule_unavailable")
             rate = Decimal(str(schedule["r"]))
             exponent = Decimal(str(schedule["e"]))
             if not rate.is_finite() or not 0 <= rate <= 1:
-                raise ValueError("invalid_fee_rate")
-            if not exponent.is_finite() or exponent != 1:
-                raise ValueError("unsupported_fee_exponent")
-        except ValueError:
-            raise
+                raise LookupError("invalid_fee_rate")
+            # The CLOB schema explicitly allows fee-curve exponents other than
+            # one. The current public fee formula uses the returned rate; an
+            # exponent is metadata describing the curve and must not disable
+            # execution merely because a new category uses a different value.
+            if not exponent.is_finite() or exponent <= 0:
+                raise LookupError("invalid_fee_exponent")
+        except ValueError as exc:
+            # A response for a different market is not safe to use.
+            if str(exc) == "fee_market_identity_mismatch":
+                raise
+            rate = self._fallback_fee_rate(title)
+            log.warning(
+                "invalid_fee_data_using_fallback",
+                condition_id=condition_id,
+                fallback_rate=str(rate),
+                error=str(exc),
+            )
         except Exception as exc:
             rate = self._fallback_fee_rate(title)
             log.warning(
@@ -195,10 +208,23 @@ class PolymarketClient:
     @staticmethod
     def _fallback_fee_rate(title: str) -> Decimal:
         text = title.lower()
+        if any(word in text for word in ("geopolitic", "world event")):
+            return Decimal(0)
         if any(word in text for word in ("crypto", "bitcoin", "ethereum")):
             return Decimal("0.07")
-        if any(word in text for word in ("sport", "nfl", "nba", "mls", "soccer")):
-            return Decimal("0.05")
+        if any(
+            word in text
+            for word in (
+                "sport",
+                "nfl",
+                "nba",
+                "mls",
+                "soccer",
+                " fc ",
+                "afc",
+            )
+        ):
+            return Decimal("0.03")
         if any(word in text for word in ("politic", "election", "geopolitic")):
             return Decimal("0.04")
         return Decimal("0.05")
