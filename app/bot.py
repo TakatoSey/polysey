@@ -18,7 +18,7 @@ from sqlalchemy import select
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import CopyTrade, Leader, Position, RiskRule
+from .models import CopyTrade, Leader, PaperOrder, Position, RiskRule
 from .repository import add_leader, get_leaders, get_or_create_account, orders, positions
 
 log = structlog.get_logger(__name__)
@@ -369,7 +369,20 @@ class TelegramApp:
 
     async def _orders_text_v2(self, page: int = 0, status_filter: str = "all") -> str:
         async with SessionLocal() as session:
-            rows = await orders(session)
+            rows: list[PaperOrder] = await orders(session)
+            copy_trade_ids = [row.copy_trade_id for row in rows if row.copy_trade_id]
+            trades = (
+                list(
+                    (
+                        await session.scalars(
+                            select(CopyTrade).where(CopyTrade.id.in_(copy_trade_ids))
+                        )
+                    ).all()
+                )
+                if copy_trade_ids
+                else []
+            )
+        trades_by_id = {trade.id: trade for trade in trades}
         mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
         filtered = [
             r
@@ -406,16 +419,35 @@ class TelegramApp:
             lines.append("\nЗаписей в этом фильтре нет.")
         for row in current:
             when = row.created_at.strftime("%d.%m %H:%M") if row.created_at else "—"
+            trade = trades_by_id.get(row.copy_trade_id)
             raw_reason = row.reason or ""
             reason = reasons.get(raw_reason, raw_reason)
             if raw_reason.startswith("book_error:"):
                 reason = "не удалось получить актуальный стакан"
             elif raw_reason.startswith("market_data:") and raw_reason not in reasons:
                 reason = "не удалось подтвердить параметры рынка"
-            suffix = f" · {html.escape(reason)}" if reason and row.status == "rejected" else ""
-            lines.append(
-                f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>\n{row.filled_shares:.4f} shares @ ${row.average_fill_price:.4f}{suffix}"
-            )
+            header = f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>"
+            if row.status == "rejected":
+                details = []
+                if trade:
+                    details.append(
+                        f"Лидер: {trade.leader_size:.4f} shares @ ${trade.leader_price:.4f}"
+                    )
+                if row.requested_shares > 0:
+                    details.append(f"Наша заявка: {row.requested_shares:.4f} shares")
+                details.append(f"Причина: {html.escape(reason or 'нет исполнения')}")
+                lines.append(header + "\n" + "\n".join(details))
+            elif row.status == "settled":
+                proceeds = row.filled_shares * row.average_fill_price
+                lines.append(
+                    header + f"\nЗакрыто: {row.filled_shares:.4f} shares · выплата ${proceeds:.4f}"
+                )
+            else:
+                lines.append(
+                    header
+                    + f"\nИсполнено: {row.filled_shares:.4f} shares @ ${row.average_fill_price:.4f}"
+                    + (f" · комиссия ${row.fee:.5f}" if row.fee else "")
+                )
         lines.append(f"\nСтраница {page + 1}/{total_pages}")
         return "\n".join(lines)
 
