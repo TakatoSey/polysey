@@ -125,6 +125,17 @@ class LiveBookCache:
         for message in messages:
             if not isinstance(message, dict):
                 continue
+            if message.get("event_type") == "tick_size_change":
+                asset_id = str(message.get("asset_id") or "")
+                if asset_id and message.get("new_tick_size") is not None:
+                    async with self._lock:
+                        old = self.meta.get(asset_id, (Decimal("0.01"), Decimal("1"), False))
+                        self.meta[asset_id] = (
+                            Decimal(str(message["new_tick_size"])),
+                            old[1],
+                            old[2],
+                        )
+                continue
             if message.get("event_type") != "book":
                 continue
             asset_id = str(message.get("asset_id") or "")

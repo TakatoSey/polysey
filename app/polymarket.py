@@ -151,13 +151,28 @@ class PolymarketClient:
             )
             response.raise_for_status()
             raw = response.json()
-            market = raw[0] if isinstance(raw, list) and raw else raw.get("data", [{}])[0]
-            schedule = market.get("feeSchedule") or {}
-            rate = (
-                Decimal(str(schedule.get("rate")))
-                if schedule.get("rate") is not None
-                else self._fallback_fee_rate(title)
-            )
+            market = raw[0] if isinstance(raw, list) and raw else None
+            if market is None and isinstance(raw, dict):
+                data = raw.get("data") or []
+                market = data[0] if data else None
+            if not market:
+                rate = self._fallback_fee_rate(title)
+                self._fee_cache[condition_id] = rate
+                self._fee_cache_time[condition_id] = time.monotonic()
+                return rate
+            # Gamma explicitly marks fee-free markets. Never apply the
+            # category fallback when feesEnabled is false.
+            if market.get("feesEnabled") is False:
+                rate = Decimal(0)
+            else:
+                schedule = market.get("feeSchedule") or {}
+                rate = (
+                    Decimal(str(schedule.get("rate"))) if schedule.get("rate") is not None else None
+                )
+                if rate is None and market.get("takerBaseFee") is not None:
+                    rate = Decimal(str(market["takerBaseFee"])) / Decimal(10000)
+                if rate is None:
+                    rate = self._fallback_fee_rate(title)
         except Exception:
             rate = self._fallback_fee_rate(title)
         self._fee_cache[condition_id] = rate
