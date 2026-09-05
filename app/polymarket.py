@@ -145,10 +145,9 @@ class PolymarketClient:
         try:
             response = await self.http.get(
                 f"{self.settings.gamma_api}/markets",
-                # Gamma's REST filter is singular (condition_id). The
-                # plural condition_ids parameter silently returns an empty
-                # list, which would prevent resolved paper positions settling.
-                params={"condition_id": condition_id, "limit": 1},
+                # Gamma's REST filter uses the camelCase conditionId name.
+                # Snake_case is ignored and returns an unrelated first market.
+                params={"conditionId": condition_id, "limit": 1},
             )
             response.raise_for_status()
             raw = response.json()
@@ -172,7 +171,7 @@ class PolymarketClient:
             return cached[1]
         response = await self.http.get(
             f"{self.settings.gamma_api}/markets",
-            params={"condition_id": condition_id, "limit": 1},
+            params={"conditionId": condition_id, "limit": 1},
         )
         response.raise_for_status()
         raw = response.json()
