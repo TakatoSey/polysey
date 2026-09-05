@@ -182,7 +182,10 @@ class PolymarketClient:
             return None
         closed_value = market.get("closed")
         resolved_value = market.get("resolved")
-        is_closed = str(closed_value).lower() == "true" or str(resolved_value).lower() == "true"
+        is_closed = str(closed_value).lower() in {"true", "1"} or str(resolved_value).lower() in {
+            "true",
+            "1",
+        }
         if not is_closed:
             self._resolution_cache[cache_key] = (time.monotonic(), None)
             return None
