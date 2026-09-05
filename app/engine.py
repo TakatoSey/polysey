@@ -32,23 +32,45 @@ class CopyEngine:
             log.warning("notification_queue_full")
 
     @staticmethod
-    def calculate_buy_budget(
-        account, settings: Settings, leader_notional: Decimal, fee_rate: Decimal
-    ):
-        """Size from our cash first, using leader notional as a soft proportional ceiling."""
+    def calculate_own_buy_capacity(account, settings: Settings, fee_rate: Decimal) -> Decimal:
         cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
-        own_budget = min(
+        return min(
             cash_budget,
             account.max_trade_size,
             account.trade_size,
             cash_budget * settings.copy_balance_pct,
         )
+
+    @classmethod
+    def calculate_buy_budget(
+        cls, account, settings: Settings, leader_notional: Decimal, fee_rate: Decimal
+    ):
+        """Size from our cash first, using leader notional as a soft proportional ceiling."""
+        own_budget = cls.calculate_own_buy_capacity(account, settings, fee_rate)
         if leader_notional <= 0 or own_budget < settings.min_copy_notional:
             return max(Decimal(0), min(own_budget, leader_notional))
         proportional = leader_notional * settings.leader_order_scale
         # We intentionally copy all valid leader buys. A small leader order is
         # rounded up to our executable minimum, never above our own budget.
         return min(own_budget, max(settings.min_copy_notional, proportional))
+
+    @staticmethod
+    def ensure_book_minimum_budget(
+        budget: Decimal,
+        own_capacity: Decimal,
+        book,
+        reference_price: Decimal,
+        slippage_bps: int,
+    ) -> Decimal:
+        """Raise a valid small copy to the exchange's share minimum when affordable."""
+        if not book.asks or reference_price <= 0:
+            return budget
+        best_ask = book.asks[0][0]
+        max_price = reference_price * (Decimal(1) + Decimal(slippage_bps) / Decimal(10000))
+        required = book.min_order_size * best_ask
+        if best_ask <= max_price and budget < required <= own_capacity:
+            return required
+        return budget
 
     @staticmethod
     def record_rejection(
@@ -195,9 +217,13 @@ class CopyEngine:
             )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
+            own_capacity = min(
+                self.calculate_own_buy_capacity(account, self.settings, fee_rate),
+                max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
+            )
             buy_budget = min(
                 buy_budget,
-                max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
+                own_capacity,
             )
             target_shares = buy_budget / event.price if event.price else Decimal(0)
             if buy_budget < self.settings.min_copy_notional:
@@ -239,6 +265,15 @@ class CopyEngine:
         try:
             book = await self.client.get_book(event.token_id)
             if event.side == "BUY":
+                buy_budget = self.ensure_book_minimum_budget(
+                    buy_budget,
+                    own_capacity,
+                    book,
+                    event.price,
+                    account.slippage_bps,
+                )
+                if book.asks:
+                    target_shares = buy_budget / book.asks[0][0]
                 fill = execute_buy_fak_by_budget(
                     book,
                     buy_budget,

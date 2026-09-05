@@ -80,3 +80,24 @@ def test_fixed_buy_spends_budget_at_actual_book_prices() -> None:
     assert fill.status == "filled"
     assert fill.notional.quantize(Decimal("0.00001")) == Decimal("5.00000")
     assert fill.shares > Decimal("8")
+
+
+def test_valid_fak_order_may_partially_fill_below_exchange_order_minimum() -> None:
+    book = Book(
+        bids=[],
+        asks=[(Decimal("0.37"), Decimal("2"))],
+        tick_size=Decimal("0.01"),
+        min_order_size=Decimal("5"),
+        neg_risk=False,
+    )
+
+    fill = execute_buy_fak_by_budget(
+        book,
+        budget=Decimal("1.85"),
+        fee_rate=Decimal("0.03"),
+        reference_price=Decimal("0.37"),
+        slippage_bps=500,
+    )
+
+    assert fill.status == "partial"
+    assert fill.shares == Decimal("2")

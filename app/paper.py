@@ -49,13 +49,27 @@ def execute_buy_fak_by_budget(
         )
     drift = Decimal(slippage_bps) / Decimal(10000)
     max_price = reference_price * (Decimal(1) + drift)
+    eligible_asks = [(price, size) for price, size in book.asks if price <= max_price]
+    if not eligible_asks:
+        return Fill(
+            Decimal(0),
+            Decimal(0),
+            Decimal(0),
+            Decimal(0),
+            "rejected",
+            "no_liquidity_within_slippage",
+        )
+    # The minimum constrains the submitted order, not the eventual partial
+    # fill. A valid FAK order may match fewer shares than requested.
+    if budget < book.min_order_size * eligible_asks[0][0]:
+        return Fill(
+            Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "below_min_order_size"
+        )
     remaining_budget = budget
     filled = Decimal(0)
     notional = Decimal(0)
     fee = Decimal(0)
-    for price, size in book.asks:
-        if price > max_price:
-            break
+    for price, size in eligible_asks:
         affordable = remaining_budget / price
         take = min(size, affordable)
         if take <= 0:
@@ -67,9 +81,15 @@ def execute_buy_fak_by_budget(
         remaining_budget -= level_notional
         if remaining_budget <= Decimal("0.00000001"):
             break
-    if filled < book.min_order_size:
-        reason = "below_min_order_size" if filled > 0 else "no_liquidity_within_slippage"
-        return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", reason)
+    if filled <= 0:
+        return Fill(
+            Decimal(0),
+            Decimal(0),
+            Decimal(0),
+            Decimal(0),
+            "rejected",
+            "no_liquidity_within_slippage",
+        )
     average = (notional / filled).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     fee = fee.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
     status = "filled" if remaining_budget <= Decimal("0.00000001") else "partial"

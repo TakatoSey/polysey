@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from app.config import Settings
 from app.engine import CopyEngine
 from app.models import CopyTrade, PaperOrder
-from app.polymarket import LeaderActivity
+from app.polymarket import Book, LeaderActivity
 
 
 class RecordingSession:
@@ -80,3 +80,23 @@ def test_sizing_never_forces_minimum_when_our_cash_budget_is_too_small():
     )
 
     assert budget < settings.min_copy_notional
+
+
+def test_small_copy_is_raised_to_exchange_share_minimum_when_affordable():
+    book = Book(
+        bids=[],
+        asks=[(Decimal("0.37"), Decimal("100"))],
+        tick_size=Decimal("0.01"),
+        min_order_size=Decimal("5"),
+        neg_risk=False,
+    )
+
+    budget = CopyEngine.ensure_book_minimum_budget(
+        budget=Decimal("1.10"),
+        own_capacity=Decimal("5"),
+        book=book,
+        reference_price=Decimal("0.37"),
+        slippage_bps=500,
+    )
+
+    assert budget == Decimal("1.85")
