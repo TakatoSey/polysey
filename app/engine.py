@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from decimal import Decimal
 
 import structlog
@@ -29,6 +30,25 @@ class CopyEngine:
             self.notifications.put_nowait(message)
         except asyncio.QueueFull:
             log.warning("notification_queue_full")
+
+    @staticmethod
+    def calculate_buy_budget(
+        account, settings: Settings, leader_notional: Decimal, fee_rate: Decimal
+    ):
+        """Size from our cash first, using leader notional as a soft proportional ceiling."""
+        cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
+        own_budget = min(
+            cash_budget,
+            account.max_trade_size,
+            account.trade_size,
+            cash_budget * settings.copy_balance_pct,
+        )
+        if leader_notional <= 0 or own_budget < settings.min_copy_notional:
+            return max(Decimal(0), min(own_budget, leader_notional))
+        proportional = leader_notional * settings.leader_order_scale
+        # We intentionally copy all valid leader buys. A small leader order is
+        # rounded up to our executable minimum, never above our own budget.
+        return min(own_budget, max(settings.min_copy_notional, proportional))
 
     @staticmethod
     def record_rejection(
@@ -120,6 +140,7 @@ class CopyEngine:
                 await session.commit()
 
     async def process_event(self, session, leader: Leader, event: LeaderActivity) -> None:
+        detection_lag = max(0, time.time() - event.timestamp)
         copy_trade = CopyTrade(
             leader_id=leader.id,
             event_key=event.event_key,
@@ -168,29 +189,35 @@ class CopyEngine:
             # The configured copy size is a total cash budget. Reserve room for
             # the taker fee so apply_fill cannot reject a fill after consuming
             # the whole available balance on notional alone.
-            cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
-            balance_budget = cash_budget * self.settings.copy_balance_pct
             leader_notional = event.size * event.price
-            leader_budget = leader_notional * self.settings.leader_order_scale
-            # The old fixed trade_size remains a hard safety ceiling, while
-            # balance and leader order size determine the actual allocation.
-            limits = [account.max_trade_size, account.trade_size, balance_budget]
-            if leader_budget > 0:
-                limits.append(leader_budget)
-            buy_budget = min(*limits, cash_budget)
+            buy_budget = self.calculate_buy_budget(
+                account, self.settings, leader_notional, fee_rate
+            )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
             buy_budget = min(
                 buy_budget,
                 max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
             )
+            target_shares = buy_budget / event.price if event.price else Decimal(0)
             if buy_budget < self.settings.min_copy_notional:
                 copy_trade.status = "skipped"
                 copy_trade.skip_reason = "below_min_copy_notional"
-                self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
+                self.record_rejection(
+                    session, copy_trade, event, copy_trade.skip_reason, target_shares
+                )
+                log.info(
+                    "copy_rejected",
+                    leader=leader.address,
+                    side=event.side,
+                    reason=copy_trade.skip_reason,
+                    detection_lag_seconds=round(detection_lag, 3),
+                    paper_balance=str(account.paper_balance),
+                    leader_notional=str(leader_notional),
+                    calculated_budget=str(buy_budget),
+                )
                 await self.update_leader_position(session, leader.id, event, leader_pos)
                 return
-            target_shares = buy_budget / event.price if event.price else Decimal(0)
         else:
             position = await get_position(session, event.token_id)
             if not position or position.shares <= 0 or before_leader_shares <= 0:
@@ -250,6 +277,23 @@ class CopyEngine:
         if fill.shares <= 0:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = fill.reason or "no_fill"
+            best_price = (
+                book.asks[0][0]
+                if event.side == "BUY" and book.asks
+                else book.bids[0][0]
+                if book.bids
+                else None
+            )
+            log.info(
+                "copy_rejected",
+                leader=leader.address,
+                side=event.side,
+                reason=copy_trade.skip_reason,
+                detection_lag_seconds=round(detection_lag, 3),
+                leader_price=str(event.price),
+                best_book_price=str(best_price) if best_price is not None else None,
+                requested_shares=str(target_shares),
+            )
             return
         try:
             await apply_fill(
@@ -270,6 +314,16 @@ class CopyEngine:
             order.filled_shares = order.average_fill_price = order.fee = Decimal(0)
             return
         copy_trade.status = "executed"
+        log.info(
+            "copy_executed",
+            leader=leader.address,
+            side=event.side,
+            detection_lag_seconds=round(detection_lag, 3),
+            leader_price=str(event.price),
+            fill_price=str(fill.average_price),
+            filled_shares=str(fill.shares),
+            fee=str(fill.fee),
+        )
         # Keep the chat quiet: only successful BUY copies are user-facing
         # notifications. Rejections/partial misses remain visible in Ордера.
         if event.side == "BUY":

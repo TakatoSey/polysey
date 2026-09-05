@@ -1,5 +1,7 @@
 from decimal import Decimal
+from types import SimpleNamespace
 
+from app.config import Settings
 from app.engine import CopyEngine
 from app.models import CopyTrade, PaperOrder
 from app.polymarket import LeaderActivity
@@ -37,3 +39,44 @@ def test_skipped_copy_is_always_visible_as_rejected_order():
     assert order.copy_trade_id == 7
     assert order.status == "rejected"
     assert order.reason == "below_min_copy_notional"
+
+
+def test_small_leader_buy_is_raised_to_executable_minimum():
+    account = SimpleNamespace(
+        paper_balance=Decimal("100"),
+        trade_size=Decimal("5"),
+        max_trade_size=Decimal("30"),
+    )
+    settings = Settings(
+        _env_file=None,
+        COPY_BALANCE_PCT="0.05",
+        LEADER_ORDER_SCALE="0.10",
+        MIN_COPY_NOTIONAL="1.10",
+    )
+
+    budget = CopyEngine.calculate_buy_budget(
+        account,
+        settings,
+        leader_notional=Decimal("7.041745"),
+        fee_rate=Decimal("0.03"),
+    )
+
+    assert budget == Decimal("1.10")
+
+
+def test_sizing_never_forces_minimum_when_our_cash_budget_is_too_small():
+    account = SimpleNamespace(
+        paper_balance=Decimal("1.76"),
+        trade_size=Decimal("5"),
+        max_trade_size=Decimal("30"),
+    )
+    settings = Settings(_env_file=None, COPY_BALANCE_PCT="0.05", MIN_COPY_NOTIONAL="1.10")
+
+    budget = CopyEngine.calculate_buy_budget(
+        account,
+        settings,
+        leader_notional=Decimal("100"),
+        fee_rate=Decimal("0.03"),
+    )
+
+    assert budget < settings.min_copy_notional

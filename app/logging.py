@@ -5,6 +5,9 @@ import structlog
 
 def configure_logging(level: str) -> None:
     logging.basicConfig(format="%(message)s", level=getattr(logging, level.upper(), logging.INFO))
+    # One line per polling request hides the events that actually explain a
+    # copied or rejected trade. HTTP failures still surface at WARNING.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
