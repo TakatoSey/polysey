@@ -187,6 +187,13 @@ class PolymarketClient:
             "1",
         }
         if not is_closed:
+            log.info(
+                "market_not_resolved",
+                condition_id=condition_id,
+                closed=closed_value,
+                resolved=resolved_value,
+                outcome_prices=market.get("outcomePrices"),
+            )
             self._resolution_cache[cache_key] = (time.monotonic(), None)
             return None
         try:
@@ -199,6 +206,15 @@ class PolymarketClient:
             )
             payout = Decimal(str(prices[index]))
         except (ValueError, TypeError, StopIteration, IndexError, json.JSONDecodeError):
+            log.warning(
+                "market_resolution_unparseable",
+                condition_id=condition_id,
+                outcome=outcome,
+                closed=closed_value,
+                resolved=resolved_value,
+                outcomes=market.get("outcomes"),
+                outcome_prices=market.get("outcomePrices"),
+            )
             self._resolution_cache[cache_key] = (time.monotonic(), None)
             return None
         result = payout if payout in {Decimal(0), Decimal(1)} else None
