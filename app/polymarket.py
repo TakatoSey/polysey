@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -102,14 +101,17 @@ class PolymarketClient:
     async def get_book(self, token_id: str) -> Book:
         if self.book_stream:
             await self.book_stream.subscribe(token_id)
-            cached = await self.book_stream.get(token_id)
-            if cached:
-                return cached
+            # Stream currently lacks complete delta reconciliation; never
+            # execute/mark from a potentially outdated snapshot.
         response = await self.http.get(
             f"{self.settings.clob_api}/book", params={"token_id": token_id}
         )
         response.raise_for_status()
         data: dict[str, Any] = response.json()
+        if str(data.get("asset_id")) != token_id:
+            raise ValueError("book_token_mismatch")
+        if "tick_size" not in data or "min_order_size" not in data:
+            raise ValueError("book_constraints_unavailable")
         bids = sorted(
             [
                 (Decimal(str(row["price"])), Decimal(str(row["size"])))
@@ -132,116 +134,92 @@ class PolymarketClient:
             min_order_size=Decimal(str(data.get("min_order_size") or "1")),
             neg_risk=bool(data.get("neg_risk", False)),
         )
+        if book.tick_size <= 0 or book.min_order_size <= 0:
+            raise ValueError("invalid_book_constraints")
+        if any(
+            not p.is_finite() or not s.is_finite() or not 0 < p < 1 or s <= 0
+            for p, s in book.bids + book.asks
+        ):
+            raise ValueError("invalid_book_level")
         if self.book_stream:
             await self.book_stream.update_meta(token_id, book)
         return book
 
-    async def get_fee_rate(self, condition_id: str, title: str = "") -> Decimal:
+    async def get_market(self, condition_id: str) -> dict:
+        """Fetch by path and verify identity: a 200 alone is never enough."""
+        response = await self.http.get(f"{self.settings.clob_api}/markets/{condition_id}")
+        response.raise_for_status()
+        market = response.json()
         if (
-            condition_id in self._fee_cache
-            and time.monotonic() - self._fee_cache_time.get(condition_id, 0) < 300
+            not isinstance(market, dict)
+            or market.get("condition_id", "").lower() != condition_id.lower()
         ):
-            return self._fee_cache[condition_id]
-        try:
-            response = await self.http.get(
-                f"{self.settings.gamma_api}/markets",
-                # Gamma's REST filter uses the camelCase conditionId name.
-                # Snake_case is ignored and returns an unrelated first market.
-                params={"conditionId": condition_id, "limit": 1},
-            )
-            response.raise_for_status()
-            raw = response.json()
-            market = raw[0] if isinstance(raw, list) and raw else None
-            if market is None and isinstance(raw, dict):
-                data = raw.get("data") or []
-                market = data[0] if data else None
-            if not market:
-                rate = self._fallback_fee_rate(title)
-                self._fee_cache[condition_id] = rate
-                self._fee_cache_time[condition_id] = time.monotonic()
-                return rate
-            # Gamma explicitly marks fee-free markets. Never apply the
-            # category fallback when feesEnabled is false.
-            if market.get("feesEnabled") is False:
-                rate = Decimal(0)
-            else:
-                schedule = market.get("feeSchedule") or {}
-                rate = (
-                    Decimal(str(schedule.get("rate"))) if schedule.get("rate") is not None else None
-                )
-                if rate is None and market.get("takerBaseFee") is not None:
-                    rate = Decimal(str(market["takerBaseFee"])) / Decimal(10000)
-                if rate is None:
-                    rate = self._fallback_fee_rate(title)
-        except Exception:
-            rate = self._fallback_fee_rate(title)
+            raise ValueError("market_identity_mismatch")
+        return market
+
+    async def get_fee_rate(self, condition_id: str, title: str = "") -> Decimal:
+        """Only accept an explicit, supported CLOB fee curve. No title guesses."""
+        cached = self._fee_cache.get(condition_id)
+        if cached is not None and time.monotonic() - self._fee_cache_time[condition_id] < 60:
+            return cached
+        response = await self.http.get(f"{self.settings.clob_api}/clob-markets/{condition_id}")
+        response.raise_for_status()
+        info = response.json()
+        if not isinstance(info, dict) or info.get("c", "").lower() != condition_id.lower():
+            raise ValueError("fee_market_identity_mismatch")
+        schedule = info.get("fd")
+        if not isinstance(schedule, dict) or "r" not in schedule or "e" not in schedule:
+            raise ValueError("fee_schedule_unavailable")
+        rate = Decimal(str(schedule["r"]))
+        exponent = Decimal(str(schedule["e"]))
+        if not rate.is_finite() or not 0 <= rate <= 1:
+            raise ValueError("invalid_fee_rate")
+        if not exponent.is_finite() or exponent != 1:
+            raise ValueError("unsupported_fee_exponent")
+        # A zero rate explicitly returned by the exchange is valid.
         self._fee_cache[condition_id] = rate
         self._fee_cache_time[condition_id] = time.monotonic()
         return rate
 
-    async def get_resolution(self, condition_id: str, outcome: str) -> Decimal | None:
-        cache_key = (condition_id, outcome.lower())
+    async def get_resolution(
+        self, condition_id: str, outcome: str, token_id: str | None = None
+    ) -> Decimal | None:
+        cache_key = (condition_id, token_id or outcome.casefold())
         cached = self._resolution_cache.get(cache_key)
         if cached and time.monotonic() - cached[0] < 15:
             return cached[1]
-        response = await self.http.get(
-            f"{self.settings.gamma_api}/markets",
-            params={"conditionId": condition_id, "limit": 1},
+        market = await self.get_market(condition_id)
+        tokens = market.get("tokens") or []
+        selected = [
+            token
+            for token in tokens
+            if (
+                str(token.get("token_id")) == token_id
+                if token_id is not None
+                else str(token.get("outcome", "")).casefold() == outcome.casefold()
+            )
+        ]
+        if len(selected) != 1:
+            raise ValueError("resolution_token_mismatch")
+        if str(selected[0].get("outcome", "")).casefold() != outcome.casefold():
+            raise ValueError("resolution_outcome_mismatch")
+        result = None
+        if market.get("closed") is True:
+            winners = [token for token in tokens if token.get("winner") is True]
+            if market.get("is_50_50_outcome") is True:
+                # Explicit void/split payout, never inferred from a 0.5 quote.
+                result = Decimal("0.5")
+            elif len(winners) == 1 and all(isinstance(t.get("winner"), bool) for t in tokens):
+                result = Decimal(1) if selected[0]["winner"] else Decimal(0)
+        log.info(
+            "resolution_checked",
+            condition_id=condition_id,
+            returned_condition_id=market["condition_id"],
+            question=market.get("question"),
+            token_id=selected[0].get("token_id"),
+            outcome=outcome,
+            closed=market.get("closed"),
+            payout=str(result) if result is not None else None,
         )
-        response.raise_for_status()
-        raw = response.json()
-        market = raw[0] if isinstance(raw, list) and raw else None
-        if not market:
-            self._resolution_cache[cache_key] = (time.monotonic(), None)
-            return None
-        closed_value = market.get("closed")
-        resolved_value = market.get("resolved")
-        is_closed = str(closed_value).lower() in {"true", "1"} or str(resolved_value).lower() in {
-            "true",
-            "1",
-        }
-        if not is_closed:
-            log.info(
-                "market_not_resolved",
-                condition_id=condition_id,
-                closed=closed_value,
-                resolved=resolved_value,
-                outcome_prices=market.get("outcomePrices"),
-            )
-            self._resolution_cache[cache_key] = (time.monotonic(), None)
-            return None
-        try:
-            outcomes_raw = market.get("outcomes") or []
-            prices_raw = market.get("outcomePrices") or []
-            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
-            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
-            index = next(
-                i for i, value in enumerate(outcomes) if str(value).lower() == outcome.lower()
-            )
-            payout = Decimal(str(prices[index]))
-        except (ValueError, TypeError, StopIteration, IndexError, json.JSONDecodeError):
-            log.warning(
-                "market_resolution_unparseable",
-                condition_id=condition_id,
-                outcome=outcome,
-                closed=closed_value,
-                resolved=resolved_value,
-                outcomes=market.get("outcomes"),
-                outcome_prices=market.get("outcomePrices"),
-            )
-            self._resolution_cache[cache_key] = (time.monotonic(), None)
-            return None
-        result = payout if payout in {Decimal(0), Decimal(1)} else None
         self._resolution_cache[cache_key] = (time.monotonic(), result)
         return result
-
-    @staticmethod
-    def _fallback_fee_rate(title: str) -> Decimal:
-        text = title.lower()
-        if "crypto" in text or "bitcoin" in text or "ethereum" in text:
-            return Decimal("0.07")
-        if "sport" in text or "nfl" in text or "nba" in text:
-            return Decimal("0.05")
-        if "politic" in text or "election" in text:
-            return Decimal("0.04")
-        return Decimal("0.05")

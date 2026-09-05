@@ -7,7 +7,7 @@
 - live Data API для обнаружения исполненных сделок лидеров;
 - live CLOB WebSocket с REST fallback для симуляции исполнения;
 - FAK market execution с глубиной книги и partial fills;
-- актуальный fee schedule рынка из Gamma API с консервативным fallback;
+- актуальный fee schedule рынка из CLOB API; исполнение блокируется, если параметры комиссии не подтверждены биржей;
 - контроль slippage относительно цены сделки лидера;
 - проверка минимального размера CLOB-ордера;
 - paper-позиции, баланс, ордера и история;
@@ -28,6 +28,12 @@ cp .env.example .env
 nano .env
 docker compose up -d --build
 docker compose logs -f bot
+```
+
+Read-only settlement audit (uses positions from the database when no IDs are supplied):
+
+```bash
+docker compose exec bot python -m app.audit
 ```
 
 В `.env` укажи токен Telegram-бота и свой numeric Telegram ID. Секреты не отправляй в чат.

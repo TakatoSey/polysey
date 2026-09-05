@@ -152,41 +152,62 @@ class TelegramApp:
             rows = await positions(session)
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
             await session.commit()
-        if not rows:
-            pnl = account.paper_balance - account.starting_balance
-            return (
-                f"<b>📊 Портфель</b>\nБаланс/equity: <b>${account.paper_balance:.2f}</b>\n"
-                f"PNL: <b>${pnl:.2f}</b>\nОткрытых позиций нет."
-            )
+        lines = [
+            "<b>📊 Портфель · PAPER</b>",
+            f"Свободно: <b>${account.paper_balance:.2f}</b>",
+            f"Зафиксированный PNL: ${account.realized_pnl:+.2f}",
+        ]
         marked_value = Decimal(0)
-        unrealized = Decimal(0)
-        lines = ["<b>📊 Портфель</b>", f"Баланс: <b>${account.paper_balance:.2f}</b>"]
+        unknown = 0
         for row in rows:
-            current = row.average_price
+            current = None
+            label = "лучшая цена продажи"
             try:
-                book = await self.engine.client.get_book(row.token_id)
-                if book.bids:
-                    current = book.bids[0][0]
-            except Exception:
-                pass
-            value = row.shares * current
-            pnl = value - row.cost_basis
-            marked_value += value
-            unrealized += pnl
-            lines.append(
-                f"• {html.escape(row.title)}\n  {html.escape(row.outcome)}: {row.shares:.4f} шт.\n"
-                f"  вход ${row.average_price:.4f} → выход ${current:.4f}\n  PNL: <b>${pnl:.4f}</b>"
+                payout = await self.engine.client.get_resolution(
+                    row.condition_id, row.outcome, row.token_id
+                )
+                if payout is not None:
+                    current = payout
+                    label = "выплата за share · ожидает зачисления"
+                else:
+                    book = await self.engine.client.get_book(row.token_id)
+                    if book.bids:
+                        current = book.bids[0][0]
+            except Exception as exc:
+                log.warning("portfolio_quote_unavailable", token_id=row.token_id, error=str(exc))
+            title = html.escape(row.title[:180])
+            outcome = html.escape(row.outcome)
+            entry = f"\n<b>{title}</b>\n{outcome} · {row.shares:.4f} shares\nЗатрачено: ${row.cost_basis:.2f}"
+            if current is None:
+                unknown += 1
+                entry += "\nЦена и PNL: <b>нет подтверждённых данных</b>"
+            else:
+                value = row.shares * current
+                marked_value += value
+                entry += f"\n{label}: ${current:.4f}\nОценка: ${value:.2f} · PNL ${value - row.cost_basis:+.2f}"
+            lines.append(entry)
+        if unknown:
+            summary = f"Общая стоимость и PNL: <b>недоступны</b>\nНет цены у позиций: {unknown}"
+        else:
+            equity = account.paper_balance + marked_value
+            summary = (
+                f"Оценка позиций: ${marked_value:.2f}\n"
+                f"Общая оценка: <b>${equity:.2f}</b> · PNL ${equity - account.starting_balance:+.2f}\n"
+                "Оценка по лучшему bid до комиссии; продажа всего объёма может дать меньше."
             )
-        equity = account.paper_balance + marked_value
-        total_pnl = equity - account.starting_balance
-        lines.insert(
-            2,
-            f"Mark-to-market: <b>${marked_value:.2f}</b>\n"
-            f"Всего equity: <b>${equity:.2f}</b> (PNL: <b>${total_pnl:.2f}</b>)\n"
-            f"Unrealized PNL: <b>${unrealized:.2f}</b>\n"
-            f"Realized PNL: <b>${account.realized_pnl:.2f}</b>",
-        )
-        return "\n".join(lines)
+        lines.insert(2, summary)
+        if not rows:
+            lines.append("\nОткрытых позиций нет.")
+        # Keep one Telegram screen under the platform text limit.
+        rendered = []
+        length = 0
+        for line in lines:
+            if length + len(line) > 3600:
+                rendered.append("\nОстальные позиции скрыты: превышен размер экрана.")
+                break
+            rendered.append(line)
+            length += len(line) + 1
+        return "\n".join(rendered)
 
     async def _orders_text(self) -> str:
         async with SessionLocal() as session:

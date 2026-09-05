@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError
 from .config import Settings
 from .db import SessionLocal
 from .models import CopyTrade, Leader, LeaderPosition, PaperOrder, Position
-from .paper import execute_buy_fak_by_budget, execute_fak, fee_rate_for_title
+from .paper import execute_buy_fak_by_budget, execute_fak
 from .polymarket import LeaderActivity, PolymarketClient
 from .repository import apply_fill, get_or_create_account, get_position, get_risk
 
@@ -32,12 +32,12 @@ class CopyEngine:
 
     async def run(self) -> None:
         while not self.stop_event.is_set():
-            try:
-                await self.poll_once()
-                await self.monitor_risk_once()
-                await self.settle_once()
-            except Exception:
-                log.exception("engine_iteration_failed")
+            # Settlement must run even when an unrelated trade/feed fails.
+            for stage in (self.settle_once, self.monitor_risk_once, self.poll_once):
+                try:
+                    await stage()
+                except Exception:
+                    log.exception("engine_stage_failed", stage=stage.__name__)
             try:
                 await asyncio.wait_for(
                     self.stop_event.wait(), timeout=self.settings.poll_interval_seconds
@@ -71,7 +71,7 @@ class CopyEngine:
                 if not db_leader:
                     continue
                 if not db_leader.initialized:
-                    db_leader.last_timestamp = max(event.timestamp for event in activities)
+                    db_leader.last_timestamp = max(event.timestamp for event in activities) + 1
                     db_leader.initialized = True
                     await session.commit()
                     log.info(
@@ -84,14 +84,16 @@ class CopyEngine:
                     event for event in activities if event.timestamp >= db_leader.last_timestamp
                 ]
                 for event in new_events:
-                    if event.timestamp == db_leader.last_timestamp:
-                        exists = await session.scalar(
-                            select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)
-                        )
-                        if exists:
-                            continue
+                    exists = await session.scalar(
+                        select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)
+                    )
+                    if exists:
+                        continue
                     await self.process_event(session, db_leader, event)
                     db_leader.last_timestamp = max(db_leader.last_timestamp, event.timestamp)
+                    await session.commit()
+                    for notification in session.info.pop("notifications", []):
+                        await self.notify(notification)
                 await session.commit()
 
     async def process_event(self, session, leader: Leader, event: LeaderActivity) -> None:
@@ -106,11 +108,11 @@ class CopyEngine:
             leader_price=event.price,
             status="detected",
         )
-        session.add(copy_trade)
         try:
-            await session.flush()
+            async with session.begin_nested():
+                session.add(copy_trade)
+                await session.flush()
         except IntegrityError:
-            await session.rollback()
             return
 
         leader_pos = await session.scalar(
@@ -121,7 +123,22 @@ class CopyEngine:
         )
         before_leader_shares = leader_pos.shares if leader_pos else Decimal(0)
         account = await get_or_create_account(session, self.settings.paper_initial_balance)
-        fee_rate = await self.client.get_fee_rate(event.condition_id, event.title)
+        try:
+            market = await self.client.get_market(event.condition_id)
+            if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
+                raise ValueError("trade_token_mismatch")
+            if market.get("closed") is not False or market.get("accepting_orders") is not True:
+                raise ValueError("market_not_accepting_orders")
+            fee_rate = await self.client.get_fee_rate(event.condition_id)
+            delay = float(market["seconds_delay"])
+            if not 0 <= delay <= 60:
+                raise ValueError("invalid_market_delay")
+        except Exception as exc:
+            copy_trade.status = "failed"
+            copy_trade.skip_reason = f"market_data_unavailable:{type(exc).__name__}"
+            await self.update_leader_position(session, leader.id, event, leader_pos)
+            log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
+            return
         if event.side == "BUY":
             # The configured copy size is a total cash budget. Reserve room for
             # the taker fee so apply_fill cannot reject a fill after consuming
@@ -152,8 +169,7 @@ class CopyEngine:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = "invalid_size_or_price"
             return
-        if self.settings.copy_latency_seconds > 0:
-            await asyncio.sleep(self.settings.copy_latency_seconds)
+        await asyncio.sleep(delay + self.settings.copy_latency_seconds)
         try:
             book = await self.client.get_book(event.token_id)
             if event.side == "BUY":
@@ -210,15 +226,13 @@ class CopyEngine:
             copy_trade.skip_reason = str(exc)
             order.status = "rejected"
             order.reason = str(exc)
+            order.filled_shares = order.average_fill_price = order.fee = Decimal(0)
             return
-        position = await session.scalar(select(Position).where(Position.token_id == event.token_id))
-        if position:
-            position.fee_rate = fee_rate
         copy_trade.status = "executed"
         # Keep the chat quiet: only successful BUY copies are user-facing
         # notifications. Rejections/partial misses remain visible in Ордера.
         if event.side == "BUY":
-            await self.notify(
+            session.info.setdefault("notifications", []).append(
                 f"✅ Скопировано BUY\n{event.title}\n"
                 f"Исполнено: {fill.shares:.4f} @ ${fill.average_price:.4f}\n"
                 f"Комиссия: ${fill.fee:.5f}"
@@ -276,11 +290,28 @@ class CopyEngine:
                     trigger = "trailing-stop"
                 if not trigger:
                     continue
+                requested_shares = position.shares
+                try:
+                    fee_rate = await self.client.get_fee_rate(position.condition_id)
+                    market = await self.client.get_market(position.condition_id)
+                    if (
+                        market.get("accepting_orders") is not True
+                        or market.get("closed") is not False
+                    ):
+                        continue
+                    delay = float(market["seconds_delay"])
+                    if not 0 <= delay <= 60:
+                        continue
+                    await asyncio.sleep(delay + self.settings.copy_latency_seconds)
+                    book = await self.client.get_book(position.token_id)
+                except Exception as exc:
+                    log.warning("risk_data_unavailable", token_id=position.token_id, error=str(exc))
+                    continue
                 fill = execute_fak(
                     book,
                     "SELL",
                     position.shares,
-                    position.fee_rate or fee_rate_for_title(position.title),
+                    fee_rate,
                 )
                 if fill.shares <= 0:
                     continue
@@ -297,12 +328,12 @@ class CopyEngine:
                     )
                 except ValueError:
                     continue
-                rule.enabled = False
+                rule.enabled = fill.shares < requested_shares
                 session.add(
                     PaperOrder(
                         token_id=position.token_id,
                         side="SELL",
-                        requested_shares=position.shares,
+                        requested_shares=requested_shares,
                         filled_shares=fill.shares,
                         average_fill_price=fill.average_price,
                         fee=fill.fee,
@@ -321,9 +352,14 @@ class CopyEngine:
             for position in positions:
                 try:
                     payout = await self.client.get_resolution(
-                        position.condition_id, position.outcome
+                        position.condition_id, position.outcome, position.token_id
                     )
-                except Exception:
+                except Exception as exc:
+                    log.warning(
+                        "settlement_check_failed",
+                        condition_id=position.condition_id,
+                        error=str(exc),
+                    )
                     continue
                 if payout is None:
                     continue
@@ -340,7 +376,11 @@ class CopyEngine:
                         average_fill_price=payout,
                         fee=Decimal(0),
                         status="settled",
-                        reason="resolution:won" if payout == 1 else "resolution:lost",
+                        reason="resolution:won"
+                        if payout == 1
+                        else "resolution:lost"
+                        if payout == 0
+                        else "resolution:split",
                     )
                 )
                 rule = await get_risk(session, position.token_id)

@@ -18,6 +18,9 @@ dependencies = [
 requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "aiosqlite>=0.20,<1", "ruff>=0.9,<1"]
+
 [tool.setuptools.packages.find]
 include = ["app*"]
 

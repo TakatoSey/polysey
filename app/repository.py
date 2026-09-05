@@ -76,10 +76,10 @@ async def apply_fill(
     else:
         if not position or position.shares <= 0:
             raise ValueError("no_position")
-        sold = min(position.shares, fill.shares)
-        proceeds = sold * fill.average_price - (
-            fill.fee * (sold / fill.shares if fill.shares else 0)
-        )
+        if fill.shares > position.shares:
+            raise ValueError("insufficient_shares")
+        sold = fill.shares
+        proceeds = fill.notional - fill.fee
         account.paper_balance += proceeds
         trade_pnl = proceeds - (position.average_price * sold)
         position.realized_pnl += trade_pnl
