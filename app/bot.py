@@ -209,29 +209,55 @@ class TelegramApp:
                 if last.status == "executed"
                 else html.escape(last.skip_reason or last.status)
             )
-        cashflow = Decimal(0)
+        realized_pnl = Decimal(0)
+        open_cost = Decimal(0)
+        lots: list[list[Decimal]] = []  # shares, total cost including fee
         buys = sells = 0
-        for order in all_orders:
-            if order.status not in {"filled", "partial"} or order.filled_shares <= 0:
+        for order in sorted(all_orders, key=lambda value: value.created_at or datetime.min):
+            if order.status not in {"filled", "partial", "settled"} or order.filled_shares <= 0:
                 continue
             notional = order.filled_shares * order.average_fill_price
             if order.side == "BUY":
-                cashflow -= notional + (order.fee or Decimal(0))
+                lots.append([order.filled_shares, notional + (order.fee or Decimal(0))])
                 buys += 1
             elif order.side == "SELL":
-                cashflow += notional - (order.fee or Decimal(0))
+                remaining = order.filled_shares
+                proceeds = notional - (order.fee or Decimal(0))
+                while remaining > 0 and lots:
+                    lot_shares, lot_cost = lots[0]
+                    consumed = min(remaining, lot_shares)
+                    realized_pnl += proceeds * consumed / order.filled_shares - lot_cost * consumed / lot_shares
+                    lot_shares -= consumed
+                    lot_cost -= lot_cost * consumed / (lot_shares + consumed)
+                    remaining -= consumed
+                    if lot_shares <= Decimal("0.00000001"):
+                        lots.pop(0)
+                    else:
+                        lots[0] = [lot_shares, lot_cost]
                 sells += 1
-        pnl_note = (
-            "денежный PNL по закрытым/исполненным ордерам"
-            if not any(order.side == "BUY" and order.status in {"filled", "partial"} for order in all_orders)
-            else "cash-flow PNL · открытые позиции считаются отдельно"
-        )
+            elif order.status == "settled":
+                remaining = order.filled_shares
+                proceeds = notional
+                while remaining > 0 and lots:
+                    lot_shares, lot_cost = lots[0]
+                    consumed = min(remaining, lot_shares)
+                    realized_pnl += proceeds * consumed / order.filled_shares - lot_cost * consumed / lot_shares
+                    lot_shares -= consumed
+                    lot_cost -= lot_cost * consumed / (lot_shares + consumed)
+                    remaining -= consumed
+                    if lot_shares <= Decimal("0.00000001"):
+                        lots.pop(0)
+                    else:
+                        lots[0] = [lot_shares, lot_cost]
+        open_cost = sum((cost for _, cost in lots), Decimal(0))
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
             f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
             f"Сделки: {buys} покупок · {sells} продаж\n"
-            f"PNL копирования: <b>${cashflow:+.4f}</b>\n<i>{pnl_note}</i>\n"
+            f"Реализованный PNL: <b>${realized_pnl:+.4f}</b>\n"
+            f"Открытая себестоимость: <b>${open_cost:.4f}</b>\n"
+            "<i>FIFO · комиссии учтены; открытые shares не считаются убытком</i>\n"
             f"Последний результат: <b>{last_result}</b>\n\n"
             "Все новые сделки этого адреса обрабатываются по общим настройкам."
         )
