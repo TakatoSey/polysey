@@ -150,9 +150,9 @@ class TelegramApp:
         builder = InlineKeyboardBuilder()
         for row in current:
             icon = "🟢" if row.active else "⚪"
-            short = f"{row.address[:8]}…{row.address[-6:]}"
-            lines.append(f"{icon} <code>{row.address}</code>")
-            builder.button(text=f"{icon} {short}", callback_data=f"leader_view:{row.id}:{page}")
+            name = row.label or f"Трейдер #{row.id}"
+            lines.append(f"{icon} <b>{html.escape(name)}</b>")
+            builder.button(text=f"{icon} {name[:28]}", callback_data=f"leader_view:{row.id}:{page}")
             builder.button(
                 text="⏸" if row.active else "▶️", callback_data=f"leader_toggle:{row.id}:{page}"
             )
@@ -178,6 +178,22 @@ class TelegramApp:
                     )
                 ).all()
             )
+            all_trades = list(
+                (
+                    await session.scalars(
+                        select(CopyTrade)
+                        .where(CopyTrade.leader_id == leader_id)
+                    )
+                ).all()
+            )
+            trade_ids = [trade.id for trade in all_trades]
+            all_orders = list(
+                (
+                    await session.scalars(
+                        select(PaperOrder).where(PaperOrder.copy_trade_id.in_(trade_ids))
+                    )
+                ).all()
+            ) if trade_ids else []
         if not row:
             await self._leaders_panel(page, chat_id)
             return
@@ -193,10 +209,29 @@ class TelegramApp:
                 if last.status == "executed"
                 else html.escape(last.skip_reason or last.status)
             )
+        cashflow = Decimal(0)
+        buys = sells = 0
+        for order in all_orders:
+            if order.status not in {"filled", "partial"} or order.filled_shares <= 0:
+                continue
+            notional = order.filled_shares * order.average_fill_price
+            if order.side == "BUY":
+                cashflow -= notional + (order.fee or Decimal(0))
+                buys += 1
+            elif order.side == "SELL":
+                cashflow += notional - (order.fee or Decimal(0))
+                sells += 1
+        pnl_note = (
+            "денежный PNL по закрытым/исполненным ордерам"
+            if not any(order.side == "BUY" and order.status in {"filled", "partial"} for order in all_orders)
+            else "cash-flow PNL · открытые позиции считаются отдельно"
+        )
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
             f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
+            f"Сделки: {buys} покупок · {sells} продаж\n"
+            f"PNL копирования: <b>${cashflow:+.4f}</b>\n<i>{pnl_note}</i>\n"
             f"Последний результат: <b>{last_result}</b>\n\n"
             "Все новые сделки этого адреса обрабатываются по общим настройкам."
         )
