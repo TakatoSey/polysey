@@ -101,8 +101,7 @@ class RTDSTradeStream:
         received_at, received_monotonic = time.time(), time.monotonic()
         self.counters["frames"] += 1
         for item in self._messages(raw):
-                            event = self._parse(item, received_at, received_monotonic,
-                                                self.tracked_addresses)
+            event = self._parse(item, received_at, received_monotonic, self.tracked_addresses)
             if event is None:
                 self.counters["invalid_trades"] += 1
                 continue
