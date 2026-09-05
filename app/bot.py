@@ -11,7 +11,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 
@@ -870,7 +870,12 @@ class TelegramApp:
         while True:
             message = await self.engine.notifications.get()
             try:
-                await self.bot.send_message(self.settings.telegram_allowed_user_id, message)
+                await self.bot.send_message(
+                    self.settings.telegram_allowed_user_id,
+                    message,
+                    parse_mode="HTML",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
             except Exception:
                 log.exception("telegram_notification_failed")
 

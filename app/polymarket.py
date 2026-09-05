@@ -25,6 +25,7 @@ class LeaderActivity:
     title: str
     outcome: str
     slug: str
+    trader_name: str = ""
 
 
 @dataclass(slots=True)
@@ -94,6 +95,7 @@ class PolymarketClient:
                     title=item.get("title") or item.get("slug") or "Unknown market",
                     outcome=item.get("outcome") or "",
                     slug=item.get("slug") or "",
+                    trader_name=(item.get("name") or item.get("pseudonym") or "").strip(),
                 )
             )
         return sorted(events, key=lambda event: (event.timestamp, event.event_key))

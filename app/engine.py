@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import time
 from decimal import Decimal
 
@@ -30,6 +31,24 @@ class CopyEngine:
             self.notifications.put_nowait(message)
         except asyncio.QueueFull:
             log.warning("notification_queue_full")
+
+    @staticmethod
+    def build_buy_notification(leader: Leader, event: LeaderActivity, fill) -> str:
+        trader_name = (
+            event.trader_name or leader.label or (f"{leader.address[:8]}…{leader.address[-6:]}")
+        )
+        profile_url = f"https://polymarket.com/profile/{leader.address}"
+        total_debit = fill.notional + fill.fee
+        return (
+            "✅ <b>BUY скопирован</b>\n\n"
+            f"<b>{html.escape(event.title)}</b>\n"
+            f"Исход: <b>{html.escape(event.outcome)}</b>\n\n"
+            f'Трейдер: <a href="{profile_url}">{html.escape(trader_name)}</a>\n'
+            f"Сумма: <b>${fill.notional:.4f}</b>\n"
+            f"Получено: <b>{fill.shares:.4f} shares</b>\n"
+            f"Цена: ${fill.average_price:.4f} · комиссия ${fill.fee:.5f}\n"
+            f"Списано всего: ${total_debit:.4f}"
+        )
 
     @staticmethod
     def calculate_own_buy_capacity(account, settings: Settings, fee_rate: Decimal) -> Decimal:
@@ -163,6 +182,8 @@ class CopyEngine:
 
     async def process_event(self, session, leader: Leader, event: LeaderActivity) -> None:
         detection_lag = max(0, time.time() - event.timestamp)
+        if event.trader_name and not leader.label:
+            leader.label = event.trader_name[:120]
         copy_trade = CopyTrade(
             leader_id=leader.id,
             event_key=event.event_key,
@@ -363,9 +384,7 @@ class CopyEngine:
         # notifications. Rejections/partial misses remain visible in Ордера.
         if event.side == "BUY":
             session.info.setdefault("notifications", []).append(
-                f"✅ Скопировано BUY\n{event.title}\n"
-                f"Исполнено: {fill.shares:.4f} @ ${fill.average_price:.4f}\n"
-                f"Комиссия: ${fill.fee:.5f}"
+                self.build_buy_notification(leader, event, fill)
             )
 
     async def update_leader_position(

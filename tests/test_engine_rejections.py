@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from app.config import Settings
 from app.engine import CopyEngine
 from app.models import CopyTrade, PaperOrder
+from app.paper import Fill
 from app.polymarket import Book, LeaderActivity
 
 
@@ -100,3 +101,37 @@ def test_small_copy_is_raised_to_exchange_share_minimum_when_affordable():
     )
 
     assert budget == Decimal("1.85")
+
+
+def test_buy_notification_contains_outcome_link_amount_and_shares():
+    leader = SimpleNamespace(address="0x09b045baad1fbe115c70785635a261411774a3b6", label=None)
+    event = LeaderActivity(
+        event_key="event",
+        timestamp=1,
+        condition_id="condition",
+        token_id="token",
+        side="BUY",
+        size=Decimal("10"),
+        price=Decimal("0.5"),
+        title="Will A & B win?",
+        outcome="Yes",
+        slug="market",
+        trader_name="blackewolf83",
+    )
+    fill = Fill(
+        shares=Decimal("5"),
+        average_price=Decimal("0.37"),
+        notional=Decimal("1.85"),
+        fee=Decimal("0.01"),
+        status="filled",
+    )
+
+    message = CopyEngine.build_buy_notification(leader, event, fill)
+
+    assert "Will A &amp; B win?" in message
+    assert "Исход: <b>Yes</b>" in message
+    assert ">blackewolf83</a>" in message
+    assert "https://polymarket.com/profile/0x09b045" in message
+    assert "Сумма: <b>$1.8500</b>" in message
+    assert "Получено: <b>5.0000 shares</b>" in message
+    assert "Списано всего: $1.8600" in message

@@ -28,6 +28,32 @@ def market(**overrides):
 
 
 @pytest.mark.asyncio
+async def test_activity_includes_public_polymarket_name():
+    payload = [
+        {
+            "type": "TRADE",
+            "asset": "11",
+            "side": "BUY",
+            "transactionHash": "0xtrade",
+            "timestamp": 123,
+            "conditionId": CONDITION,
+            "size": 5,
+            "price": 0.4,
+            "title": "Market",
+            "outcome": "Yes",
+            "name": "blackewolf83",
+            "pseudonym": "Radiant-Metaphor",
+        }
+    ]
+    client = client_for(lambda _: httpx.Response(200, json=payload))
+    try:
+        events = await client.get_activity("0x" + "1" * 40)
+        assert events[0].trader_name == "blackewolf83"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_resolution_uses_verified_clob_path_and_token():
     def handler(request):
         assert request.url.path == f"/markets/{CONDITION}"
