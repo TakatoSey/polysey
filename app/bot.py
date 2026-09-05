@@ -208,6 +208,8 @@ class TelegramApp:
             "<b>⚙️ Настройки</b>\n"
             f"Размер сделки: ${account.trade_size:.2f}\n"
             f"Максимум сделки: ${account.max_trade_size:.2f}\n"
+            f"От баланса: {self.settings.copy_balance_pct * 100:.2f}%\n"
+            f"Масштаб лидера: {self.settings.leader_order_scale * 100:.2f}% его ордера\n"
             f"Slippage: {account.slippage_bps / 100:.2f}%\n"
             "Дневной лимит: нет\nЛидеры: без пользовательского лимита\n\n"
             "Команды: /setsize, /setmax, /setslippage, /risk TOKEN sl=0.2 tp=0.25 trail=0.1"

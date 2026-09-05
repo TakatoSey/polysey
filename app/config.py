@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     copy_latency_seconds: float = Field(default=0.0, alias="COPY_LATENCY_SECONDS")
     default_trade_size: Decimal = Field(default=Decimal("5"), alias="DEFAULT_TRADE_SIZE")
     max_trade_size: Decimal = Field(default=Decimal("10"), alias="MAX_TRADE_SIZE")
+    # Buy budget is primarily a percentage of our own free cash. The leader
+    # order notional is an additional proportional ceiling.
+    copy_balance_pct: Decimal = Field(default=Decimal("0.05"), alias="COPY_BALANCE_PCT")
+    leader_order_scale: Decimal = Field(default=Decimal("0.10"), alias="LEADER_ORDER_SCALE")
     default_slippage_bps: int = Field(default=500, alias="DEFAULT_SLIPPAGE_BPS")
     data_api: str = Field(default="https://data-api.polymarket.com", alias="POLYMARKET_DATA_API")
     clob_api: str = Field(default="https://clob.polymarket.com", alias="POLYMARKET_CLOB")

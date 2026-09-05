@@ -127,7 +127,15 @@ class CopyEngine:
             # the taker fee so apply_fill cannot reject a fill after consuming
             # the whole available balance on notional alone.
             cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
-            buy_budget = min(account.max_trade_size, account.trade_size, cash_budget)
+            balance_budget = cash_budget * self.settings.copy_balance_pct
+            leader_notional = event.size * event.price
+            leader_budget = leader_notional * self.settings.leader_order_scale
+            # The old fixed trade_size remains a hard safety ceiling, while
+            # balance and leader order size determine the actual allocation.
+            limits = [account.max_trade_size, account.trade_size, balance_budget]
+            if leader_budget > 0:
+                limits.append(leader_budget)
+            buy_budget = min(*limits, cash_budget)
             target_shares = buy_budget / event.price if event.price else Decimal(0)
         else:
             position = await get_position(session, event.token_id)
