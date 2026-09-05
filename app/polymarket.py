@@ -145,7 +145,10 @@ class PolymarketClient:
         try:
             response = await self.http.get(
                 f"{self.settings.gamma_api}/markets",
-                params={"condition_ids": condition_id, "limit": 1},
+                # Gamma's REST filter is singular (condition_id). The
+                # plural condition_ids parameter silently returns an empty
+                # list, which would prevent resolved paper positions settling.
+                params={"condition_id": condition_id, "limit": 1},
             )
             response.raise_for_status()
             raw = response.json()
@@ -169,17 +172,25 @@ class PolymarketClient:
             return cached[1]
         response = await self.http.get(
             f"{self.settings.gamma_api}/markets",
-            params={"condition_ids": condition_id, "limit": 1},
+            params={"condition_id": condition_id, "limit": 1},
         )
         response.raise_for_status()
         raw = response.json()
         market = raw[0] if isinstance(raw, list) and raw else None
-        if not market or not market.get("closed"):
+        if not market:
+            self._resolution_cache[cache_key] = (time.monotonic(), None)
+            return None
+        closed_value = market.get("closed")
+        resolved_value = market.get("resolved")
+        is_closed = str(closed_value).lower() == "true" or str(resolved_value).lower() == "true"
+        if not is_closed:
             self._resolution_cache[cache_key] = (time.monotonic(), None)
             return None
         try:
-            outcomes = json.loads(market.get("outcomes") or "[]")
-            prices = json.loads(market.get("outcomePrices") or "[]")
+            outcomes_raw = market.get("outcomes") or []
+            prices_raw = market.get("outcomePrices") or []
+            outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else outcomes_raw
+            prices = json.loads(prices_raw) if isinstance(prices_raw, str) else prices_raw
             index = next(
                 i for i, value in enumerate(outcomes) if str(value).lower() == outcome.lower()
             )

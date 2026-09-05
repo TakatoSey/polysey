@@ -144,7 +144,8 @@ class CopyEngine:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = "invalid_size_or_price"
             return
-        await asyncio.sleep(self.settings.copy_latency_seconds)
+        if self.settings.copy_latency_seconds > 0:
+            await asyncio.sleep(self.settings.copy_latency_seconds)
         try:
             book = await self.client.get_book(event.token_id)
             if event.side == "BUY":

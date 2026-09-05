@@ -16,7 +16,9 @@ class Settings(BaseSettings):
     )
     paper_initial_balance: Decimal = Field(default=Decimal("100"), alias="PAPER_INITIAL_BALANCE")
     poll_interval_seconds: float = Field(default=2.0, alias="POLL_INTERVAL_SECONDS")
-    copy_latency_seconds: float = Field(default=1.0, alias="COPY_LATENCY_SECONDS")
+    # Extra simulation delay only. Real VPS/API/WebSocket latency is already
+    # included naturally; zero avoids adding an artificial one-second lag.
+    copy_latency_seconds: float = Field(default=0.0, alias="COPY_LATENCY_SECONDS")
     default_trade_size: Decimal = Field(default=Decimal("5"), alias="DEFAULT_TRADE_SIZE")
     max_trade_size: Decimal = Field(default=Decimal("10"), alias="MAX_TRADE_SIZE")
     default_slippage_bps: int = Field(default=500, alias="DEFAULT_SLIPPAGE_BPS")
