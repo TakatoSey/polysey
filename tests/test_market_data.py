@@ -1,3 +1,4 @@
+import asyncio
 from decimal import Decimal
 
 import httpx
@@ -49,7 +50,37 @@ async def test_activity_includes_public_polymarket_name():
     try:
         events = await client.get_activity("0x" + "1" * 40)
         assert events[0].trader_name == "blackewolf83"
+        assert events[0].received_at > 0
+        assert events[0].received_monotonic > 0
     finally:
+        await client.close()
+
+
+async def test_concurrent_metadata_is_shared_but_closed_status_is_not_cached():
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+
+    async def handler(request):
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+        return httpx.Response(200, json=market(closed=calls > 1))
+
+    client = client_for(handler)
+    try:
+        first = asyncio.create_task(client.get_market(CONDITION))
+        await asyncio.wait_for(entered.wait(), 1)
+        second = asyncio.create_task(client.get_market(CONDITION))
+        await asyncio.sleep(0)
+        release.set()
+        a, b = await asyncio.gather(first, second)
+        assert calls == 1
+        assert a["closed"] is False and b["closed"] is False
+        assert (await client.get_market(CONDITION))["closed"] is True
+        assert calls == 2
+    finally:
+        release.set()
         await client.close()
 
 

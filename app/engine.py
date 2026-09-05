@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import time
+from dataclasses import dataclass
 from decimal import Decimal
 
 import structlog
@@ -11,12 +12,24 @@ from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
 from .db import SessionLocal
-from .models import CopyTrade, Leader, LeaderPosition, PaperOrder, Position
+from .models import CopyTrade, Leader, LeaderPosition, PaperOrder, Position, RiskRule
 from .paper import execute_buy_fak_by_budget, execute_fak
-from .polymarket import LeaderActivity, PolymarketClient
+from .polymarket import Book, LeaderActivity, PolymarketClient
 from .repository import apply_fill, get_or_create_account, get_position, get_risk
 
 log = structlog.get_logger(__name__)
+
+
+@dataclass
+class PreparedCopy:
+    market: dict | None = None
+    fee_rate: Decimal = Decimal(0)
+    exchange_delay: float = 0.0
+    error: Exception | None = None
+    ready_at: float = 0.0
+    book: Book | None = None
+    book_at: float = 0.0
+    book_error: Exception | None = None
 
 
 class CopyEngine:
@@ -25,6 +38,15 @@ class CopyEngine:
         self.client = client
         self.stop_event = asyncio.Event()
         self.notifications: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
+        # Network preparation is concurrent; all portfolio mutations remain serialized.
+        self._ledger_lock = asyncio.Lock()
+        self._prepare_slots = asyncio.Semaphore(settings.copy_prepare_concurrency)
+        self._poll_slots = asyncio.Semaphore(8)
+        self._maintenance_slots = asyncio.Semaphore(4)
+        self._pending: dict[str, asyncio.Task] = {}
+        self._leader_polls: dict[int, asyncio.Task] = {}
+        self._token_tails: dict[str, asyncio.Task] = {}
+        self._leader_floors: dict[int, int] = {}
 
     async def notify(self, message: str) -> None:
         try:
@@ -115,24 +137,54 @@ class CopyEngine:
         )
 
     async def run(self) -> None:
+        log.info(
+            "copy_latency_config",
+            poll_seconds=self.settings.poll_interval_seconds,
+            artificial_delay_seconds=self.settings.copy_latency_seconds,
+            prepare_concurrency=self.settings.copy_prepare_concurrency,
+        )
+        if self.settings.copy_latency_seconds:
+            log.warning("artificial_copy_delay_enabled", hint="Set COPY_LATENCY_SECONDS=0")
+        loops = [
+            asyncio.create_task(
+                self._repeat(self.poll_background_once, self.settings.poll_interval_seconds)
+            ),
+            asyncio.create_task(
+                self._repeat(self.settle_once, self.settings.maintenance_interval_seconds)
+            ),
+            asyncio.create_task(
+                self._repeat(self.monitor_risk_once, self.settings.maintenance_interval_seconds)
+            ),
+        ]
+        try:
+            await asyncio.gather(*loops)
+        finally:
+            tasks = loops + list(self._leader_polls.values()) + list(self._pending.values())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _repeat(self, stage, interval: float) -> None:
         while not self.stop_event.is_set():
-            # Settlement must run even when an unrelated trade/feed fails.
-            for stage in (self.settle_once, self.monitor_risk_once, self.poll_once):
-                try:
-                    await stage()
-                except Exception:
-                    log.exception("engine_stage_failed", stage=stage.__name__)
+            started = time.monotonic()
             try:
-                await asyncio.wait_for(
-                    self.stop_event.wait(), timeout=self.settings.poll_interval_seconds
-                )
+                await stage()
+            except Exception:
+                log.exception("engine_stage_failed", stage=stage.__name__)
+            # Start-to-start cadence, not HTTP duration plus another full interval.
+            remaining = max(0.05, interval - (time.monotonic() - started))
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 pass
 
     async def stop(self) -> None:
         self.stop_event.set()
 
-    async def poll_once(self) -> None:
+    async def poll_background_once(self) -> None:
+        await self.poll_once(wait=False)
+
+    async def poll_once(self, *, wait: bool = True) -> None:
         async with SessionLocal() as session:
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
             await session.commit()
@@ -142,18 +194,41 @@ class CopyEngine:
                 (await session.scalars(select(Leader).where(Leader.active.is_(True)))).all()
             )
 
+        tasks = []
         for leader in leaders:
+            task = self._leader_polls.get(leader.id)
+            if task is None:
+                task = asyncio.create_task(self._poll_leader(leader))
+                self._leader_polls[leader.id] = task
+
+                def done(completed, leader_id=leader.id):
+                    if self._leader_polls.get(leader_id) is completed:
+                        self._leader_polls.pop(leader_id, None)
+                    if not completed.cancelled() and completed.exception():
+                        log.error(
+                            "leader_poll_failed",
+                            leader_id=leader_id,
+                            error=str(completed.exception()),
+                        )
+
+                task.add_done_callback(done)
+            tasks.append(task)
+        if wait:
+            await asyncio.gather(*tasks)
+
+    async def _poll_leader(self, leader: Leader) -> None:
+        async with self._poll_slots:
             try:
                 activities = await self.client.get_activity(leader.address)
             except Exception:
                 log.exception("leader_activity_failed", leader=leader.address)
-                continue
+                return
             if not activities:
-                continue
+                return
             async with SessionLocal() as session:
                 db_leader = await session.scalar(select(Leader).where(Leader.id == leader.id))
-                if not db_leader:
-                    continue
+                if not db_leader or not db_leader.active:
+                    return
                 if not db_leader.initialized:
                     db_leader.last_timestamp = max(event.timestamp for event in activities) + 1
                     db_leader.initialized = True
@@ -163,25 +238,123 @@ class CopyEngine:
                         leader=leader.address,
                         last_timestamp=db_leader.last_timestamp,
                     )
-                    continue
-                new_events = [
-                    event for event in activities if event.timestamp >= db_leader.last_timestamp
-                ]
-                for event in new_events:
-                    exists = await session.scalar(
-                        select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)
+                    self._leader_floors[leader.id] = db_leader.last_timestamp
+                    return
+                # Keep the session's lower bound stable: late-indexed events must
+                # not disappear just because another token finished sooner.
+                floor = self._leader_floors.setdefault(leader.id, db_leader.last_timestamp)
+                new_events = [event for event in activities if event.timestamp >= floor]
+                if not new_events:
+                    return
+                existing = set(
+                    await session.scalars(
+                        select(CopyTrade.event_key).where(
+                            CopyTrade.event_key.in_([event.event_key for event in new_events])
+                        )
                     )
-                    if exists:
+                )
+                outstanding = []
+                for event in new_events:
+                    if event.event_key in existing:
                         continue
-                    await self.process_event(session, db_leader, event)
-                    db_leader.last_timestamp = max(db_leader.last_timestamp, event.timestamp)
-                    await session.commit()
-                    for notification in session.info.pop("notifications", []):
-                        await self.notify(notification)
+                    outstanding.append(event.timestamp)
+                    self._schedule_copy(leader.id, event)
+                # Never checkpoint past an uncommitted/overflowed event.
+                checkpoint = (
+                    min(outstanding) if outstanding else max(e.timestamp for e in new_events)
+                )
+                db_leader.last_timestamp = checkpoint
                 await session.commit()
 
-    async def process_event(self, session, leader: Leader, event: LeaderActivity) -> None:
-        detection_lag = max(0, time.time() - event.timestamp)
+    def _schedule_copy(self, leader_id: int, event: LeaderActivity) -> None:
+        if event.event_key in self._pending:
+            return
+        if len(self._pending) >= self.settings.copy_queue_limit:
+            log.warning("copy_queue_full", pending=len(self._pending), event_key=event.event_key)
+            return  # REST retries it; no checkpoint or fake rejection.
+        if not event.received_at:
+            event.received_at, event.received_monotonic = time.time(), time.monotonic()
+        predecessor = self._token_tails.get(event.token_id)
+        task = asyncio.create_task(self._execute_queued(leader_id, event, predecessor))
+        self._pending[event.event_key] = task
+        self._token_tails[event.token_id] = task
+
+        def done(completed):
+            self._pending.pop(event.event_key, None)
+            if self._token_tails.get(event.token_id) is completed:
+                self._token_tails.pop(event.token_id, None)
+            if not completed.cancelled() and completed.exception():
+                log.error(
+                    "copy_worker_failed",
+                    event_key=event.event_key,
+                    error=str(completed.exception()),
+                )
+
+        task.add_done_callback(done)
+
+    async def prepare_copy(self, event: LeaderActivity) -> PreparedCopy:
+        prepared = PreparedCopy()
+        try:
+            async with self._prepare_slots:
+                market, fee_rate = await asyncio.gather(
+                    self.client.get_market(event.condition_id),
+                    self.client.get_fee_rate(event.condition_id, event.title),
+                )
+            if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
+                raise ValueError("trade_token_mismatch")
+            if market.get("closed") is not False or market.get("accepting_orders") is not True:
+                raise ValueError("market_not_accepting_orders")
+            delay = float(market["seconds_delay"])
+            if not 0 <= delay <= 60:
+                raise ValueError("invalid_market_delay")
+            prepared.market, prepared.fee_rate, prepared.exchange_delay = market, fee_rate, delay
+            # Independent orders can wait simultaneously, including on the same
+            # token. Do not hold a DB transaction or the balance lock here.
+            await asyncio.sleep(delay + self.settings.copy_latency_seconds)
+        except Exception as exc:
+            prepared.error = exc
+        prepared.ready_at = time.monotonic()
+        return prepared
+
+    async def _execute_queued(self, leader_id, event, predecessor) -> None:
+        prepared = await self.prepare_copy(event)
+        if predecessor:
+            await asyncio.shield(predecessor)
+        # Obtain the execution snapshot after the prior fill on this token,
+        # but without blocking unrelated tokens behind a slow HTTP request.
+        if not prepared.error:
+            try:
+                async with self._prepare_slots:
+                    prepared.book = await self.client.get_book(event.token_id)
+                prepared.book_at = time.monotonic()
+            except Exception as exc:
+                prepared.book_error = exc
+        async with self._ledger_lock:
+            async with SessionLocal() as session:
+                leader = await session.get(Leader, leader_id)
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
+                # Recheck controls after waiting, not just at discovery time.
+                if not leader or not leader.active or account.paused:
+                    return
+                await self.process_event(session, leader, event, prepared)
+                await session.commit()
+                messages = session.info.pop("notifications", [])
+        for message in messages:
+            await self.notify(message)
+        log.info(
+            "copy_latency",
+            event_key=event.event_key,
+            source_age_seconds=round(max(0, event.received_at - event.timestamp), 3),
+            prepare_ms=round((prepared.ready_at - event.received_monotonic) * 1000, 1),
+            after_prepare_ms=round((time.monotonic() - prepared.ready_at) * 1000, 1),
+            bot_ms=round((time.monotonic() - event.received_monotonic) * 1000, 1),
+            exchange_delay_seconds=prepared.exchange_delay,
+        )
+
+    async def process_event(
+        self, session, leader: Leader, event: LeaderActivity, prepared: PreparedCopy | None = None
+    ) -> None:
+        detection_lag = max(0, (event.received_at or time.time()) - event.timestamp)
         if event.trader_name and not leader.label:
             leader.label = event.trader_name[:120]
         copy_trade = CopyTrade(
@@ -211,19 +384,14 @@ class CopyEngine:
         before_leader_shares = leader_pos.shares if leader_pos else Decimal(0)
         account = await get_or_create_account(session, self.settings.paper_initial_balance)
         try:
-            market = await self.client.get_market(event.condition_id)
-            if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
-                raise ValueError("trade_token_mismatch")
-            if market.get("closed") is not False or market.get("accepting_orders") is not True:
-                raise ValueError("market_not_accepting_orders")
-            fee_rate = await self.client.get_fee_rate(event.condition_id, event.title)
-            delay = float(market["seconds_delay"])
-            if not 0 <= delay <= 60:
-                raise ValueError("invalid_market_delay")
+            prepared = prepared or await self.prepare_copy(event)
+            if prepared.error:
+                raise prepared.error
+            fee_rate = prepared.fee_rate
         except Exception as exc:
             copy_trade.status = "failed"
             detail = str(exc) or type(exc).__name__
-            copy_trade.skip_reason = f"market_data:{detail}"
+            copy_trade.skip_reason = f"market_data:{detail}"[:200]
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             await self.update_leader_position(session, leader.id, event, leader_pos)
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
@@ -282,9 +450,13 @@ class CopyEngine:
             copy_trade.skip_reason = "invalid_size_or_price"
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             return
-        await asyncio.sleep(delay + self.settings.copy_latency_seconds)
         try:
-            book = await self.client.get_book(event.token_id)
+            if prepared.book_error:
+                raise prepared.book_error
+            book = prepared.book
+            if book is None or time.monotonic() - prepared.book_at > 0.25:
+                # Do not execute against a snapshot that aged in the ledger queue.
+                book = await self.client.get_book(event.token_id)
             if event.side == "BUY":
                 buy_budget = self.ensure_book_minimum_budget(
                     buy_budget,
@@ -314,7 +486,7 @@ class CopyEngine:
         except Exception as exc:
             copy_trade.status = "failed"
             detail = str(exc) or type(exc).__name__
-            copy_trade.skip_reason = f"book_error:{detail}"
+            copy_trade.skip_reason = f"book_error:{detail}"[:200]
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason, target_shares)
             return
 
@@ -403,22 +575,27 @@ class CopyEngine:
 
     async def monitor_risk_once(self) -> None:
         async with SessionLocal() as session:
-            account = await get_or_create_account(session, self.settings.paper_initial_balance)
-            if account.paused:
-                return
-            positions = list(
-                (await session.scalars(select(Position).where(Position.shares > 0))).all()
+            token_ids = list(
+                await session.scalars(
+                    select(Position.token_id)
+                    .join(RiskRule, RiskRule.token_id == Position.token_id)
+                    .where(Position.shares > 0, RiskRule.enabled.is_(True))
+                )
             )
-            for position in positions:
-                rule = await get_risk(session, position.token_id)
-                if not rule or not rule.enabled:
-                    continue
-                try:
-                    book = await self.client.get_book(position.token_id)
-                except Exception:
-                    continue
-                if not book.bids:
-                    continue
+        await asyncio.gather(*(self._monitor_risk_token(token) for token in token_ids))
+
+    async def _monitor_risk_token(self, token_id: str) -> None:
+        try:
+            async with self._maintenance_slots:
+                book = await self.client.get_book(token_id)
+            if not book.bids:
+                return
+            async with self._ledger_lock, SessionLocal() as session:
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
+                position = await get_position(session, token_id)
+                rule = await get_risk(session, token_id)
+                if account.paused or not position or not rule or not rule.enabled:
+                    return
                 current = book.bids[0][0]
                 if not rule.high_water_price or current > rule.high_water_price:
                     rule.high_water_price = current
@@ -438,46 +615,56 @@ class CopyEngine:
                 ):
                     trigger = "trailing-stop"
                 if not trigger:
-                    continue
-                requested_shares = position.shares
-                try:
-                    fee_rate = await self.client.get_fee_rate(position.condition_id, position.title)
-                    market = await self.client.get_market(position.condition_id)
-                    if (
-                        market.get("accepting_orders") is not True
-                        or market.get("closed") is not False
-                    ):
-                        continue
-                    delay = float(market["seconds_delay"])
-                    if not 0 <= delay <= 60:
-                        continue
-                    await asyncio.sleep(delay + self.settings.copy_latency_seconds)
-                    book = await self.client.get_book(position.token_id)
-                except Exception as exc:
-                    log.warning("risk_data_unavailable", token_id=position.token_id, error=str(exc))
-                    continue
-                fill = execute_fak(
-                    book,
-                    "SELL",
-                    position.shares,
-                    fee_rate,
+                    await session.commit()
+                    return
+                position_id, requested_shares = position.id, position.shares
+                rule_values = (rule.stop_loss_pct, rule.take_profit_pct, rule.trailing_pct)
+                event = LeaderActivity(
+                    event_key="risk",
+                    timestamp=int(time.time()),
+                    condition_id=position.condition_id,
+                    token_id=token_id,
+                    side="SELL",
+                    size=requested_shares,
+                    price=current,
+                    title=position.title,
+                    outcome=position.outcome,
+                    slug="",
                 )
+                await session.commit()
+            prepared = await self.prepare_copy(event)
+            if prepared.error:
+                raise prepared.error
+            async with self._ledger_lock, SessionLocal() as session:
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
+                position = await get_position(session, token_id)
+                rule = await get_risk(session, token_id)
+                if (
+                    account.paused
+                    or not position
+                    or position.id != position_id
+                    or not rule
+                    or not rule.enabled
+                    or rule_values != (rule.stop_loss_pct, rule.take_profit_pct, rule.trailing_pct)
+                ):
+                    return
+                requested_shares = min(requested_shares, position.shares)
+                book = await self.client.get_book(token_id)
+                fill = execute_fak(book, "SELL", requested_shares, prepared.fee_rate)
                 if fill.shares <= 0:
-                    continue
-                try:
-                    await apply_fill(
-                        session,
-                        fill,
-                        position.token_id,
-                        "SELL",
-                        position.title,
-                        position.outcome,
-                        position.condition_id,
-                        account,
-                    )
-                except ValueError:
-                    continue
-                rule.enabled = fill.shares < requested_shares
+                    return
+                remaining = position.shares - fill.shares
+                await apply_fill(
+                    session,
+                    fill,
+                    token_id,
+                    "SELL",
+                    position.title,
+                    position.outcome,
+                    position.condition_id,
+                    account,
+                )
+                rule.enabled = remaining > Decimal("0.00000001")
                 session.add(
                     PaperOrder(
                         token_id=position.token_id,
@@ -490,28 +677,33 @@ class CopyEngine:
                         reason=trigger,
                     )
                 )
-            await session.commit()
+                await session.commit()
+        except Exception as exc:
+            log.warning("risk_data_unavailable", token_id=token_id, error=str(exc))
 
     async def settle_once(self) -> None:
         async with SessionLocal() as session:
-            account = await get_or_create_account(session, self.settings.paper_initial_balance)
             positions = list(
                 (await session.scalars(select(Position).where(Position.shares > 0))).all()
             )
-            for position in positions:
-                try:
-                    payout = await self.client.get_resolution(
-                        position.condition_id, position.outcome, position.token_id
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "settlement_check_failed",
-                        condition_id=position.condition_id,
-                        error=str(exc),
-                    )
-                    continue
-                if payout is None:
-                    continue
+        await asyncio.gather(*(self._settle_position(position) for position in positions))
+
+    async def _settle_position(self, snapshot: Position) -> None:
+        try:
+            async with self._maintenance_slots:
+                payout = await self.client.get_resolution(
+                    snapshot.condition_id, snapshot.outcome, snapshot.token_id
+                )
+            if payout is None:
+                return
+            if not payout.is_finite() or not Decimal(0) <= payout <= Decimal(1):
+                raise ValueError("invalid_resolution_payout")
+            async with self._ledger_lock, SessionLocal() as session:
+                # Shares/cost/balance may have changed while resolution was fetched.
+                position = await session.get(Position, snapshot.id)
+                if not position or position.token_id != snapshot.token_id or position.shares <= 0:
+                    return
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
                 proceeds = position.shares * payout
                 pnl = proceeds - position.cost_basis
                 account.paper_balance += proceeds
@@ -536,4 +728,8 @@ class CopyEngine:
                 if rule:
                     rule.enabled = False
                 await session.delete(position)
-            await session.commit()
+                await session.commit()
+        except Exception as exc:
+            log.warning(
+                "settlement_check_failed", condition_id=snapshot.condition_id, error=str(exc)
+            )

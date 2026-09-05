@@ -15,10 +15,15 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     paper_initial_balance: Decimal = Field(default=Decimal("100"), alias="PAPER_INITIAL_BALANCE")
-    poll_interval_seconds: float = Field(default=2.0, alias="POLL_INTERVAL_SECONDS")
+    poll_interval_seconds: float = Field(default=0.5, ge=0.25, alias="POLL_INTERVAL_SECONDS")
+    maintenance_interval_seconds: float = Field(
+        default=2.0, ge=0.5, alias="MAINTENANCE_INTERVAL_SECONDS"
+    )
+    copy_prepare_concurrency: int = Field(default=8, ge=1, le=32, alias="COPY_PREPARE_CONCURRENCY")
+    copy_queue_limit: int = Field(default=256, ge=1, le=2000, alias="COPY_QUEUE_LIMIT")
     # Extra simulation delay only. Real VPS/API/WebSocket latency is already
     # included naturally; zero avoids adding an artificial one-second lag.
-    copy_latency_seconds: float = Field(default=0.0, alias="COPY_LATENCY_SECONDS")
+    copy_latency_seconds: float = Field(default=0.0, ge=0, le=60, alias="COPY_LATENCY_SECONDS")
     default_trade_size: Decimal = Field(default=Decimal("5"), alias="DEFAULT_TRADE_SIZE")
     max_trade_size: Decimal = Field(default=Decimal("10"), alias="MAX_TRADE_SIZE")
     # Buy budget is primarily a percentage of our own free cash. The leader

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -26,6 +27,8 @@ class LeaderActivity:
     outcome: str
     slug: str
     trader_name: str = ""
+    received_at: float = 0.0
+    received_monotonic: float = 0.0
 
 
 @dataclass(slots=True)
@@ -44,12 +47,33 @@ class PolymarketClient:
         self._fee_cache: dict[str, Decimal] = {}
         self._fee_cache_time: dict[str, float] = {}
         self._resolution_cache: dict[tuple[str, str], tuple[float, Decimal | None]] = {}
+        self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self.book_stream = None
 
     async def close(self) -> None:
         if self.book_stream:
             await self.book_stream.stop()
+        pending = list(self._inflight.values())
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         await self.http.aclose()
+
+    async def _shared_request(self, key, request):
+        """Coalesce simultaneous metadata reads without caching market status."""
+        task = self._inflight.get(key)
+        if task is None:
+            task = asyncio.create_task(request())
+            self._inflight[key] = task
+
+            def done(completed):
+                if self._inflight.get(key) is completed:
+                    self._inflight.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()  # retrieve errors even if all waiters cancel
+
+            task.add_done_callback(done)
+        return await asyncio.shield(task)
 
     async def start(self) -> None:
         from .orderbook import LiveBookCache
@@ -60,9 +84,11 @@ class PolymarketClient:
 
     async def get_activity(self, address: str, limit: int = 500) -> list[LeaderActivity]:
         response = await self.http.get(
-            f"{self.settings.data_api}/activity", params={"user": address, "limit": limit}
+            f"{self.settings.data_api}/activity",
+            params={"user": address, "limit": limit, "type": "TRADE", "sortDirection": "DESC"},
         )
         response.raise_for_status()
+        received_at, received_monotonic = time.time(), time.monotonic()
         raw = response.json()
         if isinstance(raw, dict):
             raw = raw.get("data") or raw.get("value") or []
@@ -96,6 +122,8 @@ class PolymarketClient:
                     outcome=item.get("outcome") or "",
                     slug=item.get("slug") or "",
                     trader_name=(item.get("name") or item.get("pseudonym") or "").strip(),
+                    received_at=received_at,
+                    received_monotonic=received_monotonic,
                 )
             )
         return sorted(events, key=lambda event: (event.timestamp, event.event_key))
@@ -148,6 +176,11 @@ class PolymarketClient:
         return book
 
     async def get_market(self, condition_id: str) -> dict:
+        return await self._shared_request(
+            ("market", condition_id), lambda: self._get_market(condition_id)
+        )
+
+    async def _get_market(self, condition_id: str) -> dict:
         """Fetch by path and verify identity: a 200 alone is never enough."""
         response = await self.http.get(f"{self.settings.clob_api}/markets/{condition_id}")
         response.raise_for_status()
@@ -160,6 +193,11 @@ class PolymarketClient:
         return market
 
     async def get_fee_rate(self, condition_id: str, title: str = "") -> Decimal:
+        return await self._shared_request(
+            ("fee", condition_id), lambda: self._get_fee_rate(condition_id, title)
+        )
+
+    async def _get_fee_rate(self, condition_id: str, title: str = "") -> Decimal:
         """Use exchange fee data, with a conservative fallback during outages."""
         cached = self._fee_cache.get(condition_id)
         if cached is not None and time.monotonic() - self._fee_cache_time[condition_id] < 60:
