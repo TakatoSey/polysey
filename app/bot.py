@@ -152,7 +152,11 @@ class TelegramApp:
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
             await session.commit()
         if not rows:
-            return f"<b>📊 Портфель</b>\nБаланс: <b>${account.paper_balance:.2f}</b>\nОткрытых позиций нет."
+            pnl = account.paper_balance - account.starting_balance
+            return (
+                f"<b>📊 Портфель</b>\nБаланс/equity: <b>${account.paper_balance:.2f}</b>\n"
+                f"PNL: <b>${pnl:.2f}</b>\nОткрытых позиций нет."
+            )
         marked_value = Decimal(0)
         unrealized = Decimal(0)
         lines = ["<b>📊 Портфель</b>", f"Баланс: <b>${account.paper_balance:.2f}</b>"]
@@ -172,9 +176,14 @@ class TelegramApp:
                 f"• {html.escape(row.title)}\n  {html.escape(row.outcome)}: {row.shares:.4f} шт.\n"
                 f"  вход ${row.average_price:.4f} → выход ${current:.4f}\n  PNL: <b>${pnl:.4f}</b>"
             )
+        equity = account.paper_balance + marked_value
+        total_pnl = equity - account.starting_balance
         lines.insert(
             2,
-            f"Mark-to-market: <b>${marked_value:.2f}</b>\nUnrealized PNL: <b>${unrealized:.2f}</b>\nRealized PNL: <b>${account.realized_pnl:.2f}</b>",
+            f"Mark-to-market: <b>${marked_value:.2f}</b>\n"
+            f"Всего equity: <b>${equity:.2f}</b> (PNL: <b>${total_pnl:.2f}</b>)\n"
+            f"Unrealized PNL: <b>${unrealized:.2f}</b>\n"
+            f"Realized PNL: <b>${account.realized_pnl:.2f}</b>",
         )
         return "\n".join(lines)
 

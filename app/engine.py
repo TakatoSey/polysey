@@ -123,7 +123,11 @@ class CopyEngine:
         account = await get_or_create_account(session, self.settings.paper_initial_balance)
         fee_rate = await self.client.get_fee_rate(event.condition_id, event.title)
         if event.side == "BUY":
-            buy_budget = min(account.max_trade_size, account.trade_size, account.paper_balance)
+            # The configured copy size is a total cash budget. Reserve room for
+            # the taker fee so apply_fill cannot reject a fill after consuming
+            # the whole available balance on notional alone.
+            cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
+            buy_budget = min(account.max_trade_size, account.trade_size, cash_budget)
             target_shares = buy_budget / event.price if event.price else Decimal(0)
         else:
             position = await get_position(session, event.token_id)
@@ -131,7 +135,6 @@ class CopyEngine:
                 copy_trade.status = "skipped"
                 copy_trade.skip_reason = "no_position_to_sell"
                 await self.update_leader_position(session, leader.id, event, leader_pos)
-                await self.notify(f"⏭️ Продажа пропущена\n{event.title}\nПричина: нет нашей позиции")
                 return
             sell_ratio = min(Decimal(1), event.size / before_leader_shares)
             target_shares = position.shares * sell_ratio
@@ -164,7 +167,6 @@ class CopyEngine:
         except Exception as exc:
             copy_trade.status = "failed"
             copy_trade.skip_reason = f"book_error:{type(exc).__name__}"
-            await self.notify(f"❌ Ошибка книги заявок\n{event.title}\n{type(exc).__name__}")
             return
 
         order = PaperOrder(
@@ -182,7 +184,6 @@ class CopyEngine:
         if fill.shares <= 0:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = fill.reason or "no_fill"
-            await self.notify(f"⏭️ Нет исполнения\n{event.title}\nПричина: {fill.reason}")
             return
         try:
             await apply_fill(
@@ -200,17 +201,19 @@ class CopyEngine:
             copy_trade.skip_reason = str(exc)
             order.status = "rejected"
             order.reason = str(exc)
-            await self.notify(f"⏭️ Сделка пропущена\n{event.title}\nПричина: {str(exc)}")
             return
         position = await session.scalar(select(Position).where(Position.token_id == event.token_id))
         if position:
             position.fee_rate = fee_rate
         copy_trade.status = "executed"
-        await self.notify(
-            f"✅ Скопировано {event.side}\n{event.title}\n"
-            f"Исполнено: {fill.shares:.4f} @ ${fill.average_price:.4f}\n"
-            f"Комиссия: ${fill.fee:.5f}"
-        )
+        # Keep the chat quiet: only successful BUY copies are user-facing
+        # notifications. Rejections/partial misses remain visible in Ордера.
+        if event.side == "BUY":
+            await self.notify(
+                f"✅ Скопировано BUY\n{event.title}\n"
+                f"Исполнено: {fill.shares:.4f} @ ${fill.average_price:.4f}\n"
+                f"Комиссия: ${fill.fee:.5f}"
+            )
 
     async def update_leader_position(
         self, session, leader_id: int, event: LeaderActivity, position: LeaderPosition | None
@@ -298,9 +301,6 @@ class CopyEngine:
                         reason=trigger,
                     )
                 )
-                await self.notify(
-                    f"🛡️ {trigger} сработал\n{position.title}\nЦена: ${fill.average_price:.4f}"
-                )
             await session.commit()
 
     async def settle_once(self) -> None:
@@ -337,9 +337,5 @@ class CopyEngine:
                 rule = await get_risk(session, position.token_id)
                 if rule:
                     rule.enabled = False
-                await self.notify(
-                    f"🏁 Рынок разрешён\n{position.title}\n"
-                    f"Результат: {'WIN' if payout == 1 else 'LOSS'}\nPNL: ${pnl:.4f}"
-                )
                 await session.delete(position)
             await session.commit()
