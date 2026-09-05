@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import re
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
 import structlog
@@ -216,6 +217,40 @@ class TelegramApp:
             await session.commit()
         return rows, account
 
+    async def _position_quote(self, row) -> tuple[Decimal | None, str, str]:
+        """Keep resolution, quote availability and API failures distinct."""
+        try:
+            payout = await self.engine.client.get_resolution(
+                row.condition_id, row.outcome, row.token_id
+            )
+        except Exception as exc:
+            log.warning("portfolio_resolution_failed", token_id=row.token_id, error=str(exc))
+            status = "⚠️ Не удалось проверить результат рынка"
+        else:
+            if payout is not None:
+                status = (
+                    "✅ Победа"
+                    if payout == 1
+                    else "Проигрыш"
+                    if payout == 0
+                    else "Разделённая выплата"
+                )
+                return payout, status, f"Выплата ${payout:.4f}/share · ожидает зачисления"
+            status = "⏳ Результат ещё не подтверждён"
+        # An unavailable resolution endpoint must not hide a usable quote.
+        try:
+            book = await self.engine.client.get_book(row.token_id)
+        except Exception as exc:
+            log.warning("portfolio_book_failed", token_id=row.token_id, error=str(exc))
+            return None, status, "Стакан недоступен · оценка неизвестна"
+        if not book.bids:
+            return None, status, "Нет заявок на покупку · оценка неизвестна"
+        return (
+            book.bids[0][0],
+            status,
+            "Оценка по лучшему bid до комиссии; весь объём может стоить меньше",
+        )
+
     async def _portfolio_text_v2(self, page: int = 0) -> str:
         rows, account = await self._portfolio_data_v2()
         per_page = 5
@@ -231,23 +266,15 @@ class TelegramApp:
             lines.append("\nОткрытых позиций нет.")
             return "\n".join(lines)
         for row in current:
-            quote = None
-            try:
-                quote = await self.engine.client.get_resolution(
-                    row.condition_id, row.outcome, row.token_id
-                )
-                if quote is None:
-                    book = await self.engine.client.get_book(row.token_id)
-                    quote = book.bids[0][0] if book.bids else None
-            except Exception as exc:
-                log.warning("portfolio_quote_unavailable", token_id=row.token_id, error=str(exc))
+            quote, status, note = await self._position_quote(row)
             value = row.shares * quote if quote is not None else None
             mark = f"${value:.2f}" if value is not None else "—"
             pnl = f" · PNL ${value - row.cost_basis:+.2f}" if value is not None else ""
             lines.append(
-                f"\n<b>{html.escape(row.title[:95])}</b>\n{html.escape(row.outcome)} · {row.shares:.3f} shares · вход ${row.average_price:.4f}\nОценка: <b>{mark}</b>{pnl}"
+                f"\n<b>{html.escape(row.title[:95])}</b>\n{html.escape(row.outcome)} · {row.shares:.3f} shares · вход ${row.average_price:.4f}\nОценка: <b>{mark}</b>{pnl}\n{status}\n{note}"
             )
         lines.append(f"\nСтраница {page + 1}/{total_pages}. Нажмите на позицию для деталей.")
+        lines.append(f"Обновлено: {datetime.now(UTC):%H:%M:%S} UTC")
         return "\n".join(lines)
 
     def _portfolio_keyboard_v2(self, rows, page: int = 0):
@@ -261,6 +288,7 @@ class TelegramApp:
             builder.button(text="◀️", callback_data=f"portfolio:{page - 1}")
         if page + 1 < total_pages:
             builder.button(text="▶️", callback_data=f"portfolio:{page + 1}")
+        builder.button(text="🔄 Обновить", callback_data=f"portfolio:{page}")
         builder.button(text="⬅️ На главную", callback_data="home")
         builder.adjust(1, 2, 1)
         return builder.as_markup()
@@ -269,40 +297,22 @@ class TelegramApp:
         async with SessionLocal() as session:
             row = await session.get(Position, position_id)
         if not row:
-            return "<b>Позиция не найдена</b>"
-        quote = None
-        resolved = False
-        try:
-            quote = await self.engine.client.get_resolution(
-                row.condition_id, row.outcome, row.token_id
-            )
-            resolved = quote is not None
-            if quote is None:
-                book = await self.engine.client.get_book(row.token_id)
-                quote = book.bids[0][0] if book.bids else None
-        except Exception:
-            pass
+            return "<b>Позиция больше не открыта</b>\nПроверьте продажу или выплату в разделе «История»."
+        quote, status, note = await self._position_quote(row)
         value = row.shares * quote if quote is not None else None
-        status = (
-            "✅ победа · выплата $1/share"
-            if resolved and quote == 1
-            else "❌ проигрыш"
-            if resolved
-            else "⏳ рынок не определён"
-        )
         lines = [
             f"<b>📌 {html.escape(row.title)}</b>",
             f"Исход: <b>{html.escape(row.outcome)}</b>",
             f"Количество: {row.shares:.6f} shares",
-            f"Средняя цена: ${row.average_price:.6f}",
+            f"Средняя себестоимость с комиссией: ${row.average_price:.6f}",
             f"Затрачено: ${row.cost_basis:.4f}",
             f"Статус: {status}",
         ]
         lines.append(
-            f"Текущая оценка: ${value:.4f}"
-            if value is not None
-            else "Текущая цена: нет доступного bid"
+            f"Текущая оценка: ${value:.4f}" if value is not None else "Текущая оценка: неизвестна"
         )
+        lines.append(note)
+        lines.append(f"\nОбновлено: {datetime.now(UTC):%H:%M:%S} UTC")
         return "\n".join(lines)
 
     async def _portfolio_text(self) -> str:
@@ -791,6 +801,7 @@ class TelegramApp:
         elif data.startswith("position:"):
             _, raw_id, raw_page = data.split(":")
             builder = InlineKeyboardBuilder()
+            builder.button(text="🔄 Обновить", callback_data=data)
             builder.button(text="⬅️ К портфелю", callback_data=f"portfolio:{raw_page}")
             builder.button(text="🏠 На главную", callback_data="home")
             builder.adjust(2)
