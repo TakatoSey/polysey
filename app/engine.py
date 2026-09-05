@@ -14,7 +14,7 @@ from .config import Settings
 from .db import SessionLocal
 from .models import CopyTrade, Leader, LeaderPosition, PaperOrder, Position, RiskRule
 from .paper import execute_buy_fak_by_budget, execute_fak
-from .polymarket import Book, LeaderActivity, PolymarketClient
+from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key
 from .repository import apply_fill, get_or_create_account, get_position, get_risk
 
 log = structlog.get_logger(__name__)
@@ -183,14 +183,16 @@ class CopyEngine:
 
     async def on_rtds_trade(self, event: LeaderActivity) -> None:
         if not event.trader_address:
-            return
+            return "untracked"
+        event.event_key = copy_event_key(event.event_key, event.trader_address)
         async with SessionLocal() as session:
             leader = await session.scalar(select(Leader).where(Leader.address == event.trader_address))
             if not leader or not leader.active or not leader.initialized:
-                return
+                return "untracked"
             if await session.scalar(select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)):
-                return
+                return "duplicate"
         self._schedule_copy(leader.id, event)
+        return "scheduled"
 
     async def poll_background_once(self) -> None:
         await self.poll_once(wait=False)

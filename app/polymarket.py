@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -30,6 +31,25 @@ class LeaderActivity:
     received_at: float = 0.0
     received_monotonic: float = 0.0
     trader_address: str = ""
+    source: str = "rest"
+
+
+def copy_event_key(key: str, address: str) -> str:
+    """Canonical identity, including wallet, compatible with legacy stored keys."""
+    if key.startswith("v2:"):
+        return key
+    parts = key.split(":")
+    if len(parts) != 7:
+        return key  # synthetic events, not network trades
+    tx, stamp, condition, asset, side, size, price = parts
+
+    def number(value):
+        result = format(Decimal(value), "f")
+        return result.rstrip("0").rstrip(".") if "." in result else result
+
+    normalized = "|".join((address.lower(), tx.lower(), str(int(stamp)), condition.lower(),
+                           asset, side.upper(), number(size), number(price)))
+    return "v2:" + hashlib.sha256(normalized.encode()).hexdigest()
 
 
 @dataclass(slots=True)
@@ -110,9 +130,10 @@ class PolymarketClient:
                     item.get("price"),
                 )
             )
+            address = str(item.get("proxyWallet") or item.get("proxy_wallet") or "").lower()
             events.append(
                 LeaderActivity(
-                    event_key=key,
+                    event_key=copy_event_key(key, address) if address else key,
                     timestamp=int(item.get("timestamp") or 0),
                     condition_id=item.get("conditionId") or "",
                     token_id=str(item.get("asset")),
@@ -125,6 +146,7 @@ class PolymarketClient:
                     trader_name=(item.get("name") or item.get("pseudonym") or "").strip(),
                     received_at=received_at,
                     received_monotonic=received_monotonic,
+                    trader_address=address,
                 )
             )
         return sorted(events, key=lambda event: (event.timestamp, event.event_key))
