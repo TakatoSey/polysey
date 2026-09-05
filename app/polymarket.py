@@ -29,6 +29,7 @@ class LeaderActivity:
     trader_name: str = ""
     received_at: float = 0.0
     received_monotonic: float = 0.0
+    trader_address: str = ""
 
 
 @dataclass(slots=True)

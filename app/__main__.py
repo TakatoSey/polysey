@@ -6,6 +6,7 @@ from .db import SessionLocal, init_db
 from .engine import CopyEngine
 from .logging import configure_logging
 from .polymarket import PolymarketClient
+from .rtds import RTDSTradeStream
 from .repository import add_leader, get_leader
 
 
@@ -23,11 +24,16 @@ async def main() -> None:
     client = PolymarketClient(settings)
     await client.start()
     engine = CopyEngine(settings, client)
+    rtds = RTDSTradeStream(engine.on_rtds_trade) if settings.rtds_enabled else None
+    if rtds:
+        await rtds.start()
     telegram = TelegramApp(settings, engine)
     try:
         await asyncio.gather(engine.run(), telegram.run(), telegram.notify_loop())
     finally:
         await engine.stop()
+        if rtds:
+            await rtds.stop()
         await client.close()
 
 

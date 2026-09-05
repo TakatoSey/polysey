@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     )
     copy_prepare_concurrency: int = Field(default=8, ge=1, le=32, alias="COPY_PREPARE_CONCURRENCY")
     copy_queue_limit: int = Field(default=256, ge=1, le=2000, alias="COPY_QUEUE_LIMIT")
+    rtds_enabled: bool = Field(default=True, alias="RTDS_ENABLED")
     # Extra simulation delay only. Real VPS/API/WebSocket latency is already
     # included naturally; zero avoids adding an artificial one-second lag.
     copy_latency_seconds: float = Field(default=0.0, ge=0, le=60, alias="COPY_LATENCY_SECONDS")

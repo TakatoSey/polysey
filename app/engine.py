@@ -181,6 +181,17 @@ class CopyEngine:
     async def stop(self) -> None:
         self.stop_event.set()
 
+    async def on_rtds_trade(self, event: LeaderActivity) -> None:
+        if not event.trader_address:
+            return
+        async with SessionLocal() as session:
+            leader = await session.scalar(select(Leader).where(Leader.address == event.trader_address))
+            if not leader or not leader.active or not leader.initialized:
+                return
+            if await session.scalar(select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)):
+                return
+        self._schedule_copy(leader.id, event)
+
     async def poll_background_once(self) -> None:
         await self.poll_once(wait=False)
 
