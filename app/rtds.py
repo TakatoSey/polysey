@@ -23,8 +23,9 @@ class RTDSTradeStream:
     HEALTH_SECONDS = 30
     RECEIVE_TIMEOUT = 15
 
-    def __init__(self, on_trade):
+    def __init__(self, on_trade, tracked_addresses=None):
         self.on_trade = on_trade
+        self.tracked_addresses = tracked_addresses or set()
         self.stop_event = asyncio.Event()
         self.task: asyncio.Task | None = None
         self.counters: Counter = Counter()
@@ -100,7 +101,8 @@ class RTDSTradeStream:
         received_at, received_monotonic = time.time(), time.monotonic()
         self.counters["frames"] += 1
         for item in self._messages(raw):
-            event = self._parse(item, received_at, received_monotonic)
+                            event = self._parse(item, received_at, received_monotonic,
+                                                self.tracked_addresses)
             if event is None:
                 self.counters["invalid_trades"] += 1
                 continue
@@ -133,7 +135,7 @@ class RTDSTradeStream:
         return payloads
 
     @staticmethod
-    def _parse(item, received_at=None, received_monotonic=None):
+    def _parse(item, received_at=None, received_monotonic=None, tracked_addresses=None):
         if not isinstance(item, dict):
             return None
         try:
@@ -142,6 +144,8 @@ class RTDSTradeStream:
             address = str(item["proxyWallet"]).lower()
             tx = str(item["transactionHash"]).lower()
             side = str(item["side"]).upper()
+            if tracked_addresses is not None and address not in tracked_addresses:
+                return None
             timestamp_value = Decimal(str(item["timestamp"]))
             size, price = Decimal(str(item["size"])), Decimal(str(item["price"]))
             if (

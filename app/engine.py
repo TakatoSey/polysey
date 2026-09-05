@@ -47,6 +47,7 @@ class CopyEngine:
         self._leader_polls: dict[int, asyncio.Task] = {}
         self._token_tails: dict[str, asyncio.Task] = {}
         self._leader_floors: dict[int, int] = {}
+        self.tracked_addresses: set[str] = set()
 
     async def notify(self, message: str) -> None:
         try:
@@ -206,6 +207,8 @@ class CopyEngine:
             leaders = list(
                 (await session.scalars(select(Leader).where(Leader.active.is_(True)))).all()
             )
+            self.tracked_addresses.clear()
+            self.tracked_addresses.update(leader.address.lower() for leader in leaders)
 
         tasks = []
         for leader in leaders:

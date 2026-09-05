@@ -24,7 +24,11 @@ async def main() -> None:
     client = PolymarketClient(settings)
     await client.start()
     engine = CopyEngine(settings, client)
-    rtds = RTDSTradeStream(engine.on_rtds_trade) if settings.rtds_enabled else None
+    rtds = (
+        RTDSTradeStream(engine.on_rtds_trade, engine.tracked_addresses)
+        if settings.rtds_enabled
+        else None
+    )
     if rtds:
         await rtds.start()
     telegram = TelegramApp(settings, engine)
