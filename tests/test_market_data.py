@@ -110,10 +110,9 @@ async def test_unverified_fee_is_an_error_not_five_percent(payload):
 
 
 @pytest.mark.asyncio
-async def test_fee_network_failure_does_not_fall_back():
+async def test_fee_network_failure_uses_conservative_fallback():
     client = client_for(lambda _: httpx.Response(503))
     try:
-        with pytest.raises(httpx.HTTPStatusError):
-            await client.get_fee_rate(CONDITION)
+        assert await client.get_fee_rate(CONDITION, "Bitcoin Up or Down") == Decimal("0.07")
     finally:
         await client.close()

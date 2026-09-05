@@ -25,6 +25,8 @@ class Settings(BaseSettings):
     # order notional is an additional proportional ceiling.
     copy_balance_pct: Decimal = Field(default=Decimal("0.05"), alias="COPY_BALANCE_PCT")
     leader_order_scale: Decimal = Field(default=Decimal("0.10"), alias="LEADER_ORDER_SCALE")
+    min_copy_notional: Decimal = Field(default=Decimal("1.10"), alias="MIN_COPY_NOTIONAL")
+    max_outcome_exposure: Decimal = Field(default=Decimal("50"), alias="MAX_OUTCOME_EXPOSURE")
     default_slippage_bps: int = Field(default=500, alias="DEFAULT_SLIPPAGE_BPS")
     data_api: str = Field(default="https://data-api.polymarket.com", alias="POLYMARKET_DATA_API")
     clob_api: str = Field(default="https://clob.polymarket.com", alias="POLYMARKET_CLOB")

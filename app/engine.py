@@ -129,7 +129,7 @@ class CopyEngine:
                 raise ValueError("trade_token_mismatch")
             if market.get("closed") is not False or market.get("accepting_orders") is not True:
                 raise ValueError("market_not_accepting_orders")
-            fee_rate = await self.client.get_fee_rate(event.condition_id)
+            fee_rate = await self.client.get_fee_rate(event.condition_id, event.title)
             delay = float(market["seconds_delay"])
             if not 0 <= delay <= 60:
                 raise ValueError("invalid_market_delay")
@@ -153,6 +153,17 @@ class CopyEngine:
             if leader_budget > 0:
                 limits.append(leader_budget)
             buy_budget = min(*limits, cash_budget)
+            existing = await get_position(session, event.token_id)
+            existing_exposure = existing.cost_basis if existing else Decimal(0)
+            buy_budget = min(
+                buy_budget,
+                max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
+            )
+            if buy_budget < self.settings.min_copy_notional:
+                copy_trade.status = "skipped"
+                copy_trade.skip_reason = "below_min_copy_notional"
+                await self.update_leader_position(session, leader.id, event, leader_pos)
+                return
             target_shares = buy_budget / event.price if event.price else Decimal(0)
         else:
             position = await get_position(session, event.token_id)
@@ -292,7 +303,7 @@ class CopyEngine:
                     continue
                 requested_shares = position.shares
                 try:
-                    fee_rate = await self.client.get_fee_rate(position.condition_id)
+                    fee_rate = await self.client.get_fee_rate(position.condition_id, position.title)
                     market = await self.client.get_market(position.condition_id)
                     if (
                         market.get("accepting_orders") is not True

@@ -158,28 +158,50 @@ class PolymarketClient:
         return market
 
     async def get_fee_rate(self, condition_id: str, title: str = "") -> Decimal:
-        """Only accept an explicit, supported CLOB fee curve. No title guesses."""
+        """Use exchange fee data, with a conservative fallback during outages."""
         cached = self._fee_cache.get(condition_id)
         if cached is not None and time.monotonic() - self._fee_cache_time[condition_id] < 60:
             return cached
-        response = await self.http.get(f"{self.settings.clob_api}/clob-markets/{condition_id}")
-        response.raise_for_status()
-        info = response.json()
-        if not isinstance(info, dict) or info.get("c", "").lower() != condition_id.lower():
-            raise ValueError("fee_market_identity_mismatch")
-        schedule = info.get("fd")
-        if not isinstance(schedule, dict) or "r" not in schedule or "e" not in schedule:
-            raise ValueError("fee_schedule_unavailable")
-        rate = Decimal(str(schedule["r"]))
-        exponent = Decimal(str(schedule["e"]))
-        if not rate.is_finite() or not 0 <= rate <= 1:
-            raise ValueError("invalid_fee_rate")
-        if not exponent.is_finite() or exponent != 1:
-            raise ValueError("unsupported_fee_exponent")
+        try:
+            response = await self.http.get(f"{self.settings.clob_api}/clob-markets/{condition_id}")
+            response.raise_for_status()
+            info = response.json()
+            if not isinstance(info, dict) or info.get("c", "").lower() != condition_id.lower():
+                raise ValueError("fee_market_identity_mismatch")
+            schedule = info.get("fd")
+            if not isinstance(schedule, dict) or "r" not in schedule or "e" not in schedule:
+                raise ValueError("fee_schedule_unavailable")
+            rate = Decimal(str(schedule["r"]))
+            exponent = Decimal(str(schedule["e"]))
+            if not rate.is_finite() or not 0 <= rate <= 1:
+                raise ValueError("invalid_fee_rate")
+            if not exponent.is_finite() or exponent != 1:
+                raise ValueError("unsupported_fee_exponent")
+        except ValueError:
+            raise
+        except Exception as exc:
+            rate = self._fallback_fee_rate(title)
+            log.warning(
+                "fee_data_unavailable_using_fallback",
+                condition_id=condition_id,
+                fallback_rate=str(rate),
+                error=type(exc).__name__,
+            )
         # A zero rate explicitly returned by the exchange is valid.
         self._fee_cache[condition_id] = rate
         self._fee_cache_time[condition_id] = time.monotonic()
         return rate
+
+    @staticmethod
+    def _fallback_fee_rate(title: str) -> Decimal:
+        text = title.lower()
+        if any(word in text for word in ("crypto", "bitcoin", "ethereum")):
+            return Decimal("0.07")
+        if any(word in text for word in ("sport", "nfl", "nba", "mls", "soccer")):
+            return Decimal("0.05")
+        if any(word in text for word in ("politic", "election", "geopolitic")):
+            return Decimal("0.04")
+        return Decimal("0.05")
 
     async def get_resolution(
         self, condition_id: str, outcome: str, token_id: str | None = None
