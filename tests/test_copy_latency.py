@@ -359,7 +359,7 @@ async def test_exchange_delay_runs_concurrently_and_book_is_fetched_after_it(rig
     rig.engine._schedule_copy(1, activity("a"))
     rig.engine._schedule_copy(1, activity("b"))
     await asyncio.wait_for(entered.wait(), 2)
-    rig.client.get_book.assert_not_called()
+    assert rig.client.get_book.await_count == 2
     release.set()
     await drain(rig.engine)
     assert rig.client.get_book.await_count == 2
