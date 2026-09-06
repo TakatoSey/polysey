@@ -47,8 +47,18 @@ def copy_event_key(key: str, address: str) -> str:
         result = format(Decimal(value), "f")
         return result.rstrip("0").rstrip(".") if "." in result else result
 
-    normalized = "|".join((address.lower(), tx.lower(), str(int(stamp)), condition.lower(),
-                           asset, side.upper(), number(size), number(price)))
+    normalized = "|".join(
+        (
+            address.lower(),
+            tx.lower(),
+            str(int(stamp)),
+            condition.lower(),
+            asset,
+            side.upper(),
+            number(size),
+            number(price),
+        )
+    )
     return "v2:" + hashlib.sha256(normalized.encode()).hexdigest()
 
 
@@ -70,6 +80,7 @@ class PolymarketClient:
         self._resolution_cache: dict[tuple[str, str], tuple[float, Decimal | None]] = {}
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._value_cache: dict[str, tuple[float, Decimal]] = {}
+        self._profile_cache: dict[str, tuple[float, str]] = {}
         self.book_stream = None
 
     async def close(self) -> None:
@@ -156,9 +167,7 @@ class PolymarketClient:
         cached = self._value_cache.get(address.lower())
         if cached and time.monotonic() - cached[0] < 10:
             return cached[1]
-        response = await self.http.get(
-            f"{self.settings.data_api}/value", params={"user": address}
-        )
+        response = await self.http.get(f"{self.settings.data_api}/value", params={"user": address})
         response.raise_for_status()
         raw = response.json()
         rows = raw if isinstance(raw, list) else [raw]
@@ -170,6 +179,24 @@ class PolymarketClient:
             raise ValueError("leader_position_value_unavailable")
         self._value_cache[address.lower()] = (time.monotonic(), value)
         return value
+
+    async def get_public_profile(self, address: str) -> str | None:
+        """Return the display name from Gamma's public profile endpoint."""
+        address = address.lower()
+        cached = self._profile_cache.get(address)
+        if cached and time.monotonic() - cached[0] < 86400:
+            return cached[1] or None
+        response = await self.http.get(
+            f"{self.settings.gamma_api}/public-profile", params={"address": address}
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            return None
+        # Prefer the manually chosen name, then Polymarket's stable pseudonym.
+        name = str(data.get("name") or data.get("pseudonym") or "").strip()[:120]
+        self._profile_cache[address] = (time.monotonic(), name)
+        return name or None
 
     async def get_book(self, token_id: str) -> Book:
         if self.book_stream:

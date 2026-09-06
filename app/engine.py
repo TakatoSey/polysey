@@ -290,14 +290,32 @@ class CopyEngine:
     async def _poll_leader(self, leader: Leader) -> None:
         async with self._poll_slots:
             try:
+                profile_method = getattr(self.client, "get_public_profile", None)
+                profile_task = (
+                    asyncio.create_task(profile_method(leader.address)) if profile_method else None
+                )
                 activities = await self.client.get_activity(leader.address)
+                profile = None
+                if profile_task:
+                    try:
+                        profile = await profile_task
+                    except Exception as exc:
+                        log.info(
+                            "leader_profile_unavailable",
+                            leader=leader.address,
+                            error=type(exc).__name__,
+                        )
             except Exception:
                 log.exception("leader_activity_failed", leader=leader.address)
+                if profile_task and not profile_task.done():
+                    profile_task.cancel()
                 return
             async with SessionLocal() as session:
                 db_leader = await session.scalar(select(Leader).where(Leader.id == leader.id))
                 if not db_leader or not db_leader.active:
                     return
+                if profile:
+                    db_leader.label = profile
                 await self._refresh_sizing_profile(session, db_leader, activities)
                 if not activities:
                     return

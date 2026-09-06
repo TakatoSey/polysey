@@ -223,7 +223,7 @@ class TelegramApp:
         builder = InlineKeyboardBuilder()
         for row in current:
             icon = "🟢" if row.active else "⚪"
-            name = row.label or f"Трейдер #{row.id}"
+            name = row.label or f"{row.address[:6]}…{row.address[-4:]}"
             lines.append(f"{icon} <b>{html.escape(name)}</b>")
             builder.button(text=f"{icon} {name[:28]}", callback_data=f"leader_view:{row.id}:{page}")
             builder.button(
@@ -267,7 +267,7 @@ class TelegramApp:
             await self._leaders_panel(page, chat_id)
             return
         status = "🟢 активно" if row.active else "⚪ приостановлено"
-        label = html.escape(row.label or f"Трейдер #{row.id}")
+        label = html.escape(row.label or f"{row.address[:6]}…{row.address[-4:]}")
         executed = sum(1 for trade in recent if trade.status == "executed")
         rejected = sum(1 for trade in recent if trade.status in {"skipped", "failed"})
         last_result = "событий пока нет"

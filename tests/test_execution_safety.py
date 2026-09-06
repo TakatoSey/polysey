@@ -128,6 +128,26 @@ async def test_rtds_actually_delivers_newly_added_leader_and_stops_after_removal
     assert callback.await_count == 1
 
 
+def test_public_profile_prefers_name_then_pseudonym():
+    from app.polymarket import PolymarketClient
+
+    client = object.__new__(PolymarketClient)
+    client._profile_cache = {}
+    response = SimpleNamespace(
+        raise_for_status=lambda: None, json=lambda: {"name": "chosen", "pseudonym": "auto"}
+    )
+    client.http = SimpleNamespace(get=AsyncMock(return_value=response))
+    client.settings = SimpleNamespace(gamma_api="https://gamma.example")
+
+    async def check():
+        assert await client.get_public_profile("0x" + "1" * 40) == "chosen"
+        response.json = lambda: {"pseudonym": "auto"}
+        client._profile_cache.clear()
+        assert await client.get_public_profile("0x" + "2" * 40) == "auto"
+
+    asyncio.run(check())
+
+
 async def test_exit_priority_and_cancelled_waiters_do_not_lose_lock():
     lock, order = PriorityLock(), []
     await lock.acquire()
