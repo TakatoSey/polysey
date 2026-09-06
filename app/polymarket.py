@@ -69,6 +69,7 @@ class PolymarketClient:
         self._fee_cache_time: dict[str, float] = {}
         self._resolution_cache: dict[tuple[str, str], tuple[float, Decimal | None]] = {}
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
+        self._value_cache: dict[str, tuple[float, Decimal]] = {}
         self.book_stream = None
 
     async def close(self) -> None:
@@ -150,6 +151,26 @@ class PolymarketClient:
                 )
             )
         return sorted(events, key=lambda event: (event.timestamp, event.event_key))
+
+    async def get_user_position_value(self, address: str) -> Decimal:
+        """Current marked value used as a public, conservative leader-capital proxy."""
+        cached = self._value_cache.get(address.lower())
+        if cached and time.monotonic() - cached[0] < 10:
+            return cached[1]
+        response = await self.http.get(
+            f"{self.settings.data_api}/value", params={"user": address}
+        )
+        response.raise_for_status()
+        raw = response.json()
+        rows = raw if isinstance(raw, list) else [raw]
+        value = Decimal(0)
+        for row in rows:
+            if isinstance(row, dict) and str(row.get("user", address)).lower() == address.lower():
+                value = max(value, Decimal(str(row.get("value") or 0)))
+        if value <= 0:
+            raise ValueError("leader_position_value_unavailable")
+        self._value_cache[address.lower()] = (time.monotonic(), value)
+        return value
 
     async def get_book(self, token_id: str) -> Book:
         if self.book_stream:

@@ -30,6 +30,7 @@ class PreparedCopy:
     book: Book | None = None
     book_at: float = 0.0
     book_error: Exception | None = None
+    leader_value: Decimal | None = None
 
 
 class CopyEngine:
@@ -95,6 +96,20 @@ class CopyEngine:
         # We intentionally copy all valid leader buys. A small leader order is
         # rounded up to our executable minimum, never above our own budget.
         return min(own_budget, max(settings.min_copy_notional, proportional))
+
+    @classmethod
+    def calculate_smart_buy_budget(
+        cls, account, settings: Settings, leader_notional: Decimal,
+        leader_value: Decimal | None, fee_rate: Decimal,
+    ) -> Decimal:
+        """Match the leader's capital risk while never exceeding our cash guards."""
+        if not settings.smart_sizing_enabled or not leader_value or leader_value <= 0:
+            return cls.calculate_buy_budget(account, settings, leader_notional, fee_rate)
+        own_equity = max(Decimal(0), account.paper_balance)
+        ratio = min(settings.smart_sizing_max_ratio, own_equity / leader_value)
+        proportional = leader_notional * ratio
+        own_capacity = cls.calculate_own_buy_capacity(account, settings, fee_rate)
+        return min(own_capacity, proportional)
 
     @staticmethod
     def ensure_book_minimum_budget(
@@ -316,9 +331,17 @@ class CopyEngine:
                 market_task = asyncio.create_task(self.client.get_market(event.condition_id))
                 fee_task = asyncio.create_task(self.client.get_fee_rate(event.condition_id, event.title))
                 book_task = asyncio.create_task(self.client.get_book(event.token_id))
-                market, fee_rate = await asyncio.gather(
-                    market_task, fee_task,
+                value_task = (
+                    asyncio.create_task(self.client.get_user_position_value(event.trader_address))
+                    if event.trader_address else None
                 )
+                results = await asyncio.gather(market_task, fee_task, return_exceptions=True)
+                market, fee_rate = results
+                if value_task:
+                    try:
+                        prepared.leader_value = await value_task
+                    except Exception:
+                        log.info("leader_value_unavailable", address=event.trader_address)
             if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
                 raise ValueError("trade_token_mismatch")
             if market.get("closed") is not False or market.get("accepting_orders") is not True:
@@ -424,8 +447,8 @@ class CopyEngine:
             # the taker fee so apply_fill cannot reject a fill after consuming
             # the whole available balance on notional alone.
             leader_notional = event.size * event.price
-            buy_budget = self.calculate_buy_budget(
-                account, self.settings, leader_notional, fee_rate
+            buy_budget = self.calculate_smart_buy_budget(
+                account, self.settings, leader_notional, prepared.leader_value, fee_rate
             )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
