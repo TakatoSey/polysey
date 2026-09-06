@@ -108,7 +108,11 @@ class CopyEngine:
         own_equity = max(Decimal(0), account.paper_balance)
         ratio = min(settings.smart_sizing_max_ratio, own_equity / leader_value)
         proportional = leader_notional * ratio
-        own_capacity = cls.calculate_own_buy_capacity(account, settings, fee_rate)
+        # Smart mode already scales by our equity/leader equity. Do not apply
+        # the legacy fixed 5% cash cap a second time; max_trade_size and cash
+        # remain hard safety limits.
+        cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
+        own_capacity = min(cash_budget, account.max_trade_size, account.trade_size)
         return min(own_capacity, proportional)
 
     @staticmethod
