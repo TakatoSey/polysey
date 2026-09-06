@@ -48,6 +48,7 @@ class CopyEngine:
         self._leader_polls: dict[int, asyncio.Task] = {}
         self._token_tails: dict[str, asyncio.Task] = {}
         self._leader_floors: dict[int, int] = {}
+        self._leader_avg_trade_size: dict[int, Decimal] = {}
         self.tracked_addresses: set[str] = set()
 
     async def notify(self, message: str) -> None:
@@ -101,8 +102,18 @@ class CopyEngine:
     def calculate_smart_buy_budget(
         cls, account, settings: Settings, leader_notional: Decimal,
         leader_value: Decimal | None, fee_rate: Decimal,
+        leader_avg_trade_size: Decimal | None = None,
     ) -> Decimal:
         """Match the leader's capital risk while never exceeding our cash guards."""
+        if leader_avg_trade_size and leader_avg_trade_size > 0:
+            # Risk follows the leader's observed trade distribution, while the
+            # cash percentage remains our own base risk budget.
+            base = cls.calculate_own_buy_capacity(account, settings, fee_rate)
+            return min(
+                base * leader_notional / leader_avg_trade_size,
+                account.max_trade_size,
+                account.paper_balance / (Decimal(1) + fee_rate),
+            )
         if not settings.smart_sizing_enabled or not leader_value or leader_value <= 0:
             return cls.calculate_buy_budget(account, settings, leader_notional, fee_rate)
         own_equity = max(Decimal(0), account.paper_balance)
@@ -264,6 +275,13 @@ class CopyEngine:
                 db_leader = await session.scalar(select(Leader).where(Leader.id == leader.id))
                 if not db_leader or not db_leader.active:
                     return
+                notionals = [
+                    event.size * event.price
+                    for event in activities
+                    if event.size > 0 and event.price > 0
+                ]
+                if notionals:
+                    self._leader_avg_trade_size[leader.id] = sum(notionals, Decimal(0)) / len(notionals)
                 if not db_leader.initialized:
                     db_leader.last_timestamp = max(event.timestamp for event in activities) + 1
                     db_leader.initialized = True
@@ -452,7 +470,8 @@ class CopyEngine:
             # the whole available balance on notional alone.
             leader_notional = event.size * event.price
             buy_budget = self.calculate_smart_buy_budget(
-                account, self.settings, leader_notional, prepared.leader_value, fee_rate
+                account, self.settings, leader_notional, prepared.leader_value, fee_rate,
+                self._leader_avg_trade_size.get(leader.id),
             )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
