@@ -7,7 +7,7 @@ from .engine import CopyEngine
 from .logging import configure_logging
 from .polymarket import PolymarketClient
 from .rtds import RTDSTradeStream
-from .repository import add_leader, get_leader
+from .repository import add_leader, get_leader, get_or_create_account
 
 
 async def main() -> None:
@@ -15,6 +15,9 @@ async def main() -> None:
     configure_logging(settings.log_level)
     await init_db()
     async with SessionLocal() as session:
+        # Initialize defaults before either the Telegram or trading loops start.
+        # Existing account limits are intentionally preserved.
+        await get_or_create_account(session, settings.paper_initial_balance, settings=settings)
         if settings.default_leader_address:
             # Seed the configured leader once; do not silently re-enable one
             # the user intentionally disabled from the Telegram panel.

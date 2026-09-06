@@ -9,11 +9,17 @@ from .models import Account, Leader, PaperOrder, Position, RiskRule
 from .paper import Fill
 
 
-async def get_or_create_account(session: AsyncSession, starting: Decimal) -> Account:
+async def get_or_create_account(
+    session: AsyncSession, starting: Decimal, *, settings=None
+) -> Account:
     account = await session.scalar(select(Account).where(Account.id == 1))
     if account:
         return account
     account = Account(id=1, paper_balance=starting, starting_balance=starting)
+    if settings is not None:
+        account.trade_size = settings.default_trade_size
+        account.max_trade_size = settings.max_trade_size
+        account.slippage_bps = settings.default_slippage_bps
     session.add(account)
     await session.flush()
     return account

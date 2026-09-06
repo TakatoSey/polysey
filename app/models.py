@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -97,6 +97,49 @@ class PaperOrder(Base):
     status: Mapped[str] = mapped_column(String(24), default="submitted")
     reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+
+
+class LeaderSizingProfile(Base):
+    __tablename__ = "leader_sizing_profiles"
+    leader_id: Mapped[int] = mapped_column(ForeignKey("leaders.id"), primary_key=True)
+    reference_notional: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    sample_count: Mapped[int] = mapped_column(Integer)
+    sample_start: Mapped[int] = mapped_column(Integer)
+    sample_end: Mapped[int] = mapped_column(Integer)
+    bucket_seconds: Mapped[int] = mapped_column(Integer, default=2)
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+
+class SizingEntry(Base):
+    """One cumulative BUY budget, committed atomically with its fills."""
+    __tablename__ = "sizing_entries"
+    leader_id: Mapped[int] = mapped_column(ForeignKey("leaders.id"), primary_key=True)
+    token_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    bucket_start: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bucket_seconds: Mapped[int] = mapped_column(Integer, default=2)
+    cash_at_start: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    base_budget: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    reference_notional: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    max_budget: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    max_multiplier: Mapped[Decimal] = mapped_column(Numeric(12, 6))
+    leader_notional: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=0)
+    leader_shares: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=0)
+    spent: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=0)
+    closed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class SizingAudit(Base):
+    __tablename__ = "sizing_audits"
+    copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"), primary_key=True)
+    bucket_start: Mapped[int] = mapped_column(Integer)
+    base_budget: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    reference_notional: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    leader_notional: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    leader_vwap: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    price_factor: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    target_budget: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    spent_before: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    order_budget: Mapped[Decimal] = mapped_column(Numeric(24, 10))
 
 
 class RiskRule(Base):

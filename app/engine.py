@@ -4,18 +4,21 @@ import asyncio
 import html
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from .config import Settings
 from .db import SessionLocal
-from .models import CopyTrade, Leader, LeaderPosition, PaperOrder, Position, RiskRule
+from .models import (CopyTrade, Leader, LeaderPosition, PaperOrder, Position, RiskRule,
+                     LeaderSizingProfile, SizingEntry, SizingAudit)
 from .paper import execute_buy_fak_by_budget, execute_fak
 from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key
 from .repository import apply_fill, get_or_create_account, get_position, get_risk
+from .sizing import entry_bucket, entry_budget, sample_entries
 
 log = structlog.get_logger(__name__)
 
@@ -30,7 +33,6 @@ class PreparedCopy:
     book: Book | None = None
     book_at: float = 0.0
     book_error: Exception | None = None
-    leader_value: Decimal | None = None
 
 
 class CopyEngine:
@@ -48,7 +50,8 @@ class CopyEngine:
         self._leader_polls: dict[int, asyncio.Task] = {}
         self._token_tails: dict[str, asyncio.Task] = {}
         self._leader_floors: dict[int, int] = {}
-        self._leader_avg_trade_size: dict[int, Decimal] = {}
+        self._leader_sizing_profiles: dict[int, LeaderSizingProfile] = {}
+        self._profile_refresh_attempt: dict[int, float] = {}
         self.tracked_addresses: set[str] = set()
 
     async def notify(self, message: str) -> None:
@@ -97,34 +100,6 @@ class CopyEngine:
         # We intentionally copy all valid leader buys. A small leader order is
         # rounded up to our executable minimum, never above our own budget.
         return min(own_budget, max(settings.min_copy_notional, proportional))
-
-    @classmethod
-    def calculate_smart_buy_budget(
-        cls, account, settings: Settings, leader_notional: Decimal,
-        leader_value: Decimal | None, fee_rate: Decimal,
-        leader_avg_trade_size: Decimal | None = None,
-    ) -> Decimal:
-        """Match the leader's capital risk while never exceeding our cash guards."""
-        if leader_avg_trade_size and leader_avg_trade_size > 0:
-            # Risk follows the leader's observed trade distribution, while the
-            # cash percentage remains our own base risk budget.
-            base = cls.calculate_own_buy_capacity(account, settings, fee_rate)
-            return min(
-                base * leader_notional / leader_avg_trade_size,
-                account.max_trade_size,
-                account.paper_balance / (Decimal(1) + fee_rate),
-            )
-        if not settings.smart_sizing_enabled or not leader_value or leader_value <= 0:
-            return cls.calculate_buy_budget(account, settings, leader_notional, fee_rate)
-        own_equity = max(Decimal(0), account.paper_balance)
-        ratio = min(settings.smart_sizing_max_ratio, own_equity / leader_value)
-        proportional = leader_notional * ratio
-        # Smart mode already scales by our equity/leader equity. Do not apply
-        # the legacy fixed 5% cash cap a second time; max_trade_size and cash
-        # remain hard safety limits.
-        cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
-        own_capacity = min(cash_budget, account.max_trade_size, account.trade_size)
-        return min(own_capacity, proportional)
 
     @staticmethod
     def ensure_book_minimum_budget(
@@ -269,19 +244,13 @@ class CopyEngine:
             except Exception:
                 log.exception("leader_activity_failed", leader=leader.address)
                 return
-            if not activities:
-                return
             async with SessionLocal() as session:
                 db_leader = await session.scalar(select(Leader).where(Leader.id == leader.id))
                 if not db_leader or not db_leader.active:
                     return
-                notionals = [
-                    event.size * event.price
-                    for event in activities
-                    if event.side == "BUY" and event.size > 0 and event.price > 0
-                ]
-                if notionals:
-                    self._leader_avg_trade_size[leader.id] = sum(notionals, Decimal(0)) / len(notionals)
+                await self._refresh_sizing_profile(session, db_leader, activities)
+                if not activities:
+                    return
                 if not db_leader.initialized:
                     db_leader.last_timestamp = max(event.timestamp for event in activities) + 1
                     db_leader.initialized = True
@@ -319,6 +288,40 @@ class CopyEngine:
                 db_leader.last_timestamp = checkpoint
                 await session.commit()
 
+    async def _refresh_sizing_profile(self, session, leader, activities) -> None:
+        if not self.settings.smart_sizing_enabled:
+            return
+        last = self._profile_refresh_attempt.get(leader.id)
+        interval = (self.settings.smart_sizing_stats_refresh_seconds
+                    if leader.id in self._leader_sizing_profiles else 60)
+        if last is not None and time.monotonic() - last < interval:
+            return
+        now = int(time.time())
+        # Exclude events about to be copied, including their entire source bucket.
+        cutoff = min(now, leader.last_timestamp) if leader.initialized else now
+        sample = sample_entries(
+            activities, before=entry_bucket(cutoff, self.settings.smart_sizing_burst_seconds),
+            seconds=self.settings.smart_sizing_burst_seconds,
+            min_samples=self.settings.smart_sizing_min_samples,
+        )
+        profile = await session.get(LeaderSizingProfile, leader.id)
+        if sample:
+            if profile is None:
+                profile = LeaderSizingProfile(leader_id=leader.id)
+                session.add(profile)
+            profile.reference_notional = sample.reference_notional
+            profile.sample_count = sample.sample_count
+            profile.sample_start, profile.sample_end = sample.sample_start, sample.sample_end
+            profile.bucket_seconds = self.settings.smart_sizing_burst_seconds
+            profile.refreshed_at = datetime.now(UTC)
+            await session.commit()
+        if (profile and profile.sample_end >= now - 7 * 86400
+                and profile.bucket_seconds == self.settings.smart_sizing_burst_seconds):
+            self._leader_sizing_profiles[leader.id] = profile
+        else:
+            self._leader_sizing_profiles.pop(leader.id, None)
+        self._profile_refresh_attempt[leader.id] = time.monotonic()
+
     def _schedule_copy(self, leader_id: int, event: LeaderActivity) -> None:
         if event.event_key in self._pending:
             return
@@ -348,22 +351,22 @@ class CopyEngine:
     async def prepare_copy(self, event: LeaderActivity) -> PreparedCopy:
         prepared = PreparedCopy()
         started = time.monotonic()
+        tasks = []
         try:
             async with self._prepare_slots:
                 market_task = asyncio.create_task(self.client.get_market(event.condition_id))
                 fee_task = asyncio.create_task(self.client.get_fee_rate(event.condition_id, event.title))
-                book_task = asyncio.create_task(self.client.get_book(event.token_id))
-                value_task = (
-                    asyncio.create_task(self.client.get_user_position_value(event.trader_address))
-                    if event.trader_address else None
-                )
+                async def fetch_book():
+                    book = await self.client.get_book(event.token_id)
+                    return book, time.monotonic()
+
+                book_task = asyncio.create_task(fetch_book())
+                tasks = [market_task, fee_task, book_task]
                 results = await asyncio.gather(market_task, fee_task, return_exceptions=True)
                 market, fee_rate = results
-                if value_task:
-                    try:
-                        prepared.leader_value = await value_task
-                    except Exception:
-                        log.info("leader_value_unavailable", address=event.trader_address)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
             if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
                 raise ValueError("trade_token_mismatch")
             if market.get("closed") is not False or market.get("accepting_orders") is not True:
@@ -377,10 +380,14 @@ class CopyEngine:
             remaining = delay + self.settings.copy_latency_seconds - (time.monotonic() - started)
             if remaining > 0:
                 await asyncio.sleep(remaining)
-            prepared.book = await book_task
-            prepared.book_at = time.monotonic()
+            prepared.book, prepared.book_at = await book_task
         except Exception as exc:
             prepared.error = exc
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         prepared.ready_at = time.monotonic()
         return prepared
 
@@ -419,6 +426,64 @@ class CopyEngine:
             exchange_delay_seconds=prepared.exchange_delay,
         )
 
+    async def _get_sizing_entry(self, session, leader_id, event, account):
+        seconds = self.settings.smart_sizing_burst_seconds
+        start = entry_bucket(event.timestamp, seconds)
+        # A SELL is a barrier even if we had no position to sell. A later bucket
+        # also prevents late REST events from reviving a superseded entry.
+        barrier = await session.scalar(select(CopyTrade.id).where(
+            CopyTrade.leader_id == leader_id, CopyTrade.token_id == event.token_id,
+            ((CopyTrade.side == "SELL") & (CopyTrade.timestamp >= start))
+            | (CopyTrade.timestamp >= start + seconds),
+        ).limit(1))
+        if barrier:
+            return None, "sizing_entry_closed"
+        key = (leader_id, event.token_id, start)
+        entry = await session.get(SizingEntry, key)
+        if entry is not None and entry.bucket_seconds != seconds:
+            return None, "sizing_entry_closed"
+        if entry is None:
+            overlap = await session.scalar(select(SizingEntry.bucket_start).where(
+                SizingEntry.leader_id == leader_id, SizingEntry.token_id == event.token_id,
+                SizingEntry.bucket_start < start + seconds,
+                SizingEntry.bucket_start + SizingEntry.bucket_seconds > start,
+            ).limit(1))
+            # Upgrade / switching legacy->smart mid-entry must not mint a fresh
+            # budget for an entry whose old frozen cash/target we cannot recover.
+            old_fill = await session.scalar(select(PaperOrder.id).join(
+                CopyTrade, CopyTrade.id == PaperOrder.copy_trade_id,
+            ).where(
+                CopyTrade.leader_id == leader_id, CopyTrade.token_id == event.token_id,
+                CopyTrade.timestamp >= start, CopyTrade.timestamp < start + seconds,
+                CopyTrade.side == "BUY", PaperOrder.filled_shares > 0,
+                PaperOrder.status.in_(["filled", "partial"]),
+            ).limit(1))
+            if overlap is not None or old_fill is not None:
+                return None, "sizing_entry_closed"
+            profile = await session.get(LeaderSizingProfile, leader_id)
+            if (profile is None or profile.reference_notional <= 0
+                    or profile.sample_count < self.settings.smart_sizing_min_samples
+                    or profile.bucket_seconds != seconds
+                    or profile.sample_end > start
+                    or profile.sample_end < int(time.time()) - 7 * 86400):
+                return None, "sizing_profile_unavailable"
+            entry = SizingEntry(
+                leader_id=leader_id, token_id=event.token_id, bucket_start=start, bucket_seconds=seconds,
+                cash_at_start=account.paper_balance,
+                base_budget=account.paper_balance * self.settings.copy_balance_pct,
+                reference_notional=profile.reference_notional,
+                max_budget=account.max_trade_size,
+                max_multiplier=self.settings.smart_sizing_max_multiplier,
+                leader_notional=Decimal(0), leader_shares=Decimal(0), spent=Decimal(0),
+                closed=False,
+            )
+            session.add(entry)
+        if entry.closed:
+            return None, "sizing_entry_closed"
+        entry.leader_notional += event.size * event.price
+        entry.leader_shares += event.size
+        return entry, None
+
     async def process_event(
         self, session, leader: Leader, event: LeaderActivity, prepared: PreparedCopy | None = None
     ) -> None:
@@ -443,6 +508,19 @@ class CopyEngine:
         except IntegrityError:
             return
 
+        if (event.side not in {"BUY", "SELL"} or not event.size.is_finite()
+                or not event.price.is_finite() or event.size <= 0
+                or not Decimal(0) < event.price < Decimal(1)):
+            copy_trade.status, copy_trade.skip_reason = "skipped", "invalid_size_or_price"
+            self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
+            return
+
+        if event.side == "SELL":
+            await session.execute(update(SizingEntry).where(
+                SizingEntry.leader_id == leader.id, SizingEntry.token_id == event.token_id,
+                SizingEntry.bucket_start <= event.timestamp,
+            ).values(closed=True))
+
         leader_pos = await session.scalar(
             select(LeaderPosition).where(
                 LeaderPosition.leader_id == leader.id,
@@ -464,24 +542,20 @@ class CopyEngine:
             await self.update_leader_position(session, leader.id, event, leader_pos)
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
             return
-        if event.side == "BUY":
+        smart_buy = event.side == "BUY" and self.settings.smart_sizing_enabled
+        smart_entry = decision = None
+        if smart_buy:
+            # Sizing needs the executable ask. No fixed-dollar budget is applied.
+            target_shares = Decimal(0)
+        elif event.side == "BUY":
             # The configured copy size is a total cash budget. Reserve room for
             # the taker fee so apply_fill cannot reject a fill after consuming
             # the whole available balance on notional alone.
             leader_notional = event.size * event.price
-            buy_budget = self.calculate_smart_buy_budget(
-                account, self.settings, leader_notional, prepared.leader_value, fee_rate,
-                self._leader_avg_trade_size.get(leader.id),
-            )
+            buy_budget = self.calculate_buy_budget(account, self.settings, leader_notional, fee_rate)
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
-            if self.settings.smart_sizing_enabled and (
-                prepared.leader_value or self._leader_avg_trade_size.get(leader.id)
-            ):
-                cash_capacity = account.paper_balance / (Decimal(1) + fee_rate)
-                base_capacity = min(cash_capacity, account.max_trade_size, account.trade_size)
-            else:
-                base_capacity = self.calculate_own_buy_capacity(account, self.settings, fee_rate)
+            base_capacity = self.calculate_own_buy_capacity(account, self.settings, fee_rate)
             own_capacity = min(
                 base_capacity,
                 max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
@@ -521,7 +595,7 @@ class CopyEngine:
             target_shares = position.shares * sell_ratio
 
         await self.update_leader_position(session, leader.id, event, leader_pos)
-        if target_shares <= 0:
+        if target_shares <= 0 and not smart_buy:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = "invalid_size_or_price"
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
@@ -534,20 +608,52 @@ class CopyEngine:
                 # Do not execute against a snapshot that aged in the ledger queue.
                 book = await self.client.get_book(event.token_id)
             if event.side == "BUY":
-                buy_budget = self.ensure_book_minimum_budget(
-                    buy_budget,
-                    own_capacity,
-                    book,
-                    event.price,
-                    account.slippage_bps,
-                )
+                if smart_buy:
+                    smart_entry, reason = await self._get_sizing_entry(session, leader.id, event, account)
+                    if smart_entry is None:
+                        copy_trade.status, copy_trade.skip_reason = "skipped", reason
+                        self.record_rejection(session, copy_trade, event, reason)
+                        return
+                    existing = await get_position(session, event.token_id)
+                    exposure = existing.cost_basis if existing else Decimal(0)
+                    ask = book.asks[0][0] if book.asks else Decimal(0)
+                    decision = entry_budget(
+                        smart_entry, ask=ask, event_price=event.price,
+                        cash=account.paper_balance,
+                        exposure_room=max(Decimal(0), self.settings.max_outcome_exposure - exposure),
+                        current_max=account.max_trade_size, fee_rate=fee_rate,
+                        slippage_bps=account.slippage_bps,
+                        min_notional=self.settings.min_copy_notional, min_shares=book.min_order_size,
+                    )
+                    session.add(SizingAudit(
+                        copy_trade_id=copy_trade.id, bucket_start=smart_entry.bucket_start,
+                        base_budget=smart_entry.base_budget, reference_notional=smart_entry.reference_notional,
+                        leader_notional=smart_entry.leader_notional, leader_vwap=decision.leader_vwap,
+                        price_factor=decision.price_factor, target_budget=decision.target_budget,
+                        spent_before=smart_entry.spent, order_budget=decision.order_budget,
+                    ))
+                    buy_budget = decision.order_budget
+                    target_shares = buy_budget / ask if ask > 0 else Decimal(0)
+                    log.info("copy_sizing", leader=leader.address, token_id=event.token_id,
+                             base=str(smart_entry.base_budget), typical_entry=str(smart_entry.reference_notional),
+                             leader_entry=str(smart_entry.leader_notional), leader_vwap=str(decision.leader_vwap),
+                             price_factor=str(decision.price_factor), target=str(decision.target_budget),
+                             spent=str(smart_entry.spent), order_budget=str(buy_budget), reason=decision.reason)
+                    if decision.reason:
+                        copy_trade.status, copy_trade.skip_reason = "skipped", decision.reason
+                        self.record_rejection(session, copy_trade, event, decision.reason, target_shares)
+                        return
+                else:
+                    buy_budget = self.ensure_book_minimum_budget(
+                        buy_budget, own_capacity, book, event.price, account.slippage_bps,
+                    )
                 if book.asks:
                     target_shares = buy_budget / book.asks[0][0]
                 fill = execute_buy_fak_by_budget(
                     book,
                     buy_budget,
                     fee_rate,
-                    reference_price=event.price,
+                    reference_price=decision.reference_price if decision else event.price,
                     slippage_bps=account.slippage_bps,
                 )
             else:
@@ -618,6 +724,8 @@ class CopyEngine:
             order.filled_shares = order.average_fill_price = order.fee = Decimal(0)
             return
         copy_trade.status = "executed"
+        if smart_entry:
+            smart_entry.spent += fill.notional + fill.fee
         log.info(
             "copy_executed",
             leader=leader.address,
@@ -631,8 +739,12 @@ class CopyEngine:
         # Keep the chat quiet: only successful BUY copies are user-facing
         # notifications. Rejections/partial misses remain visible in Ордера.
         if event.side == "BUY":
+            message = self.build_buy_notification(leader, event, fill)
+            if decision:
+                message += (f"\n\nБюджет серии с комиссией: ${decision.target_budget:.2f}"
+                            f"\nИспользовано в серии: ${smart_entry.spent:.2f}")
             session.info.setdefault("notifications", []).append(
-                self.build_buy_notification(leader, event, fill)
+                message
             )
 
     async def update_leader_position(
@@ -741,6 +853,9 @@ class CopyEngine:
                     account,
                 )
                 rule.enabled = remaining > Decimal("0.00000001")
+                await session.execute(update(SizingEntry).where(
+                    SizingEntry.token_id == token_id,
+                ).values(closed=True))
                 session.add(
                     PaperOrder(
                         token_id=position.token_id,
@@ -784,6 +899,9 @@ class CopyEngine:
                 pnl = proceeds - position.cost_basis
                 account.paper_balance += proceeds
                 account.realized_pnl += pnl
+                await session.execute(update(SizingEntry).where(
+                    SizingEntry.token_id == position.token_id,
+                ).values(closed=True))
                 session.add(
                     PaperOrder(
                         token_id=position.token_id,

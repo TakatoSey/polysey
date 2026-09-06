@@ -16,27 +16,6 @@ class RecordingSession:
         self.items.append(item)
 
 
-def test_smart_sizing_scales_from_leader_average_trade_size():
-    account = SimpleNamespace(
-        paper_balance=Decimal("100"),
-        trade_size=Decimal("30"),
-        max_trade_size=Decimal("30"),
-    )
-    settings = Settings(
-        _env_file=None,
-        SMART_SIZING_ENABLED=True,
-        COPY_BALANCE_PCT=Decimal("0.05"),
-        MIN_COPY_NOTIONAL=Decimal("0.01"),
-    )
-
-    # Our base risk budget is $5; a $29.20 leader entry against a $14.60
-    # average entry should therefore target $10, independent of position value.
-    budget = CopyEngine.calculate_smart_buy_budget(
-        account, settings, Decimal("29.20"), None, Decimal("0"), Decimal("14.60")
-    )
-    assert budget == Decimal("10.00")
-
-
 def test_skipped_copy_is_always_visible_as_rejected_order():
     session = RecordingSession()
     trade = CopyTrade(id=7)

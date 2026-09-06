@@ -27,12 +27,14 @@ class Settings(BaseSettings):
     copy_latency_seconds: float = Field(default=0.0, ge=0, le=60, alias="COPY_LATENCY_SECONDS")
     default_trade_size: Decimal = Field(default=Decimal("5"), alias="DEFAULT_TRADE_SIZE")
     max_trade_size: Decimal = Field(default=Decimal("10"), alias="MAX_TRADE_SIZE")
-    # Buy budget is primarily a percentage of our own free cash. The leader
-    # order notional is an additional proportional ceiling.
-    copy_balance_pct: Decimal = Field(default=Decimal("0.05"), alias="COPY_BALANCE_PCT")
+    # Base all-in budget for one entry, from our cash at entry start.
+    copy_balance_pct: Decimal = Field(default=Decimal("0.05"), gt=0, le=1, alias="COPY_BALANCE_PCT")
     leader_order_scale: Decimal = Field(default=Decimal("0.10"), alias="LEADER_ORDER_SCALE")
     smart_sizing_enabled: bool = Field(default=True, alias="SMART_SIZING_ENABLED")
-    smart_sizing_max_ratio: Decimal = Field(default=Decimal("1"), gt=0, le=10, alias="SMART_SIZING_MAX_RATIO")
+    smart_sizing_max_multiplier: Decimal = Field(default=Decimal("3"), ge=1, le=10, alias="SMART_SIZING_MAX_MULTIPLIER")
+    smart_sizing_burst_seconds: int = Field(default=2, ge=1, le=10, alias="SMART_SIZING_BURST_SECONDS")
+    smart_sizing_min_samples: int = Field(default=3, ge=1, le=100, alias="SMART_SIZING_MIN_SAMPLES")
+    smart_sizing_stats_refresh_seconds: int = Field(default=86400, ge=60, alias="SMART_SIZING_STATS_REFRESH_SECONDS")
     min_copy_notional: Decimal = Field(default=Decimal("1.10"), alias="MIN_COPY_NOTIONAL")
     max_outcome_exposure: Decimal = Field(default=Decimal("50"), alias="MAX_OUTCOME_EXPOSURE")
     default_slippage_bps: int = Field(default=500, alias="DEFAULT_SLIPPAGE_BPS")

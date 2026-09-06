@@ -72,7 +72,10 @@ async def rig(tmp_path, monkeypatch):
         get_activity=AsyncMock(return_value=[]),
         get_resolution=AsyncMock(return_value=None),
     )
-    settings = Settings(_env_file=None, COPY_BALANCE_PCT=1, LEADER_ORDER_SCALE=1)
+    # This fixture tests ledger/latency independently of history-based sizing.
+    # Adaptive sizing has a separate fixture with seeded historical profiles.
+    settings = Settings(_env_file=None, COPY_BALANCE_PCT=1, LEADER_ORDER_SCALE=1,
+                        SMART_SIZING_ENABLED=False)
     engine = CopyEngine(settings, client)
     yield SimpleNamespace(engine=engine, client=client, sessions=sessions, book=book)
     await engine.stop()

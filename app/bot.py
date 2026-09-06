@@ -24,6 +24,13 @@ from .repository import add_leader, get_leaders, get_or_create_account, orders, 
 
 log = structlog.get_logger(__name__)
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+SIZING_REASONS = {
+    "sizing_profile_unavailable": "собираем статистику входов трейдера; пока недостаточно данных",
+    "sizing_entry_closed": "серия уже завершена; позднюю покупку не догоняем",
+    "sizing_below_minimum": "добавка к серии ниже минимума; учитывается при следующей покупке в том же окне",
+    "sizing_entry_budget_used": "бюджет этой серии уже использован",
+    "sizing_exposure_limit": "достигнут лимит на исход с учётом комиссии",
+}
 
 
 class LeaderForm(StatesGroup):
@@ -112,29 +119,78 @@ class TelegramApp:
             open_positions = await positions(session)
             await session.commit()
         state = "⏸ приостановлено" if account.paused else "▶️ активно"
-        max_next_buy = min(
-            account.trade_size,
-            account.max_trade_size,
-            account.paper_balance * self.settings.copy_balance_pct,
-        )
+        if self.settings.smart_sizing_enabled:
+            max_next_buy = min(
+                account.paper_balance,
+                account.max_trade_size,
+                account.paper_balance * self.settings.copy_balance_pct
+                * self.settings.smart_sizing_max_multiplier,
+            )
+        else:
+            max_next_buy = min(
+                account.trade_size,
+                account.max_trade_size,
+                account.paper_balance * self.settings.copy_balance_pct,
+            )
         cash_warning = (
-            "\n\n⚠️ Новые покупки сейчас невозможны: расчётная сумма сделки "
+            "\n\n⚠️ Новые покупки сейчас невозможны: верхний предел бюджета "
             f"${max_next_buy:.2f} ниже минимума ${self.settings.min_copy_notional:.2f}."
             if not account.paused and max_next_buy < self.settings.min_copy_notional
             else ""
         )
+        sizing_status = ""
+        if self.settings.smart_sizing_enabled:
+            ready_count = sum(
+                1 for row in leaders
+                if row.active and self._sizing_profile_ready(row.id)
+            )
+            active_count = sum(1 for row in leaders if row.active)
+            sizing_status = (
+                f"Размер входа: <b>адаптивный · {self.settings.copy_balance_pct * 100:.1f}% базы</b>\n"
+                f"Статистика входов: {ready_count}/{active_count} готовы\n"
+            )
         text = (
             "<b>POLYSEY · PAPER</b>\n\n"
             f"Свободно: <b>${account.paper_balance:.2f}</b>\n"
             f"Стартовый капитал: ${account.starting_balance:.2f}\n"
             f"Состояние копирования: {state}\n"
             f"Активных трейдеров: <b>{sum(1 for row in leaders if row.active)}</b>\n"
+            f"{sizing_status}"
             f"Открытых позиций: <b>{len(open_positions)}</b>\n"
             f"Зафиксированный PNL: <b>${account.realized_pnl:+.2f}</b>\n\n"
             "Стоимость открытых позиций доступна в разделе «Портфель»."
             f"{cash_warning}"
         )
         await self._edit_panel(text, self._menu(account.paused), chat_id)
+
+    def _sizing_profile_ready(self, leader_id: int) -> bool:
+        profile = self.engine._leader_sizing_profiles.get(leader_id)
+        return bool(
+            profile
+            and profile.reference_notional > 0
+            and profile.sample_count >= self.settings.smart_sizing_min_samples
+        )
+
+    def _leader_sizing_text(self, leader_id: int) -> str:
+        if not self.settings.smart_sizing_enabled:
+            return "Размер входа: <b>классический режим</b>\n"
+        profile = self.engine._leader_sizing_profiles.get(leader_id)
+        if not self._sizing_profile_ready(leader_id):
+            count = profile.sample_count if profile else 0
+            return (
+                "Размер входа: <b>⏳ собираем статистику</b>\n"
+                f"Серий в выборке: {count}; нужно минимум {self.settings.smart_sizing_min_samples}.\n"
+                "Новые BUY пока пропускаются; это не пауза копирования.\n"
+            )
+        refreshed = profile.refreshed_at
+        if refreshed.tzinfo is None:
+            refreshed = refreshed.replace(tzinfo=UTC)
+        return (
+            f"Типичная серия входа: <b>${profile.reference_notional:.2f}</b>\n"
+            f"Серий в выборке: {profile.sample_count} · окно {self.settings.smart_sizing_burst_seconds} с\n"
+            f"Статистика: {refreshed.astimezone(UTC):%d.%m %H:%M} UTC\n"
+            "<i>При 10+ сериях убираем крайние 10% с каждой стороны; это не баланс трейдера.</i>\n"
+        )
 
     async def _leaders_panel(self, page: int = 0, chat_id: int | None = None) -> None:
         async with SessionLocal() as session:
@@ -223,7 +279,7 @@ class TelegramApp:
             last_result = (
                 "скопировано"
                 if last.status == "executed"
-                else html.escape(last.skip_reason or last.status)
+                else html.escape(SIZING_REASONS.get(last.skip_reason, last.skip_reason or last.status))
             )
         realized_pnl = Decimal(0)
         open_cost = Decimal(0)
@@ -266,14 +322,12 @@ class TelegramApp:
                     else:
                         lots[0] = [lot_shares, lot_cost]
         open_cost = sum((cost for _, cost in lots), Decimal(0))
-        avg_trade = self.engine._leader_avg_trade_size.get(leader_id)
-        avg_line = f"Средняя сделка лидера: <b>${avg_trade:.2f}</b>\n" if avg_trade else ""
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
             f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
             f"Сделки: {buys} покупок · {sells} продаж\n"
-            + avg_line
+            + self._leader_sizing_text(leader_id)
             + f"Реализованный PNL: <b>${realized_pnl:+.4f}</b>\n"
             f"Открытая себестоимость: <b>${open_cost:.4f}</b>\n"
             "<i>FIFO · комиссии учтены; открытые shares не считаются убытком</i>\n"
@@ -491,6 +545,7 @@ class TelegramApp:
             "submitted": "ожидает",
         }
         reasons = {
+            **SIZING_REASONS,
             "no_liquidity_within_slippage": "цена вышла за slippage",
             "no_liquidity": "нет ликвидности",
             "below_min_order_size": "меньше минимума",
@@ -575,14 +630,60 @@ class TelegramApp:
             await session.commit()
         return (
             "<b>⚙️ НАСТРОЙКИ</b>\n\n"
-            "<b>Размер копирования</b>\n"
-            f"Базовая сумма: <b>${account.trade_size:.2f}</b> · максимум ${account.max_trade_size:.2f}\n"
-            f"От свободного баланса: {self.settings.copy_balance_pct * 100:.1f}% · масштаб лидера: {self.settings.leader_order_scale * 100:.1f}%\n\n"
+            + self._sizing_summary(account)
+            + "\n\n"
             "<b>Исполнение и риск</b>\n"
-            f"Минимум сделки: ${self.settings.min_copy_notional:.2f} · максимум на исход: ${self.settings.max_outcome_exposure:.2f}\n"
+            f"Минимум BUY: ${self.settings.min_copy_notional:.2f} · лимит на исход: ${self.settings.max_outcome_exposure:.2f}\n"
+            "Также действует минимум shares из стакана.\n"
             f"Допустимое отклонение цены: <b>{account.slippage_bps / 100:.2f}%</b>\n"
             "Дневной лимит: выключен · Buy-only: выключен\n\n"
-            "Изменить параметры можно кнопками ниже или командами /setsize, /setmax, /setslippage, /risk."
+            "Подробности — кнопками ниже. Команды: /setmax, /setslippage, /risk."
+        )
+
+    def _sizing_summary(self, account) -> str:
+        if not self.settings.smart_sizing_enabled:
+            return (
+                "<b>Размер копирования · классический</b>\n"
+                f"Фиксированный предел: <b>${account.trade_size:.2f}</b> · максимум ${account.max_trade_size:.2f}\n"
+                f"От свободного баланса: {self.settings.copy_balance_pct * 100:.1f}%\n"
+                f"Масштаб отдельной сделки лидера: {self.settings.leader_order_scale * 100:.1f}%\n"
+                "Изменить предел: /setsize 5 · максимум: /setmax 30"
+            )
+        base = max(Decimal(0), account.paper_balance) * self.settings.copy_balance_pct
+        return (
+            "<b>Размер копирования · адаптивный</b>\n"
+            f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · сейчас ${base:.2f}\n"
+            f"Размер серии лидера / его типичный вход · до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
+            "Цена хуже средней в серии → бюджет уменьшается.\n"
+            f"Максимум на серию: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
+            f"Покупки одного исхода за {self.settings.smart_sizing_burst_seconds} с делят один бюджет.\n"
+            "/setsize не влияет на адаптивный режим. Максимум: /setmax 30"
+        )
+
+    def _sizing_help(self) -> str:
+        if not self.settings.smart_sizing_enabled:
+            return (
+                "<b>💵 Размер сделки · классический</b>\n"
+                "Бюджет ограничен свободными деньгами, их процентом, размером сделки лидера "
+                "и установленными пределами.\n\n/setsize 5 · /setmax 30"
+            )
+        return (
+            "<b>💵 Как рассчитывается вход</b>\n\n"
+            f"1. База — {self.settings.copy_balance_pct * 100:.1f}% свободных денег в начале серии.\n"
+            "2. Масштаб — сумма BUY трейдера в серии / его типичная серия.\n"
+            f"3. Масштаб ограничен {self.settings.smart_sizing_max_multiplier:g}×. "
+            "Если наша цена выше средней цены трейдера в серии, бюджет уменьшается "
+            "в отношении этих цен. Лучшая цена бюджет не увеличивает.\n"
+            "4. Из целевого бюджета вычитаем уже потраченное в этой серии, включая комиссии.\n\n"
+            f"Серия — трейдер + исход + фиксированное окно {self.settings.smart_sizing_burst_seconds} с "
+            "по времени сделки. На границе окна близкие сделки могут разделиться. "
+            "Бот не ждёт окончания окна. Мелкие добавки накапливаются только внутри него.\n\n"
+            "Это модель размера позиции, не оценка вероятности победы или капитала трейдера. "
+            "Slippage, доступные деньги и лимит на исход остаются обязательными.\n\n"
+            "<b>/setmax 30</b> — потолок серии с комиссиями. "
+            "/setsize действует только в классическом режиме. "
+            "Процент базы меняется через COPY_BALANCE_PCT в .env; "
+            "после изменения контейнер нужно пересоздать."
         )
 
     async def _orders_text(self) -> str:
@@ -608,21 +709,7 @@ class TelegramApp:
         return builder.as_markup()
 
     async def _settings_text(self) -> str:
-        async with SessionLocal() as session:
-            account = await get_or_create_account(session, self.settings.paper_initial_balance)
-            await session.commit()
-        return (
-            "<b>⚙️ Настройки</b>\n"
-            f"Размер сделки: ${account.trade_size:.2f}\n"
-            f"Максимум сделки: ${account.max_trade_size:.2f}\n"
-            f"От баланса: {self.settings.copy_balance_pct * 100:.2f}%\n"
-            f"Масштаб лидера: {self.settings.leader_order_scale * 100:.2f}% его ордера\n"
-            f"Min/Max BUY: ${self.settings.min_copy_notional:.2f} / ${account.max_trade_size:.2f}\n"
-            f"Макс. exposure outcome: ${self.settings.max_outcome_exposure:.2f}\n"
-            f"Slippage: {account.slippage_bps / 100:.2f}%\n"
-            "Дневной лимит: нет\nЛидеры: без пользовательского лимита\n\n"
-            "Команды: /setsize, /setmax, /setslippage, /risk TOKEN sl=0.2 tp=0.25 trail=0.1"
-        )
+        return await self._settings_text_v2()
 
     def _register(self) -> None:
         self.dp.message.register(self.start, Command("start"))
@@ -767,20 +854,25 @@ class TelegramApp:
             value = Decimal(parts[1]) if len(parts) == 2 else Decimal(0)
         except (InvalidOperation, IndexError):
             value = Decimal(0)
-        if value <= 0:
+        if not value.is_finite() or value <= 0:
             await self._edit_panel(f"Формат: /{command} 5", self._back(), message.chat.id)
             return
         async with SessionLocal() as session:
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
             setattr(account, field, value)
             await session.commit()
-        await self._edit_panel(f"✅ {label}: ${value:.2f}", self._back(), message.chat.id)
+        note = (
+            "\nСохранено для классического режима; в адаптивном режиме /setsize не используется."
+            if field == "trade_size" and self.settings.smart_sizing_enabled else ""
+        )
+        await self._edit_panel(f"✅ {label}: ${value:.2f}{note}", self._back(), message.chat.id)
 
     async def setsize(self, message: Message):
         await self._set_decimal_setting(message, "trade_size", "setsize", "Размер сделки")
 
     async def setmax(self, message: Message):
-        await self._set_decimal_setting(message, "max_trade_size", "setmax", "Максимум сделки")
+        label = "Максимум серии с комиссией" if self.settings.smart_sizing_enabled else "Максимум сделки"
+        await self._set_decimal_setting(message, "max_trade_size", "setmax", label)
 
     async def setslippage(self, message: Message) -> None:
         if not self._allowed(message):
@@ -895,8 +987,8 @@ class TelegramApp:
         elif data.startswith("settings:"):
             section = data.split(":", 1)[1]
             details = {
-                "sizing": "💵 <b>Размер сделки</b>\nСумма считается от нашего свободного баланса и ограничивается максимумом.\n\nКоманды: /setsize 5 · /setmax 30",
-                "limits": "📏 <b>Лимиты</b>\nДневной лимит выключен. Ограничение на один исход защищает от концентрации.",
+                "sizing": self._sizing_help(),
+                "limits": "📏 <b>Лимиты</b>\nДневной лимит выключен. В адаптивном режиме лимиты серии и исхода учитывают комиссии. Максимум серии меняется через /setmax; он хранится в базе и не перезаписывается из .env.",
                 "slippage": "📉 <b>Slippage</b>\nМаксимальное отклонение цены при копировании. Изменить: /setslippage 5",
                 "risk": "🛡️ <b>Stop-loss / Take-profit</b>\nНастраиваются для конкретного token_id: /risk TOKEN sl=0.2 tp=0.25 trail=0.1",
             }
