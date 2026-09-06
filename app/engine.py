@@ -278,7 +278,7 @@ class CopyEngine:
                 notionals = [
                     event.size * event.price
                     for event in activities
-                    if event.size > 0 and event.price > 0
+                    if event.side == "BUY" and event.size > 0 and event.price > 0
                 ]
                 if notionals:
                     self._leader_avg_trade_size[leader.id] = sum(notionals, Decimal(0)) / len(notionals)
@@ -475,7 +475,9 @@ class CopyEngine:
             )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
-            if self.settings.smart_sizing_enabled and prepared.leader_value:
+            if self.settings.smart_sizing_enabled and (
+                prepared.leader_value or self._leader_avg_trade_size.get(leader.id)
+            ):
                 cash_capacity = account.paper_balance / (Decimal(1) + fee_rate)
                 base_capacity = min(cash_capacity, account.max_trade_size, account.trade_size)
             else:
