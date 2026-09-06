@@ -266,11 +266,14 @@ class TelegramApp:
                     else:
                         lots[0] = [lot_shares, lot_cost]
         open_cost = sum((cost for _, cost in lots), Decimal(0))
+        avg_trade = self.engine._leader_avg_trade_size.get(leader_id)
+        avg_line = f"Средняя сделка лидера: <b>${avg_trade:.2f}</b>\n" if avg_trade else ""
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
             f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
             f"Сделки: {buys} покупок · {sells} продаж\n"
+            + avg_line
             f"Реализованный PNL: <b>${realized_pnl:+.4f}</b>\n"
             f"Открытая себестоимость: <b>${open_cost:.4f}</b>\n"
             "<i>FIFO · комиссии учтены; открытые shares не считаются убытком</i>\n"
