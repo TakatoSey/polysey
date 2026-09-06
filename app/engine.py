@@ -901,8 +901,17 @@ class CopyEngine:
             self.record_rejection(session, copy_trade, event, signal_reason)
             log.info(
                 "copy_rejected",
+                event_key=event.event_key,
                 reason=signal_reason,
                 source=event.source,
+                source_timestamp=event.timestamp,
+                received_age_seconds=round(max(0, event.received_at - event.timestamp), 3),
+                age_limit_seconds=(
+                    self.settings.max_signal_age_rtds_seconds
+                    if event.source == "rtds"
+                    else self.settings.max_signal_age_rest_seconds
+                ),
+                current_age_seconds=round(max(0, time.time() - event.timestamp), 3),
                 source_age_seconds=round(time.time() - event.timestamp, 3),
             )
             return
@@ -953,6 +962,7 @@ class CopyEngine:
                     "copy_rejected",
                     leader=leader.address,
                     side=event.side,
+                    event_key=event.event_key,
                     reason=copy_trade.skip_reason,
                     detection_lag_seconds=round(detection_lag, 3),
                     paper_balance=str(account.paper_balance),
@@ -1104,6 +1114,12 @@ class CopyEngine:
                 leader_price=str(event.price),
                 best_book_price=str(best_price) if best_price is not None else None,
                 requested_shares=str(target_shares),
+                reference_price=str(event.price),
+                best_ask=str(book.asks[0][0]) if event.side == "BUY" and book.asks else None,
+                slippage_price=str(policy.slippage_price),
+                max_buy_price=str(event.price + policy.slippage_price)
+                if event.side == "BUY"
+                else None,
             )
             return
         try:
