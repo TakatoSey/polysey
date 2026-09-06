@@ -456,8 +456,13 @@ class CopyEngine:
             )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
+            if self.settings.smart_sizing_enabled and prepared.leader_value:
+                cash_capacity = account.paper_balance / (Decimal(1) + fee_rate)
+                base_capacity = min(cash_capacity, account.max_trade_size, account.trade_size)
+            else:
+                base_capacity = self.calculate_own_buy_capacity(account, self.settings, fee_rate)
             own_capacity = min(
-                self.calculate_own_buy_capacity(account, self.settings, fee_rate),
+                base_capacity,
                 max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
             )
             buy_budget = min(
