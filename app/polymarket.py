@@ -98,11 +98,10 @@ class PolymarketClient:
         return await asyncio.shield(task)
 
     async def start(self) -> None:
-        from .orderbook import LiveBookCache
-
-        if not self.book_stream:
-            self.book_stream = LiveBookCache(self)
-            await self.book_stream.start()
+        # The old cache is NOT used for execution (it does not reconcile all
+        # deltas). Avoid maintaining unused subscriptions and parsing traffic.
+        # RTDS wallet discovery is a separate stream and remains enabled.
+        pass
 
     async def get_activity(self, address: str, limit: int = 500) -> list[LeaderActivity]:
         response = await self.http.get(

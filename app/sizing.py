@@ -1,4 +1,5 @@
 """Capital allocation heuristics, not leader equity or win-probability estimates."""
+
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -18,7 +19,9 @@ class EntrySample:
     sample_end: int
 
 
-def sample_entries(activities, *, before: int, seconds: int, min_samples: int) -> EntrySample | None:
+def sample_entries(
+    activities, *, before: int, seconds: int, min_samples: int
+) -> EntrySample | None:
     """Same fixed buckets as execution; exclude open buckets and BUY/SELL mixtures.
 
     Activity is already fetched for detection. No extra HTTP request or future
@@ -43,18 +46,25 @@ def sample_entries(activities, *, before: int, seconds: int, min_samples: int) -
         key = (event.token_id, start)
         if event.side == "SELL":
             blocked.add(key)
-        elif (event.side == "BUY" and event.size.is_finite() and event.price.is_finite()
-              and event.size > 0 and ZERO < event.price < ONE):
+        elif (
+            event.side == "BUY"
+            and event.size.is_finite()
+            and event.price.is_finite()
+            and event.size > 0
+            and ZERO < event.price < ONE
+        ):
             groups[key] = groups.get(key, ZERO) + event.size * event.price
     groups = {key: value for key, value in groups.items() if key not in blocked}
     if len(groups) < min_samples:
         return None
     ordered = sorted(groups.values())
     trim = len(ordered) // 10
-    middle = ordered[trim:len(ordered) - trim] if trim else ordered
+    middle = ordered[trim : len(ordered) - trim] if trim else ordered
     return EntrySample(
-        sum(middle, ZERO) / len(middle), len(ordered),
-        min(key[1] for key in groups), max(key[1] for key in groups) + seconds,
+        sum(middle, ZERO) / len(middle),
+        len(ordered),
+        min(key[1] for key in groups),
+        max(key[1] for key in groups) + seconds,
     )
 
 
@@ -68,9 +78,20 @@ class BudgetDecision:
     reason: str | None = None
 
 
-def entry_budget(entry, *, ask: Decimal, event_price: Decimal, cash: Decimal,
-                 exposure_room: Decimal, current_max: Decimal, fee_rate: Decimal,
-                 slippage_bps: int, min_notional: Decimal, min_shares: Decimal) -> BudgetDecision:
+def entry_budget(
+    entry,
+    *,
+    ask: Decimal,
+    event_price: Decimal,
+    cash: Decimal,
+    exposure_room: Decimal,
+    current_max: Decimal,
+    fee_rate: Decimal,
+    slippage_price: Decimal | None = None,
+    slippage_bps: int | None = None,
+    min_notional: Decimal,
+    min_shares: Decimal,
+) -> BudgetDecision:
     """Cumulative all-in target minus actual prior cash debits; never round up."""
     vwap = entry.leader_notional / entry.leader_shares
     reference = min(vwap, event_price)
@@ -82,12 +103,19 @@ def entry_budget(entry, *, ask: Decimal, event_price: Decimal, cash: Decimal,
     reserve = ONE + max(ZERO, fee_rate) * (ONE - ask)
     budget = max(ZERO, min(remaining, cash, exposure_room)) / reserve
     reason = None
+    distance = (
+        slippage_price
+        if slippage_price is not None
+        else reference * Decimal(slippage_bps or 0) / 10000
+    )
     if entry.closed:
         reason = "sizing_entry_closed"
     elif ask <= 0:
         reason = "no_liquidity"
-    elif ask > reference * (ONE + Decimal(slippage_bps) / 10000):
+    elif ask > reference + distance:
         reason = "no_liquidity_within_slippage"
+    elif slippage_price is not None and ask < max(vwap, event_price) - distance:
+        reason = "entry_price_drop"
     elif remaining <= 0:
         reason = "sizing_entry_budget_used"
     elif exposure_room <= 0:

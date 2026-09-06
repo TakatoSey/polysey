@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import time
-from dataclasses import dataclass
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -11,13 +13,32 @@ import structlog
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
+from .accounting import Holding, inventory
 from .config import Settings
 from .db import SessionLocal
-from .models import (CopyTrade, Leader, LeaderPosition, PaperOrder, Position, RiskRule,
-                     LeaderSizingProfile, SizingEntry, SizingAudit)
+from .models import (
+    CopyTrade,
+    ExitIntent,
+    Leader,
+    LeaderPosition,
+    LeaderSizingProfile,
+    PaperOrder,
+    Position,
+    RiskRule,
+    SizingAudit,
+    SizingEntry,
+    SourceReceipt,
+)
 from .paper import execute_buy_fak_by_budget, execute_fak
 from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key
-from .repository import apply_fill, get_or_create_account, get_position, get_risk
+from .priority import PriorityLock
+from .repository import (
+    apply_fill,
+    get_execution_policy,
+    get_or_create_account,
+    get_position,
+    get_risk,
+)
 from .sizing import entry_bucket, entry_budget, sample_entries
 
 log = structlog.get_logger(__name__)
@@ -42,13 +63,18 @@ class CopyEngine:
         self.stop_event = asyncio.Event()
         self.notifications: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
         # Network preparation is concurrent; all portfolio mutations remain serialized.
-        self._ledger_lock = asyncio.Lock()
+        self._ledger_lock = PriorityLock()
         self._prepare_slots = asyncio.Semaphore(settings.copy_prepare_concurrency)
         self._poll_slots = asyncio.Semaphore(8)
         self._maintenance_slots = asyncio.Semaphore(4)
+        self._exit_slots = asyncio.Semaphore(2)
+        self._exit_workers = {}
+        self._buy_batches = {}
+        self._sell_watermarks = {}
+        self._buy_preparations = {}
         self._pending: dict[str, asyncio.Task] = {}
         self._leader_polls: dict[int, asyncio.Task] = {}
-        self._token_tails: dict[str, asyncio.Task] = {}
+        self._token_tails: dict[tuple[int, str], asyncio.Task] = {}
         self._leader_floors: dict[int, int] = {}
         self._leader_sizing_profiles: dict[int, LeaderSizingProfile] = {}
         self._profile_refresh_attempt: dict[int, float] = {}
@@ -107,13 +133,19 @@ class CopyEngine:
         own_capacity: Decimal,
         book,
         reference_price: Decimal,
-        slippage_bps: int,
+        slippage_price: Decimal | None = None,
+        slippage_bps: int | None = None,
     ) -> Decimal:
         """Raise a valid small copy to the exchange's share minimum when affordable."""
         if not book.asks or reference_price <= 0:
             return budget
         best_ask = book.asks[0][0]
-        max_price = reference_price * (Decimal(1) + Decimal(slippage_bps) / Decimal(10000))
+        distance = (
+            slippage_price
+            if slippage_price is not None
+            else reference_price * Decimal(slippage_bps or 0) / Decimal(10000)
+        )
+        max_price = reference_price + distance
         required = book.min_order_size * best_ask
         if best_ask <= max_price and budget < required <= own_capacity:
             return required
@@ -148,6 +180,10 @@ class CopyEngine:
             poll_seconds=self.settings.poll_interval_seconds,
             artificial_delay_seconds=self.settings.copy_latency_seconds,
             prepare_concurrency=self.settings.copy_prepare_concurrency,
+            max_age_rtds_seconds=self.settings.max_signal_age_rtds_seconds,
+            max_age_rest_seconds=self.settings.max_signal_age_rest_seconds,
+            exit_retry_enabled=self.settings.exit_retry_enabled,
+            exit_retry_seconds=self.settings.exit_retry_seconds,
         )
         if self.settings.copy_latency_seconds:
             log.warning("artificial_copy_delay_enabled", hint="Set COPY_LATENCY_SECONDS=0")
@@ -161,11 +197,19 @@ class CopyEngine:
             asyncio.create_task(
                 self._repeat(self.monitor_risk_once, self.settings.maintenance_interval_seconds)
             ),
+            asyncio.create_task(
+                self._repeat(self.retry_exits_once, self.settings.exit_retry_seconds)
+            ),
         ]
         try:
             await asyncio.gather(*loops)
         finally:
-            tasks = loops + list(self._leader_polls.values()) + list(self._pending.values())
+            tasks = (
+                loops
+                + list(self._leader_polls.values())
+                + list(set(self._pending.values()))
+                + list(self._exit_workers.values())
+            )
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
@@ -192,10 +236,16 @@ class CopyEngine:
             return "untracked"
         event.event_key = copy_event_key(event.event_key, event.trader_address)
         async with SessionLocal() as session:
-            leader = await session.scalar(select(Leader).where(Leader.address == event.trader_address))
+            leader = await session.scalar(
+                select(Leader).where(Leader.address == event.trader_address)
+            )
             if not leader or not leader.active or not leader.initialized:
                 return "untracked"
-            if await session.scalar(select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)):
+            if await session.scalar(
+                select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)
+            ):
+                return "duplicate"
+            if await session.get(SourceReceipt, event.event_key):
                 return "duplicate"
         self._schedule_copy(leader.id, event)
         return "scheduled"
@@ -275,6 +325,13 @@ class CopyEngine:
                         )
                     )
                 )
+                existing.update(
+                    await session.scalars(
+                        select(SourceReceipt.event_key).where(
+                            SourceReceipt.event_key.in_([event.event_key for event in new_events])
+                        )
+                    )
+                )
                 outstanding = []
                 for event in new_events:
                     if event.event_key in existing:
@@ -292,15 +349,19 @@ class CopyEngine:
         if not self.settings.smart_sizing_enabled:
             return
         last = self._profile_refresh_attempt.get(leader.id)
-        interval = (self.settings.smart_sizing_stats_refresh_seconds
-                    if leader.id in self._leader_sizing_profiles else 60)
+        interval = (
+            self.settings.smart_sizing_stats_refresh_seconds
+            if leader.id in self._leader_sizing_profiles
+            else 60
+        )
         if last is not None and time.monotonic() - last < interval:
             return
         now = int(time.time())
         # Exclude events about to be copied, including their entire source bucket.
         cutoff = min(now, leader.last_timestamp) if leader.initialized else now
         sample = sample_entries(
-            activities, before=entry_bucket(cutoff, self.settings.smart_sizing_burst_seconds),
+            activities,
+            before=entry_bucket(cutoff, self.settings.smart_sizing_burst_seconds),
             seconds=self.settings.smart_sizing_burst_seconds,
             min_samples=self.settings.smart_sizing_min_samples,
         )
@@ -315,8 +376,11 @@ class CopyEngine:
             profile.bucket_seconds = self.settings.smart_sizing_burst_seconds
             profile.refreshed_at = datetime.now(UTC)
             await session.commit()
-        if (profile and profile.sample_end >= now - 7 * 86400
-                and profile.bucket_seconds == self.settings.smart_sizing_burst_seconds):
+        if (
+            profile
+            and profile.sample_end >= now - 7 * 86400
+            and profile.bucket_seconds == self.settings.smart_sizing_burst_seconds
+        ):
             self._leader_sizing_profiles[leader.id] = profile
         else:
             self._leader_sizing_profiles.pop(leader.id, None)
@@ -325,20 +389,52 @@ class CopyEngine:
     def _schedule_copy(self, leader_id: int, event: LeaderActivity) -> None:
         if event.event_key in self._pending:
             return
-        if len(self._pending) >= self.settings.copy_queue_limit:
+        limit = self.settings.copy_queue_limit + (64 if event.side == "SELL" else 0)
+        if len(self._pending) >= limit:
             log.warning("copy_queue_full", pending=len(self._pending), event_key=event.event_key)
             return  # REST retries it; no checkpoint or fake rejection.
         if not event.received_at:
             event.received_at, event.received_monotonic = time.time(), time.monotonic()
-        predecessor = self._token_tails.get(event.token_id)
-        task = asyncio.create_task(self._execute_queued(leader_id, event, predecessor))
+        owner_key = (leader_id, event.token_id)
+        if event.side == "SELL" and self._valid_timestamp(event):
+            self._sell_watermarks[owner_key] = max(
+                event.timestamp, self._sell_watermarks.get(owner_key, 0)
+            )
+            for stamp, cancel in self._buy_preparations.get(owner_key, []):
+                if stamp <= event.timestamp:
+                    cancel.set()
+        batch_key = (
+            *owner_key,
+            entry_bucket(event.timestamp, self.settings.smart_sizing_burst_seconds),
+            self._sell_watermarks.get(owner_key, 0),
+        )
+        if event.side == "BUY" and self.settings.smart_sizing_enabled:
+            batch = self._buy_batches.get(batch_key)
+            if batch:
+                batch[0].append(event)
+                self._pending[event.event_key] = batch[1]
+                return
+        # Preserve this leader's chronology, but an unrelated leader's slow
+        # BUY on the same outcome must not hold up our already-owned exit.
+        predecessor = self._token_tails.get(owner_key)
+        events = [event]
+        if event.side == "BUY" and self.settings.smart_sizing_enabled:
+            task = asyncio.create_task(
+                self._execute_batch(leader_id, events, batch_key, predecessor)
+            )
+            self._buy_batches[batch_key] = (events, task)
+        else:
+            task = asyncio.create_task(self._execute_queued(leader_id, event, predecessor))
         self._pending[event.event_key] = task
-        self._token_tails[event.token_id] = task
+        self._token_tails[owner_key] = task
 
         def done(completed):
-            self._pending.pop(event.event_key, None)
-            if self._token_tails.get(event.token_id) is completed:
-                self._token_tails.pop(event.token_id, None)
+            for item in events:
+                self._pending.pop(item.event_key, None)
+            if self._buy_batches.get(batch_key, (None, None))[1] is completed:
+                self._buy_batches.pop(batch_key, None)
+            if self._token_tails.get(owner_key) is completed:
+                self._token_tails.pop(owner_key, None)
             if not completed.cancelled() and completed.exception():
                 log.error(
                     "copy_worker_failed",
@@ -348,14 +444,187 @@ class CopyEngine:
 
         task.add_done_callback(done)
 
+    def _buy_signal_reason(self, event):
+        if event.side != "BUY":
+            return None
+        now = time.time()
+        if not self._valid_timestamp(event):
+            return "invalid_signal_timestamp"
+        age_limit = (
+            self.settings.max_signal_age_rtds_seconds
+            if event.source == "rtds"
+            else self.settings.max_signal_age_rest_seconds
+        )
+        if now - event.timestamp > age_limit:
+            return "stale_signal"
+        return None
+
+    @staticmethod
+    def _valid_timestamp(event):
+        return 0 < event.timestamp <= time.time() + 2
+
+    async def _execute_batch(self, leader_id, events, batch_key, predecessor):
+        prepared = await self._prepare_event(leader_id, events[0])
+        if predecessor:
+            try:
+                await asyncio.shield(predecessor)
+            except Exception:
+                log.warning("predecessor_failed", token_id=events[0].token_id)
+        self._buy_batches.pop(batch_key, None)
+        async with self._execution_slot(events[0], prepared, 10), SessionLocal() as session:
+            leader = await session.get(Leader, leader_id)
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            if not leader or not leader.active or account.paused:
+                return
+            eligible = []
+            received = set(
+                await session.scalars(
+                    select(SourceReceipt.event_key).where(
+                        SourceReceipt.event_key.in_([e.event_key for e in events])
+                    )
+                )
+            )
+            for event in events:
+                if event.event_key in received:
+                    continue
+                if self._buy_signal_reason(event) or not self._valid_trade(event):
+                    await self.process_event(session, leader, event, prepared)
+                else:
+                    eligible.append(event)
+            if eligible:
+                qty = sum((e.size for e in eligible), Decimal(0))
+                price = sum((e.size * e.price for e in eligible), Decimal(0)) / qty
+                key = (
+                    eligible[0].event_key
+                    if len(eligible) == 1
+                    else "batch:"
+                    + hashlib.sha256(
+                        "|".join(sorted(e.event_key for e in eligible)).encode()
+                    ).hexdigest()
+                )
+                combined = replace(
+                    eligible[0],
+                    event_key=key,
+                    size=qty,
+                    price=price,
+                    timestamp=min(e.timestamp for e in eligible),
+                )
+                await self.process_event(
+                    session, leader, combined, prepared, source_events=eligible
+                )
+                log.info(
+                    "copy_batch",
+                    leader_id=leader_id,
+                    fragments=len(eligible),
+                    token_id=combined.token_id,
+                    source=combined.source,
+                    age_seconds=round(time.time() - combined.timestamp, 3),
+                )
+            await session.commit()
+            messages = session.info.pop("notifications", [])
+        for message in messages:
+            await self.notify(message)
+
+        first = events[0]
+        log.info(
+            "copy_latency",
+            event_key=first.event_key,
+            fragments=len(events),
+            source=first.source,
+            source_age_seconds=round(max(0, first.received_at - first.timestamp), 3),
+            prepare_ms=round((prepared.ready_at - first.received_monotonic) * 1000, 1),
+            after_prepare_ms=round((time.monotonic() - prepared.ready_at) * 1000, 1),
+            bot_ms=round((time.monotonic() - first.received_monotonic) * 1000, 1),
+            exchange_delay_seconds=prepared.exchange_delay,
+        )
+
+    @staticmethod
+    def _valid_trade(event):
+        return (
+            event.side in {"BUY", "SELL"}
+            and event.size.is_finite()
+            and event.price.is_finite()
+            and event.size > 0
+            and Decimal(0) < event.price < Decimal(1)
+        )
+
+    async def _prepare_event(self, leader_id, event):
+        if not self._valid_timestamp(event) or not self._valid_trade(event):
+            return PreparedCopy(ready_at=time.monotonic(), error=ValueError("invalid_source_event"))
+        if event.side == "SELL":
+            return await self.prepare_copy(event)
+        key = (leader_id, event.token_id)
+        if self._buy_signal_reason(event) or self._sell_watermarks.get(key, -1) >= event.timestamp:
+            return PreparedCopy(ready_at=time.monotonic(), error=ValueError("buy_not_current"))
+        cancel = asyncio.Event()
+        item = (event.timestamp, cancel)
+        self._buy_preparations.setdefault(key, []).append(item)
+        prepare = asyncio.create_task(self.prepare_copy(event))
+        superseded = asyncio.create_task(cancel.wait())
+        try:
+            limit = (
+                self.settings.max_signal_age_rtds_seconds
+                if event.source == "rtds"
+                else self.settings.max_signal_age_rest_seconds
+            )
+            done, _ = await asyncio.wait(
+                [prepare, superseded],
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=max(0, event.timestamp + limit - time.time()),
+            )
+            if not done:
+                return PreparedCopy(
+                    ready_at=time.monotonic(), error=ValueError("signal_age_deadline")
+                )
+            if superseded in done:
+                return PreparedCopy(ready_at=time.monotonic(), error=ValueError("buy_not_current"))
+            return await prepare
+        finally:
+            for task in (prepare, superseded):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(prepare, superseded, return_exceptions=True)
+            self._buy_preparations[key].remove(item)
+            if not self._buy_preparations[key]:
+                self._buy_preparations.pop(key)
+
+    @asynccontextmanager
+    async def _execution_slot(self, event, prepared, priority):
+        # Recheck after waiting for the cash lock. Refresh outside it, then
+        # reacquire; bounded attempts prevent a busy loop under overload.
+        for attempt in range(4):
+            await self._ledger_lock.acquire(priority)
+            if (
+                attempt == 3
+                or prepared.error
+                or prepared.book_error
+                or self._buy_signal_reason(event)
+                or (prepared.book is not None and time.monotonic() - prepared.book_at <= 0.25)
+            ):
+                break
+            self._ledger_lock.release()
+            try:
+                async with self._exit_slots if event.side == "SELL" else self._prepare_slots:
+                    prepared.book = await self.client.get_book(event.token_id)
+                prepared.book_at = time.monotonic()
+            except Exception as exc:
+                prepared.book_error = exc
+        try:
+            yield
+        finally:
+            self._ledger_lock.release()
+
     async def prepare_copy(self, event: LeaderActivity) -> PreparedCopy:
         prepared = PreparedCopy()
         started = time.monotonic()
         tasks = []
         try:
-            async with self._prepare_slots:
+            async with self._exit_slots if event.side == "SELL" else self._prepare_slots:
                 market_task = asyncio.create_task(self.client.get_market(event.condition_id))
-                fee_task = asyncio.create_task(self.client.get_fee_rate(event.condition_id, event.title))
+                fee_task = asyncio.create_task(
+                    self.client.get_fee_rate(event.condition_id, event.title)
+                )
+
                 async def fetch_book():
                     book = await self.client.get_book(event.token_id)
                     return book, time.monotonic()
@@ -392,19 +661,13 @@ class CopyEngine:
         return prepared
 
     async def _execute_queued(self, leader_id, event, predecessor) -> None:
-        prepared = await self.prepare_copy(event)
+        prepared = await self._prepare_event(leader_id, event)
         if predecessor:
-            await asyncio.shield(predecessor)
-        # Obtain the execution snapshot after the prior fill on this token,
-        # but without blocking unrelated tokens behind a slow HTTP request.
-        if not prepared.error and prepared.book is None:
             try:
-                async with self._prepare_slots:
-                    prepared.book = await self.client.get_book(event.token_id)
-                prepared.book_at = time.monotonic()
-            except Exception as exc:
-                prepared.book_error = exc
-        async with self._ledger_lock:
+                await asyncio.shield(predecessor)
+            except Exception:
+                log.warning("predecessor_failed", token_id=event.token_id)
+        async with self._execution_slot(event, prepared, 0 if event.side == "SELL" else 10):
             async with SessionLocal() as session:
                 leader = await session.get(Leader, leader_id)
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
@@ -419,6 +682,7 @@ class CopyEngine:
         log.info(
             "copy_latency",
             event_key=event.event_key,
+            source=event.source,
             source_age_seconds=round(max(0, event.received_at - event.timestamp), 3),
             prepare_ms=round((prepared.ready_at - event.received_monotonic) * 1000, 1),
             after_prepare_ms=round((time.monotonic() - prepared.ready_at) * 1000, 1),
@@ -431,11 +695,16 @@ class CopyEngine:
         start = entry_bucket(event.timestamp, seconds)
         # A SELL is a barrier even if we had no position to sell. A later bucket
         # also prevents late REST events from reviving a superseded entry.
-        barrier = await session.scalar(select(CopyTrade.id).where(
-            CopyTrade.leader_id == leader_id, CopyTrade.token_id == event.token_id,
-            ((CopyTrade.side == "SELL") & (CopyTrade.timestamp >= start))
-            | (CopyTrade.timestamp >= start + seconds),
-        ).limit(1))
+        barrier = await session.scalar(
+            select(CopyTrade.id)
+            .where(
+                CopyTrade.leader_id == leader_id,
+                CopyTrade.token_id == event.token_id,
+                ((CopyTrade.side == "SELL") & (CopyTrade.timestamp >= start))
+                | (CopyTrade.timestamp >= start + seconds),
+            )
+            .limit(1)
+        )
         if barrier:
             return None, "sizing_entry_closed"
         key = (leader_id, event.token_id, start)
@@ -443,38 +712,60 @@ class CopyEngine:
         if entry is not None and entry.bucket_seconds != seconds:
             return None, "sizing_entry_closed"
         if entry is None:
-            overlap = await session.scalar(select(SizingEntry.bucket_start).where(
-                SizingEntry.leader_id == leader_id, SizingEntry.token_id == event.token_id,
-                SizingEntry.bucket_start < start + seconds,
-                SizingEntry.bucket_start + SizingEntry.bucket_seconds > start,
-            ).limit(1))
+            overlap = await session.scalar(
+                select(SizingEntry.bucket_start)
+                .where(
+                    SizingEntry.leader_id == leader_id,
+                    SizingEntry.token_id == event.token_id,
+                    SizingEntry.bucket_start < start + seconds,
+                    SizingEntry.bucket_start + SizingEntry.bucket_seconds > start,
+                )
+                .limit(1)
+            )
             # Upgrade / switching legacy->smart mid-entry must not mint a fresh
             # budget for an entry whose old frozen cash/target we cannot recover.
-            old_fill = await session.scalar(select(PaperOrder.id).join(
-                CopyTrade, CopyTrade.id == PaperOrder.copy_trade_id,
-            ).where(
-                CopyTrade.leader_id == leader_id, CopyTrade.token_id == event.token_id,
-                CopyTrade.timestamp >= start, CopyTrade.timestamp < start + seconds,
-                CopyTrade.side == "BUY", PaperOrder.filled_shares > 0,
-                PaperOrder.status.in_(["filled", "partial"]),
-            ).limit(1))
+            old_fill = await session.scalar(
+                select(PaperOrder.id)
+                .join(
+                    CopyTrade,
+                    CopyTrade.id == PaperOrder.copy_trade_id,
+                )
+                .where(
+                    CopyTrade.leader_id == leader_id,
+                    CopyTrade.token_id == event.token_id,
+                    CopyTrade.timestamp >= start,
+                    CopyTrade.timestamp < start + seconds,
+                    CopyTrade.side == "BUY",
+                    PaperOrder.filled_shares > 0,
+                    PaperOrder.status.in_(["filled", "partial"]),
+                )
+                .limit(1)
+            )
             if overlap is not None or old_fill is not None:
                 return None, "sizing_entry_closed"
             profile = await session.get(LeaderSizingProfile, leader_id)
-            if (profile is None or profile.reference_notional <= 0
-                    or profile.sample_count < self.settings.smart_sizing_min_samples
-                    or profile.bucket_seconds != seconds
-                    or profile.sample_end > start
-                    or profile.sample_end < int(time.time()) - 7 * 86400):
+            if (
+                profile is None
+                or profile.reference_notional <= 0
+                or profile.sample_count < self.settings.smart_sizing_min_samples
+                or profile.bucket_seconds != seconds
+                or profile.sample_end > start
+                or profile.sample_end < int(time.time()) - 7 * 86400
+            ):
                 return None, "sizing_profile_unavailable"
             entry = SizingEntry(
-                leader_id=leader_id, token_id=event.token_id, bucket_start=start, bucket_seconds=seconds,
+                leader_id=leader_id,
+                token_id=event.token_id,
+                bucket_start=start,
+                bucket_seconds=seconds,
                 cash_at_start=account.paper_balance,
                 base_budget=account.paper_balance * self.settings.copy_balance_pct,
                 reference_notional=profile.reference_notional,
                 max_budget=account.max_trade_size,
                 max_multiplier=self.settings.smart_sizing_max_multiplier,
-                leader_notional=Decimal(0), leader_shares=Decimal(0), spent=Decimal(0),
+                leader_notional=Decimal(0),
+                leader_shares=Decimal(0),
+                spent=Decimal(0),
                 closed=False,
             )
             session.add(entry)
@@ -485,41 +776,66 @@ class CopyEngine:
         return entry, None
 
     async def process_event(
-        self, session, leader: Leader, event: LeaderActivity, prepared: PreparedCopy | None = None
+        self,
+        session,
+        leader: Leader,
+        event: LeaderActivity,
+        prepared: PreparedCopy | None = None,
+        *,
+        source_events=None,
     ) -> None:
         detection_lag = max(0, (event.received_at or time.time()) - event.timestamp)
+        source_events = source_events or [event]
+        if await session.scalar(
+            select(SourceReceipt.event_key)
+            .where(SourceReceipt.event_key.in_([e.event_key for e in source_events]))
+            .limit(1)
+        ):
+            return
         if event.trader_name and not leader.label:
             leader.label = event.trader_name[:120]
         copy_trade = CopyTrade(
             leader_id=leader.id,
             event_key=event.event_key,
-            timestamp=event.timestamp,
+            timestamp=event.timestamp if self._valid_timestamp(event) else 0,
             token_id=event.token_id,
             condition_id=event.condition_id,
             side=event.side,
-            leader_size=event.size,
-            leader_price=event.price,
+            leader_size=event.size if event.size.is_finite() else Decimal(0),
+            leader_price=event.price if event.price.is_finite() else Decimal(0),
             status="detected",
         )
         try:
             async with session.begin_nested():
                 session.add(copy_trade)
                 await session.flush()
+                for source in source_events:
+                    session.add(
+                        SourceReceipt(event_key=source.event_key, copy_trade_id=copy_trade.id)
+                    )
+                await session.flush()
         except IntegrityError:
             return
 
-        if (event.side not in {"BUY", "SELL"} or not event.size.is_finite()
-                or not event.price.is_finite() or event.size <= 0
-                or not Decimal(0) < event.price < Decimal(1)):
+        if not self._valid_trade(event):
             copy_trade.status, copy_trade.skip_reason = "skipped", "invalid_size_or_price"
+            self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
+            return
+        if not self._valid_timestamp(event):
+            copy_trade.status, copy_trade.skip_reason = "skipped", "invalid_signal_timestamp"
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             return
 
         if event.side == "SELL":
-            await session.execute(update(SizingEntry).where(
-                SizingEntry.leader_id == leader.id, SizingEntry.token_id == event.token_id,
-                SizingEntry.bucket_start <= event.timestamp,
-            ).values(closed=True))
+            await session.execute(
+                update(SizingEntry)
+                .where(
+                    SizingEntry.leader_id == leader.id,
+                    SizingEntry.token_id == event.token_id,
+                    SizingEntry.bucket_start <= event.timestamp,
+                )
+                .values(closed=True)
+            )
 
         leader_pos = await session.scalar(
             select(LeaderPosition).where(
@@ -528,7 +844,50 @@ class CopyEngine:
             )
         )
         before_leader_shares = leader_pos.shares if leader_pos else Decimal(0)
+        await self.update_leader_position(session, leader.id, event, leader_pos)
         account = await get_or_create_account(session, self.settings.paper_initial_balance)
+        policy = await get_execution_policy(session, self.settings)
+        if event.side == "SELL":
+            await self._accept_exit(
+                session,
+                leader,
+                event,
+                copy_trade,
+                account,
+                before_leader_shares,
+                policy.slippage_price,
+                prepared,
+            )
+            return
+        signal_reason = self._buy_signal_reason(event)
+        if self._sell_watermarks.get((leader.id, event.token_id), -1) >= event.timestamp:
+            signal_reason = "buy_superseded_by_sell"
+        elif await session.scalar(
+            select(CopyTrade.id)
+            .where(
+                CopyTrade.leader_id == leader.id,
+                CopyTrade.token_id == event.token_id,
+                CopyTrade.side == "SELL",
+                CopyTrade.timestamp >= event.timestamp,
+            )
+            .limit(1)
+        ):
+            # The in-memory fast path is empty after restart; the committed
+            # SELL remains a barrier even in the legacy sizing mode.
+            signal_reason = "buy_superseded_by_sell"
+        pending_exit = await session.get(ExitIntent, (leader.id, event.token_id))
+        if pending_exit and pending_exit.remaining > 0:
+            signal_reason = "exit_pending"
+        if signal_reason:
+            copy_trade.status, copy_trade.skip_reason = "skipped", signal_reason
+            self.record_rejection(session, copy_trade, event, signal_reason)
+            log.info(
+                "copy_rejected",
+                reason=signal_reason,
+                source=event.source,
+                source_age_seconds=round(time.time() - event.timestamp, 3),
+            )
+            return
         try:
             prepared = prepared or await self.prepare_copy(event)
             if prepared.error:
@@ -539,7 +898,6 @@ class CopyEngine:
             detail = str(exc) or type(exc).__name__
             copy_trade.skip_reason = f"market_data:{detail}"[:200]
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
-            await self.update_leader_position(session, leader.id, event, leader_pos)
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
             return
         smart_buy = event.side == "BUY" and self.settings.smart_sizing_enabled
@@ -552,7 +910,9 @@ class CopyEngine:
             # the taker fee so apply_fill cannot reject a fill after consuming
             # the whole available balance on notional alone.
             leader_notional = event.size * event.price
-            buy_budget = self.calculate_buy_budget(account, self.settings, leader_notional, fee_rate)
+            buy_budget = self.calculate_buy_budget(
+                account, self.settings, leader_notional, fee_rate
+            )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
             base_capacity = self.calculate_own_buy_capacity(account, self.settings, fee_rate)
@@ -581,20 +941,7 @@ class CopyEngine:
                     leader_notional=str(leader_notional),
                     calculated_budget=str(buy_budget),
                 )
-                await self.update_leader_position(session, leader.id, event, leader_pos)
                 return
-        else:
-            position = await get_position(session, event.token_id)
-            if not position or position.shares <= 0 or before_leader_shares <= 0:
-                copy_trade.status = "skipped"
-                copy_trade.skip_reason = "no_position_to_sell"
-                self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
-                await self.update_leader_position(session, leader.id, event, leader_pos)
-                return
-            sell_ratio = min(Decimal(1), event.size / before_leader_shares)
-            target_shares = position.shares * sell_ratio
-
-        await self.update_leader_position(session, leader.id, event, leader_pos)
         if target_shares <= 0 and not smart_buy:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = "invalid_size_or_price"
@@ -605,11 +952,12 @@ class CopyEngine:
                 raise prepared.book_error
             book = prepared.book
             if book is None or time.monotonic() - prepared.book_at > 0.25:
-                # Do not execute against a snapshot that aged in the ledger queue.
-                book = await self.client.get_book(event.token_id)
+                raise ValueError("execution_book_expired")
             if event.side == "BUY":
                 if smart_buy:
-                    smart_entry, reason = await self._get_sizing_entry(session, leader.id, event, account)
+                    smart_entry, reason = await self._get_sizing_entry(
+                        session, leader.id, event, account
+                    )
                     if smart_entry is None:
                         copy_trade.status, copy_trade.skip_reason = "skipped", reason
                         self.record_rejection(session, copy_trade, event, reason)
@@ -618,43 +966,78 @@ class CopyEngine:
                     exposure = existing.cost_basis if existing else Decimal(0)
                     ask = book.asks[0][0] if book.asks else Decimal(0)
                     decision = entry_budget(
-                        smart_entry, ask=ask, event_price=event.price,
+                        smart_entry,
+                        ask=ask,
+                        event_price=event.price,
                         cash=account.paper_balance,
-                        exposure_room=max(Decimal(0), self.settings.max_outcome_exposure - exposure),
-                        current_max=account.max_trade_size, fee_rate=fee_rate,
-                        slippage_bps=account.slippage_bps,
-                        min_notional=self.settings.min_copy_notional, min_shares=book.min_order_size,
+                        exposure_room=max(
+                            Decimal(0), self.settings.max_outcome_exposure - exposure
+                        ),
+                        current_max=account.max_trade_size,
+                        fee_rate=fee_rate,
+                        slippage_price=policy.slippage_price,
+                        min_notional=self.settings.min_copy_notional,
+                        min_shares=book.min_order_size,
                     )
-                    session.add(SizingAudit(
-                        copy_trade_id=copy_trade.id, bucket_start=smart_entry.bucket_start,
-                        base_budget=smart_entry.base_budget, reference_notional=smart_entry.reference_notional,
-                        leader_notional=smart_entry.leader_notional, leader_vwap=decision.leader_vwap,
-                        price_factor=decision.price_factor, target_budget=decision.target_budget,
-                        spent_before=smart_entry.spent, order_budget=decision.order_budget,
-                    ))
+                    session.add(
+                        SizingAudit(
+                            copy_trade_id=copy_trade.id,
+                            bucket_start=smart_entry.bucket_start,
+                            base_budget=smart_entry.base_budget,
+                            reference_notional=smart_entry.reference_notional,
+                            leader_notional=smart_entry.leader_notional,
+                            leader_vwap=decision.leader_vwap,
+                            price_factor=decision.price_factor,
+                            target_budget=decision.target_budget,
+                            spent_before=smart_entry.spent,
+                            order_budget=decision.order_budget,
+                        )
+                    )
                     buy_budget = decision.order_budget
                     target_shares = buy_budget / ask if ask > 0 else Decimal(0)
-                    log.info("copy_sizing", leader=leader.address, token_id=event.token_id,
-                             base=str(smart_entry.base_budget), typical_entry=str(smart_entry.reference_notional),
-                             leader_entry=str(smart_entry.leader_notional), leader_vwap=str(decision.leader_vwap),
-                             price_factor=str(decision.price_factor), target=str(decision.target_budget),
-                             spent=str(smart_entry.spent), order_budget=str(buy_budget), reason=decision.reason)
+                    log.info(
+                        "copy_sizing",
+                        leader=leader.address,
+                        token_id=event.token_id,
+                        base=str(smart_entry.base_budget),
+                        typical_entry=str(smart_entry.reference_notional),
+                        leader_entry=str(smart_entry.leader_notional),
+                        leader_vwap=str(decision.leader_vwap),
+                        price_factor=str(decision.price_factor),
+                        target=str(decision.target_budget),
+                        spent=str(smart_entry.spent),
+                        order_budget=str(buy_budget),
+                        reason=decision.reason,
+                    )
                     if decision.reason:
                         copy_trade.status, copy_trade.skip_reason = "skipped", decision.reason
-                        self.record_rejection(session, copy_trade, event, decision.reason, target_shares)
+                        self.record_rejection(
+                            session, copy_trade, event, decision.reason, target_shares
+                        )
                         return
                 else:
                     buy_budget = self.ensure_book_minimum_budget(
-                        buy_budget, own_capacity, book, event.price, account.slippage_bps,
+                        buy_budget,
+                        own_capacity,
+                        book,
+                        event.price,
+                        policy.slippage_price,
                     )
                 if book.asks:
                     target_shares = buy_budget / book.asks[0][0]
+                final_reason = self._buy_signal_reason(event)
+                if final_reason:
+                    copy_trade.status, copy_trade.skip_reason = "skipped", final_reason
+                    self.record_rejection(session, copy_trade, event, final_reason, target_shares)
+                    return
+                if time.monotonic() - prepared.book_at > 0.25:
+                    raise ValueError("execution_book_expired")
                 fill = execute_buy_fak_by_budget(
                     book,
                     buy_budget,
                     fee_rate,
                     reference_price=decision.reference_price if decision else event.price,
-                    slippage_bps=account.slippage_bps,
+                    slippage_price=policy.slippage_price,
                 )
             else:
                 fill = execute_fak(
@@ -663,7 +1046,7 @@ class CopyEngine:
                     target_shares,
                     fee_rate,
                     reference_price=event.price,
-                    slippage_bps=account.slippage_bps,
+                    slippage_price=policy.slippage_price,
                 )
         except Exception as exc:
             copy_trade.status = "failed"
@@ -741,11 +1124,11 @@ class CopyEngine:
         if event.side == "BUY":
             message = self.build_buy_notification(leader, event, fill)
             if decision:
-                message += (f"\n\nБюджет серии с комиссией: ${decision.target_budget:.2f}"
-                            f"\nИспользовано в серии: ${smart_entry.spent:.2f}")
-            session.info.setdefault("notifications", []).append(
-                message
-            )
+                message += (
+                    f"\n\nБюджет серии с комиссией: ${decision.target_budget:.2f}"
+                    f"\nИспользовано в серии: ${smart_entry.spent:.2f}"
+                )
+            session.info.setdefault("notifications", []).append(message)
 
     async def update_leader_position(
         self, session, leader_id: int, event: LeaderActivity, position: LeaderPosition | None
@@ -760,6 +1143,110 @@ class CopyEngine:
             position.shares += event.size
         else:
             position.shares = max(Decimal(0), position.shares - event.size)
+        # Late-indexed events must not resurrect the leader's old inventory.
+        newer = await session.scalar(
+            select(CopyTrade.id)
+            .where(
+                CopyTrade.leader_id == leader_id,
+                CopyTrade.token_id == event.token_id,
+                CopyTrade.timestamp > event.timestamp,
+            )
+            .limit(1)
+        )
+        if newer:
+            rows = (
+                await session.execute(
+                    select(CopyTrade.side, CopyTrade.leader_size)
+                    .where(
+                        CopyTrade.leader_id == leader_id,
+                        CopyTrade.token_id == event.token_id,
+                        CopyTrade.leader_size > 0,
+                        CopyTrade.leader_price > 0,
+                        CopyTrade.leader_price < 1,
+                        CopyTrade.timestamp > 0,
+                    )
+                    .order_by(CopyTrade.timestamp, CopyTrade.id)
+                )
+            ).all()
+            shares = Decimal(0)
+            for side, qty in rows:
+                shares = shares + qty if side == "BUY" else max(Decimal(0), shares - qty)
+            position.shares = shares
+
+    async def _accept_exit(
+        self, session, leader, event, trade, account, before, distance, prepared
+    ):
+        pos = await get_position(session, event.token_id)
+        holdings, warnings = await inventory(session, event.token_id)
+        own = holdings.get((event.token_id, leader.id), Holding())
+        newer_buy = await session.scalar(
+            select(CopyTrade.id)
+            .join(PaperOrder)
+            .where(
+                CopyTrade.leader_id == leader.id,
+                CopyTrade.token_id == event.token_id,
+                CopyTrade.side == "BUY",
+                CopyTrade.timestamp > event.timestamp,
+                PaperOrder.filled_shares > 0,
+                PaperOrder.status.in_(["filled", "partial"]),
+            )
+            .limit(1)
+        )
+        if newer_buy:
+            trade.status, trade.skip_reason = "skipped", "out_of_order_exit"
+            self.record_rejection(session, trade, event, trade.skip_reason)
+            return
+        if not pos or own.shares <= 0 or before <= 0 or warnings:
+            reason = "ambiguous_inventory" if warnings else "no_position_to_sell"
+            trade.status, trade.skip_reason = "skipped", reason
+            self.record_rejection(session, trade, event, reason)
+            return
+        key = (leader.id, event.token_id)
+        intent = await session.get(ExitIntent, key)
+        if intent and intent.remaining > 0 and event.timestamp < intent.source_timestamp:
+            trade.status, trade.skip_reason = "skipped", "out_of_order_exit"
+            self.record_rejection(session, trade, event, trade.skip_reason)
+            return
+        if intent is None:
+            intent = ExitIntent(
+                leader_id=leader.id,
+                token_id=event.token_id,
+                remaining=Decimal(0),
+                generation=0,
+                attempts=0,
+                position_id=pos.id,
+            )
+            session.add(intent)
+        if intent.position_id != pos.id:
+            intent.remaining = Decimal(0)
+        remaining = min(own.shares, intent.remaining)
+        free = max(Decimal(0), own.shares - remaining)
+        # Each fragment adds only its share of inventory not ALREADY reserved.
+        remaining += free * min(Decimal(1), event.size / before)
+        # Close a sub-0.01-share rounding tail only after >=99% is requested.
+        if own.shares - remaining < Decimal("0.01") and remaining >= own.shares * Decimal("0.99"):
+            remaining = own.shares
+        intent.remaining = min(remaining, own.shares)
+        intent.position_id, intent.copy_trade_id = pos.id, trade.id
+        # A genuinely new SELL may update the limit; retry never lowers it.
+        new_floor = max(Decimal(0), event.price - distance)
+        intent.min_price = (
+            new_floor
+            if intent.generation == 0 or event.timestamp >= intent.source_timestamp
+            else intent.min_price
+        )
+        intent.source_timestamp = event.timestamp
+        intent.generation += 1
+        intent.attempts, intent.next_attempt = 0, Decimal(0)
+        trade.status, trade.skip_reason = "exit_pending", None
+        if prepared is None:
+            prepared = PreparedCopy(error=ValueError("exit_awaiting_preparation"))
+        await self._fill_exit(session, intent, account, prepared)
+        if trade.status != "executed":
+            self.record_rejection(
+                session, trade, event, intent.last_reason or "exit_pending", intent.remaining
+            )
+            trade.skip_reason = intent.last_reason
 
     async def monitor_risk_once(self) -> None:
         async with SessionLocal() as session:
@@ -778,7 +1265,7 @@ class CopyEngine:
                 book = await self.client.get_book(token_id)
             if not book.bids:
                 return
-            async with self._ledger_lock, SessionLocal() as session:
+            async with self._ledger_lock.hold(0), SessionLocal() as session:
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
                 position = await get_position(session, token_id)
                 rule = await get_risk(session, token_id)
@@ -823,7 +1310,7 @@ class CopyEngine:
             prepared = await self.prepare_copy(event)
             if prepared.error:
                 raise prepared.error
-            async with self._ledger_lock, SessionLocal() as session:
+            async with self._execution_slot(event, prepared, 0), SessionLocal() as session:
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
                 position = await get_position(session, token_id)
                 rule = await get_risk(session, token_id)
@@ -837,8 +1324,23 @@ class CopyEngine:
                 ):
                     return
                 requested_shares = min(requested_shares, position.shares)
-                book = await self.client.get_book(token_id)
-                fill = execute_fak(book, "SELL", requested_shares, prepared.fee_rate)
+                book = prepared.book
+                if (
+                    book is None
+                    or prepared.book_error
+                    or time.monotonic() - prepared.book_at > 0.25
+                ):
+                    return
+                shares_before = position.shares
+                policy = await get_execution_policy(session, self.settings)
+                fill = execute_fak(
+                    book,
+                    "SELL",
+                    requested_shares,
+                    prepared.fee_rate,
+                    reference_price=event.price,
+                    slippage_price=policy.slippage_price,
+                )
                 if fill.shares <= 0:
                     return
                 remaining = position.shares - fill.shares
@@ -853,9 +1355,24 @@ class CopyEngine:
                     account,
                 )
                 rule.enabled = remaining > Decimal("0.00000001")
-                await session.execute(update(SizingEntry).where(
-                    SizingEntry.token_id == token_id,
-                ).values(closed=True))
+                await session.execute(
+                    update(SizingEntry)
+                    .where(
+                        SizingEntry.token_id == token_id,
+                    )
+                    .values(closed=True)
+                )
+                await session.execute(
+                    update(ExitIntent)
+                    .where(
+                        ExitIntent.token_id == token_id,
+                        ExitIntent.remaining > 0,
+                    )
+                    .values(
+                        remaining=ExitIntent.remaining * remaining / shares_before,
+                        generation=ExitIntent.generation + 1,
+                    )
+                )
                 session.add(
                     PaperOrder(
                         token_id=position.token_id,
@@ -879,6 +1396,158 @@ class CopyEngine:
             )
         await asyncio.gather(*(self._settle_position(position) for position in positions))
 
+    async def retry_exits_once(self) -> None:
+        """Only explicit, still-open intents. Never replay old rejected orders."""
+        if not self.settings.exit_retry_enabled:
+            return
+        async with SessionLocal() as session:
+            intents = list(
+                await session.scalars(
+                    select(ExitIntent)
+                    .where(
+                        ExitIntent.remaining > 0,
+                        ExitIntent.next_attempt <= Decimal(str(time.time())),
+                    )
+                    .limit(128)
+                )
+            )
+        for intent in intents:
+            self._schedule_exit((intent.leader_id, intent.token_id))
+
+    def _schedule_exit(self, key):
+        if key in self._exit_workers or self.stop_event.is_set():
+            return
+        task = asyncio.create_task(self._retry_exit(key))
+        self._exit_workers[key] = task
+
+        def done(completed):
+            self._exit_workers.pop(key, None)
+            if not completed.cancelled() and completed.exception():
+                log.error("exit_worker_failed", key=key, error=str(completed.exception()))
+
+        task.add_done_callback(done)
+
+    async def _retry_exit(self, key):
+        async with SessionLocal() as session:
+            intent = await session.get(ExitIntent, key)
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            leader = await session.get(Leader, key[0])
+            pos = await get_position(session, key[1])
+            if (
+                not intent
+                or intent.remaining <= 0
+                or account.paused
+                or not leader
+                or not leader.active
+                or intent.next_attempt > Decimal(str(time.time()))
+            ):
+                return
+            generation = intent.generation
+            if not pos or pos.id != intent.position_id:
+                async with self._ledger_lock.hold(0):
+                    current = await session.get(ExitIntent, key, populate_existing=True)
+                    if current and current.generation == generation:
+                        current.remaining = 0
+                        current.last_reason = "position_closed"
+                        await session.commit()
+                return
+            event = LeaderActivity(
+                event_key="exit_retry",
+                timestamp=int(time.time()),
+                condition_id=pos.condition_id,
+                token_id=pos.token_id,
+                side="SELL",
+                size=intent.remaining,
+                price=max(Decimal("0.000001"), intent.min_price),
+                title=pos.title,
+                outcome=pos.outcome,
+                slug="",
+            )
+        # Metadata, exchange delay and book refresh never hold the cash lock.
+        prepared = await self.prepare_copy(event)
+        async with self._execution_slot(event, prepared, 0), SessionLocal() as session:
+            intent = await session.get(ExitIntent, key)
+            leader = await session.get(Leader, key[0])
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            if (
+                not intent
+                or intent.remaining <= 0
+                or intent.generation != generation
+                or account.paused
+                or not leader
+                or not leader.active
+            ):
+                return
+            await self._fill_exit(session, intent, account, prepared)
+            await session.commit()
+
+    async def _fill_exit(self, session, intent, account, prepared):
+        pos = await get_position(session, intent.token_id)
+        holdings, warnings = await inventory(session, intent.token_id)
+        own = holdings.get((intent.token_id, intent.leader_id), Holding())
+        if not pos or pos.id != intent.position_id or own.shares <= Decimal("0.00000001"):
+            intent.remaining, intent.last_reason = 0, "position_closed"
+            return
+        if warnings:
+            intent.last_reason = "ambiguous_inventory"
+        elif prepared.error or prepared.book_error:
+            intent.last_reason = "exit_market_data_unavailable"
+        elif prepared.book is None or time.monotonic() - prepared.book_at > 0.25:
+            intent.last_reason = "exit_book_expired"
+        else:
+            target = min(intent.remaining, own.shares, pos.shares)
+            fill = execute_fak(
+                prepared.book,
+                "SELL",
+                target,
+                prepared.fee_rate,
+                reference_price=intent.min_price,
+                slippage_price=Decimal(0),
+            )
+            intent.last_reason = fill.reason
+            if fill.shares > 0:
+                await apply_fill(
+                    session,
+                    fill,
+                    pos.token_id,
+                    "SELL",
+                    pos.title,
+                    pos.outcome,
+                    pos.condition_id,
+                    account,
+                    cost_to_release=own.cost * fill.shares / own.shares,
+                )
+                intent.remaining = max(Decimal(0), intent.remaining - fill.shares)
+                if intent.remaining <= Decimal("0.00000001"):
+                    intent.remaining = 0
+                session.add(
+                    PaperOrder(
+                        copy_trade_id=intent.copy_trade_id,
+                        token_id=pos.token_id,
+                        side="SELL",
+                        requested_shares=target,
+                        filled_shares=fill.shares,
+                        average_fill_price=fill.average_price,
+                        fee=fill.fee,
+                        status=fill.status,
+                        reason="exit_intent",
+                    )
+                )
+                trade = await session.get(CopyTrade, intent.copy_trade_id)
+                trade.status, trade.skip_reason = "executed", None
+                intent.attempts = 0
+                log.info(
+                    "exit_filled",
+                    leader_id=intent.leader_id,
+                    token_id=intent.token_id,
+                    shares=str(fill.shares),
+                    remaining=str(intent.remaining),
+                    fee=str(fill.fee),
+                )
+        intent.attempts += 1
+        wait = min(30, self.settings.exit_retry_seconds * 2 ** min(intent.attempts - 1, 5))
+        intent.next_attempt = Decimal(str(time.time() + wait))
+
     async def _settle_position(self, snapshot: Position) -> None:
         try:
             async with self._maintenance_slots:
@@ -889,7 +1558,7 @@ class CopyEngine:
                 return
             if not payout.is_finite() or not Decimal(0) <= payout <= Decimal(1):
                 raise ValueError("invalid_resolution_payout")
-            async with self._ledger_lock, SessionLocal() as session:
+            async with self._ledger_lock.hold(0), SessionLocal() as session:
                 # Shares/cost/balance may have changed while resolution was fetched.
                 position = await session.get(Position, snapshot.id)
                 if not position or position.token_id != snapshot.token_id or position.shares <= 0:
@@ -899,9 +1568,24 @@ class CopyEngine:
                 pnl = proceeds - position.cost_basis
                 account.paper_balance += proceeds
                 account.realized_pnl += pnl
-                await session.execute(update(SizingEntry).where(
-                    SizingEntry.token_id == position.token_id,
-                ).values(closed=True))
+                await session.execute(
+                    update(SizingEntry)
+                    .where(
+                        SizingEntry.token_id == position.token_id,
+                    )
+                    .values(closed=True)
+                )
+                await session.execute(
+                    update(ExitIntent)
+                    .where(
+                        ExitIntent.token_id == position.token_id,
+                    )
+                    .values(
+                        remaining=0,
+                        generation=ExitIntent.generation + 1,
+                        last_reason="market_settled",
+                    )
+                )
                 session.add(
                     PaperOrder(
                         token_id=position.token_id,

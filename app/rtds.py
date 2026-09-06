@@ -25,7 +25,9 @@ class RTDSTradeStream:
 
     def __init__(self, on_trade, tracked_addresses=None):
         self.on_trade = on_trade
-        self.tracked_addresses = tracked_addresses or set()
+        # The engine passes an initially empty, shared set and populates it
+        # after DB discovery. Do not replace that live reference when empty.
+        self.tracked_addresses = tracked_addresses if tracked_addresses is not None else set()
         self.stop_event = asyncio.Event()
         self.task: asyncio.Task | None = None
         self.counters: Counter = Counter()

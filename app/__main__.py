@@ -2,22 +2,28 @@ import asyncio
 
 from .bot import TelegramApp
 from .config import get_settings
-from .db import SessionLocal, init_db
+from .db import SessionLocal, init_db, single_process
 from .engine import CopyEngine
 from .logging import configure_logging
 from .polymarket import PolymarketClient
+from .repository import add_leader, get_leader, get_or_create_account, initialize_execution
 from .rtds import RTDSTradeStream
-from .repository import add_leader, get_leader, get_or_create_account
 
 
 async def main() -> None:
     settings = get_settings()
     configure_logging(settings.log_level)
+    async with single_process():
+        await run_bot(settings)
+
+
+async def run_bot(settings) -> None:
     await init_db()
     async with SessionLocal() as session:
         # Initialize defaults before either the Telegram or trading loops start.
         # Existing account limits are intentionally preserved.
         await get_or_create_account(session, settings.paper_initial_balance, settings=settings)
+        await initialize_execution(session, settings)
         if settings.default_leader_address:
             # Seed the configured leader once; do not silently re-enable one
             # the user intentionally disabled from the Telegram panel.

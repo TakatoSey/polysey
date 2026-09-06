@@ -43,6 +43,8 @@ def market(condition):
 
 @pytest.fixture
 async def rig(tmp_path, monkeypatch):
+    # Deterministic source clock; monotonic time still measures real async waits.
+    monkeypatch.setattr("app.engine.time", SimpleNamespace(time=lambda: 100.5, monotonic=time.monotonic))
     # Separate real connections, unlike an in-memory SQLite StaticPool.
     db = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'latency.db'}")
     sessions = async_sessionmaker(db, expire_on_commit=False)
@@ -79,7 +81,7 @@ async def rig(tmp_path, monkeypatch):
     engine = CopyEngine(settings, client)
     yield SimpleNamespace(engine=engine, client=client, sessions=sessions, book=book)
     await engine.stop()
-    tasks = list(engine._pending.values()) + list(engine._leader_polls.values())
+    tasks = list(engine._pending.values()) + list(engine._leader_polls.values()) + list(engine._exit_workers.values())
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -121,7 +123,7 @@ async def test_slow_book_does_not_block_another_token(rig):
     await drain(rig.engine)
 
 
-async def test_same_token_sell_cannot_overtake_buy(rig):
+async def test_sell_cancels_unfinished_buy_and_preserves_source_accounting(rig):
     entered, release = asyncio.Event(), asyncio.Event()
     calls = 0
 
@@ -137,15 +139,14 @@ async def test_same_token_sell_cannot_overtake_buy(rig):
     rig.engine._schedule_copy(1, activity("buy"))
     await asyncio.wait_for(entered.wait(), 2)
     rig.engine._schedule_copy(1, activity("sell", side="SELL", timestamp=101))
-    await asyncio.sleep(0.03)
-    # Book acquisition starts immediately and is allowed to overlap metadata;
-    # the token predecessor still prevents execution from overtaking the BUY.
-    assert rig.client.get_book.await_count == 2
-    release.set()
+    # No release of the stalled BUY request is necessary: observing the exit
+    # cancels its preparation, records the BUY as skipped, then processes SELL.
     await drain(rig.engine)
     async with rig.sessions() as session:
         trades = list(await session.scalars(select(CopyTrade).order_by(CopyTrade.id)))
-        assert [(t.side, t.status) for t in trades] == [("BUY", "executed"), ("SELL", "executed")]
+        assert [(t.side, t.status) for t in trades] == [("BUY", "skipped"), ("SELL", "skipped")]
+        assert trades[0].skip_reason == "buy_superseded_by_sell"
+        assert trades[1].skip_reason == "no_position_to_sell"
         assert await session.scalar(select(Position)) is None
         assert (await session.get(Account, 1)).paper_balance == 100
 

@@ -16,11 +16,19 @@ from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import select
 
+from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import CopyTrade, Leader, PaperOrder, Position, RiskRule
-from .repository import add_leader, get_leaders, get_or_create_account, orders, positions
+from .models import CopyTrade, ExitIntent, Leader, PaperOrder, Position, RiskRule
+from .repository import (
+    add_leader,
+    get_execution_policy,
+    get_leaders,
+    get_or_create_account,
+    orders,
+    positions,
+)
 
 log = structlog.get_logger(__name__)
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
@@ -30,6 +38,15 @@ SIZING_REASONS = {
     "sizing_below_minimum": "добавка к серии ниже минимума; учитывается при следующей покупке в том же окне",
     "sizing_entry_budget_used": "бюджет этой серии уже использован",
     "sizing_exposure_limit": "достигнут лимит на исход с учётом комиссии",
+    "stale_signal": "сигнал слишком старый; покупку не догоняем",
+    "entry_price_drop": "цена резко упала после входа лидера; новую покупку не открываем",
+    "buy_superseded_by_sell": "лидер уже продаёт; запоздалую покупку не открываем",
+    "invalid_signal_timestamp": "некорректное время сигнала; проверьте часы VPS",
+    "exit_pending": "сначала завершаем запрошенный выход из этой позиции",
+    "out_of_order_exit": "продажа относится к более ранним событиям; новую позицию не затрагиваем",
+    "ambiguous_inventory": "старая история не позволяет однозначно распределить доли; нужна сверка",
+    "exit_market_data_unavailable": "выход сохранён; ждём подтверждённых данных рынка",
+    "exit_book_expired": "выход сохранён; обновляем стакан",
 }
 
 
@@ -123,7 +140,8 @@ class TelegramApp:
             max_next_buy = min(
                 account.paper_balance,
                 account.max_trade_size,
-                account.paper_balance * self.settings.copy_balance_pct
+                account.paper_balance
+                * self.settings.copy_balance_pct
                 * self.settings.smart_sizing_max_multiplier,
             )
         else:
@@ -141,8 +159,7 @@ class TelegramApp:
         sizing_status = ""
         if self.settings.smart_sizing_enabled:
             ready_count = sum(
-                1 for row in leaders
-                if row.active and self._sizing_profile_ready(row.id)
+                1 for row in leaders if row.active and self._sizing_profile_ready(row.id)
             )
             active_count = sum(1 for row in leaders if row.active)
             sizing_status = (
@@ -234,38 +251,18 @@ class TelegramApp:
                     )
                 ).all()
             )
-            all_trades = list(
-                (
-                    await session.scalars(
-                        select(CopyTrade)
-                        .where(CopyTrade.leader_id == leader_id)
-                    )
-                ).all()
-            )
-            trade_ids = [trade.id for trade in all_trades]
+            holdings, warnings = await inventory(session)
             all_orders = list(
-                (
-                    await session.scalars(
-                        select(PaperOrder).where(PaperOrder.copy_trade_id.in_(trade_ids))
+                await session.scalars(
+                    select(PaperOrder)
+                    .join(CopyTrade)
+                    .where(
+                        CopyTrade.leader_id == leader_id,
+                        PaperOrder.filled_shares > 0,
+                        PaperOrder.status.in_(["filled", "partial"]),
                     )
-                ).all()
-            ) if trade_ids else []
-            token_ids = {trade.token_id for trade in all_trades}
-            if token_ids:
-                settled_orders = list(
-                    (
-                        await session.scalars(
-                            select(PaperOrder).where(
-                                PaperOrder.status == "settled",
-                                PaperOrder.token_id.in_(token_ids),
-                            )
-                        )
-                    ).all()
                 )
-                known_order_ids = {order.id for order in all_orders}
-                all_orders.extend(
-                    order for order in settled_orders if order.id not in known_order_ids
-                )
+            )
         if not row:
             await self._leaders_panel(page, chat_id)
             return
@@ -279,58 +276,25 @@ class TelegramApp:
             last_result = (
                 "скопировано"
                 if last.status == "executed"
-                else html.escape(SIZING_REASONS.get(last.skip_reason, last.skip_reason or last.status))
+                else html.escape(
+                    SIZING_REASONS.get(last.skip_reason, last.skip_reason or last.status)
+                )
             )
-        realized_pnl = Decimal(0)
-        open_cost = Decimal(0)
-        lots: list[list[Decimal]] = []  # shares, total cost including fee
-        buys = sells = 0
-        for order in sorted(all_orders, key=lambda value: value.created_at or datetime.min):
-            if order.status not in {"filled", "partial", "settled"} or order.filled_shares <= 0:
-                continue
-            notional = order.filled_shares * order.average_fill_price
-            if order.side == "BUY":
-                lots.append([order.filled_shares, notional + (order.fee or Decimal(0))])
-                buys += 1
-            elif order.side == "SELL":
-                remaining = order.filled_shares
-                proceeds = notional - (order.fee or Decimal(0))
-                while remaining > 0 and lots:
-                    lot_shares, lot_cost = lots[0]
-                    consumed = min(remaining, lot_shares)
-                    realized_pnl += proceeds * consumed / order.filled_shares - lot_cost * consumed / lot_shares
-                    lot_shares -= consumed
-                    lot_cost -= lot_cost * consumed / (lot_shares + consumed)
-                    remaining -= consumed
-                    if lot_shares <= Decimal("0.00000001"):
-                        lots.pop(0)
-                    else:
-                        lots[0] = [lot_shares, lot_cost]
-                sells += 1
-            elif order.status == "settled":
-                remaining = order.filled_shares
-                proceeds = notional
-                while remaining > 0 and lots:
-                    lot_shares, lot_cost = lots[0]
-                    consumed = min(remaining, lot_shares)
-                    realized_pnl += proceeds * consumed / order.filled_shares - lot_cost * consumed / lot_shares
-                    lot_shares -= consumed
-                    lot_cost -= lot_cost * consumed / (lot_shares + consumed)
-                    remaining -= consumed
-                    if lot_shares <= Decimal("0.00000001"):
-                        lots.pop(0)
-                    else:
-                        lots[0] = [lot_shares, lot_cost]
-        open_cost = sum((cost for _, cost in lots), Decimal(0))
+        owned = [h for (_, owner), h in holdings.items() if owner == leader_id]
+        realized_pnl = sum((h.realized for h in owned), Decimal(0))
+        open_cost = sum((h.cost for h in owned), Decimal(0))
+        buys = sum(o.side == "BUY" for o in all_orders)
+        sells = sum(o.side == "SELL" for o in all_orders)
+        pnl_label = "нужна сверка истории" if warnings else f"${realized_pnl:+.4f}"
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
             f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
             f"Сделки: {buys} покупок · {sells} продаж\n"
             + self._leader_sizing_text(leader_id)
-            + f"Реализованный PNL: <b>${realized_pnl:+.4f}</b>\n"
+            + f"Реализованный PNL: <b>{pnl_label}</b>\n"
             f"Открытая себестоимость: <b>${open_cost:.4f}</b>\n"
-            "<i>FIFO · комиссии учтены; открытые shares не считаются убытком</i>\n"
+            "<i>По каждому исходу и лидеру · комиссии и выплаты учтены</i>\n"
             f"Последний результат: <b>{last_result}</b>\n\n"
             "Все новые сделки этого адреса обрабатываются по общим настройкам."
         )
@@ -513,6 +477,17 @@ class TelegramApp:
 
     async def _orders_text_v2(self, page: int = 0, status_filter: str = "all") -> str:
         async with SessionLocal() as session:
+            pending = list(
+                (
+                    await session.execute(
+                        select(ExitIntent, Leader.label, Position.title)
+                        .join(Leader, Leader.id == ExitIntent.leader_id)
+                        .outerjoin(Position, Position.id == ExitIntent.position_id)
+                        .where(ExitIntent.remaining > 0)
+                        .limit(5)
+                    )
+                ).all()
+            )
             rows: list[PaperOrder] = await orders(session)
             copy_trade_ids = [row.copy_trade_id for row in rows if row.copy_trade_id]
             trades = (
@@ -560,6 +535,18 @@ class TelegramApp:
             "<b>🧾 ИСТОРИЯ · PAPER</b>",
             "Сделки и пропуски копирования — без технического шума.",
         ]
+        if pending:
+            lines.append("\n<b>⏳ Незавершённые выходы</b>")
+            for intent, name, title in pending:
+                lines.append(
+                    f"{html.escape(name or 'Лидер')} · {html.escape((title or intent.token_id)[:65])}"
+                    f"\nОстаток {intent.remaining:.4f} shares · не ниже {intent.min_price * 100:.2f}¢"
+                )
+            lines.append(
+                "Повторяем по актуальному стакану в пределах лимита. Пауза останавливает повторы.\n"
+                if self.settings.exit_retry_enabled
+                else "Автоматические повторы выключены в настройках сервера.\n"
+            )
         if not current:
             lines.append("\nЗаписей в этом фильтре нет.")
         for row in current:
@@ -627,15 +614,15 @@ class TelegramApp:
     async def _settings_text_v2(self) -> str:
         async with SessionLocal() as session:
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            policy = await get_execution_policy(session, self.settings)
             await session.commit()
         return (
-            "<b>⚙️ НАСТРОЙКИ</b>\n\n"
-            + self._sizing_summary(account)
-            + "\n\n"
+            "<b>⚙️ НАСТРОЙКИ</b>\n\n" + self._sizing_summary(account) + "\n\n"
             "<b>Исполнение и риск</b>\n"
             f"Минимум BUY: ${self.settings.min_copy_notional:.2f} · лимит на исход: ${self.settings.max_outcome_exposure:.2f}\n"
             "Также действует минимум shares из стакана.\n"
-            f"Допустимое отклонение цены: <b>{account.slippage_bps / 100:.2f}%</b>\n"
+            f"Допустимое отклонение цены: <b>{policy.slippage_price * 100:.2f}¢</b>\n"
+            f"Максимальный возраст BUY: RTDS {self.settings.max_signal_age_rtds_seconds:g} с · REST {self.settings.max_signal_age_rest_seconds:g} с\n"
             "Дневной лимит: выключен · Buy-only: выключен\n\n"
             "Подробности — кнопками ниже. Команды: /setmax, /setslippage, /risk."
         )
@@ -863,7 +850,8 @@ class TelegramApp:
             await session.commit()
         note = (
             "\nСохранено для классического режима; в адаптивном режиме /setsize не используется."
-            if field == "trade_size" and self.settings.smart_sizing_enabled else ""
+            if field == "trade_size" and self.settings.smart_sizing_enabled
+            else ""
         )
         await self._edit_panel(f"✅ {label}: ${value:.2f}{note}", self._back(), message.chat.id)
 
@@ -871,7 +859,11 @@ class TelegramApp:
         await self._set_decimal_setting(message, "trade_size", "setsize", "Размер сделки")
 
     async def setmax(self, message: Message):
-        label = "Максимум серии с комиссией" if self.settings.smart_sizing_enabled else "Максимум сделки"
+        label = (
+            "Максимум серии с комиссией"
+            if self.settings.smart_sizing_enabled
+            else "Максимум сделки"
+        )
         await self._set_decimal_setting(message, "max_trade_size", "setmax", label)
 
     async def setslippage(self, message: Message) -> None:
@@ -880,19 +872,26 @@ class TelegramApp:
         parts = (message.text or "").split()
         await self._delete_input(message)
         try:
-            percent = Decimal(parts[1]) if len(parts) == 2 else Decimal(-1)
+            cents = Decimal(parts[1]) if len(parts) == 2 else Decimal(-1)
         except (InvalidOperation, IndexError):
-            percent = Decimal(-1)
-        if percent < 0 or percent > 100:
+            cents = Decimal(-1)
+        if (
+            not cents.is_finite()
+            or cents < 0
+            or cents >= 100
+            or cents != cents.quantize(Decimal("0.01"))
+        ):
             await self._edit_panel(
-                "Формат: /setslippage 5 (проценты от 0 до 100)", self._back(), message.chat.id
+                "Формат: /setslippage 5 (центов; 5 = $0.05)", self._back(), message.chat.id
             )
             return
         async with SessionLocal() as session:
-            account = await get_or_create_account(session, self.settings.paper_initial_balance)
-            account.slippage_bps = int(percent * 100)
+            policy = await get_execution_policy(session, self.settings)
+            policy.slippage_price = cents / 100
             await session.commit()
-        await self._edit_panel(f"✅ Slippage: {percent:.2f}%", self._back(), message.chat.id)
+        await self._edit_panel(
+            f"✅ Slippage: {cents:.2f}¢ (${cents / 100:.4f})", self._back(), message.chat.id
+        )
 
     async def risk(self, message: Message) -> None:
         if not self._allowed(message):
@@ -989,7 +988,7 @@ class TelegramApp:
             details = {
                 "sizing": self._sizing_help(),
                 "limits": "📏 <b>Лимиты</b>\nДневной лимит выключен. В адаптивном режиме лимиты серии и исхода учитывают комиссии. Максимум серии меняется через /setmax; он хранится в базе и не перезаписывается из .env.",
-                "slippage": "📉 <b>Slippage</b>\nМаксимальное отклонение цены при копировании. Изменить: /setslippage 5",
+                "slippage": "📉 <b>Slippage</b>\nАбсолютное отклонение цены: 5¢ = $0.05. Изменить: /setslippage 5",
                 "risk": "🛡️ <b>Stop-loss / Take-profit</b>\nНастраиваются для конкретного token_id: /risk TOKEN sl=0.2 tp=0.25 trail=0.1",
             }
             await self._edit_panel(

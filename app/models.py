@@ -107,11 +107,14 @@ class LeaderSizingProfile(Base):
     sample_start: Mapped[int] = mapped_column(Integer)
     sample_end: Mapped[int] = mapped_column(Integer)
     bucket_seconds: Mapped[int] = mapped_column(Integer, default=2)
-    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    refreshed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC)
+    )
 
 
 class SizingEntry(Base):
     """One cumulative BUY budget, committed atomically with its fills."""
+
     __tablename__ = "sizing_entries"
     leader_id: Mapped[int] = mapped_column(ForeignKey("leaders.id"), primary_key=True)
     token_id: Mapped[str] = mapped_column(String(100), primary_key=True)
@@ -151,6 +154,38 @@ class RiskRule(Base):
     trailing_pct: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
     high_water_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
+class ExecutionPolicy(Base):
+    __tablename__ = "execution_policy"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    slippage_price: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+
+
+class SourceReceipt(Base):
+    __tablename__ = "source_receipts"
+    event_key: Mapped[str] = mapped_column(String(400), primary_key=True)
+    copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"), index=True)
+
+
+class RuntimeMigration(Base):
+    __tablename__ = "runtime_migrations"
+    name: Mapped[str] = mapped_column(String(80), primary_key=True)
+
+
+class ExitIntent(Base):
+    __tablename__ = "exit_intents"
+    leader_id: Mapped[int] = mapped_column(ForeignKey("leaders.id"), primary_key=True)
+    token_id: Mapped[str] = mapped_column(String(100), primary_key=True)
+    copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"))
+    position_id: Mapped[int] = mapped_column(Integer)
+    remaining: Mapped[Decimal] = mapped_column(Numeric(24, 10), default=0)
+    min_price: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    source_timestamp: Mapped[int] = mapped_column(Integer)
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt: Mapped[Decimal] = mapped_column(Numeric(20, 6), default=0)
+    last_reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
 
 
 class LeaderPosition(Base):

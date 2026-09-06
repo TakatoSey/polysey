@@ -267,7 +267,7 @@ async def sizing_rig(tmp_path, monkeypatch):
                           sessions=sessions, book=book, timestamp=timestamp)
     yield rig
     await rig.engine.stop()
-    tasks = list(rig.engine._pending.values()) + list(rig.engine._leader_polls.values())
+    tasks = list(rig.engine._pending.values()) + list(rig.engine._leader_polls.values()) + list(rig.engine._exit_workers.values())
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -362,7 +362,10 @@ async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
         assert abs((await session.get(Account, 1)).paper_balance - D("92.625")) < TOLERANCE
 
 
-async def test_sell_closes_only_same_leader_same_and_older_buckets(sizing_rig):
+async def test_sell_closes_only_same_leader_same_and_older_buckets(sizing_rig, monkeypatch):
+    # This test deliberately presents an out-of-order SELL after a later BUY.
+    monkeypatch.setattr("app.engine.time", SimpleNamespace(
+        time=lambda: sizing_rig.timestamp + 4.1, monotonic=time.monotonic))
     await copy(sizing_rig, "old", "20")
     await copy(sizing_rig, "current", "20", offset=2)
     await copy(sizing_rig, "future", "20", offset=4)
@@ -394,7 +397,7 @@ async def test_fill_fees_are_part_of_cumulative_cash_limit(sizing_rig):
 
 
 async def test_slippage_rejection_does_not_consume_cumulative_cash_budget(sizing_rig):
-    sizing_rig.book.asks = [(D("0.53"), D(1000))]
+    sizing_rig.book.asks = [(D("0.56"), D(1000))]
     await copy(sizing_rig, "too-expensive", "20")
     async with sizing_rig.sessions() as session:
         assert (await session.get(Account, 1)).paper_balance == 100
@@ -474,7 +477,7 @@ async def test_late_buy_cannot_reopen_bucket_after_sell(sizing_rig):
         assert (await session.get(Account, 1)).paper_balance == 100
         assert await session.scalar(select(Position)) is None
         late = await session.scalar(select(CopyTrade).where(CopyTrade.event_key == "late-entry-fragment"))
-        assert late.skip_reason == "sizing_entry_closed"
+        assert late.skip_reason == "buy_superseded_by_sell"
 
 
 async def test_sell_without_our_position_also_prevents_stale_entry(sizing_rig):
@@ -484,7 +487,7 @@ async def test_sell_without_our_position_also_prevents_stale_entry(sizing_rig):
         assert (await session.get(Account, 1)).paper_balance == 100
         assert await session.scalar(select(Position)) is None
         late = await session.scalar(select(CopyTrade).where(CopyTrade.event_key == "late-buy"))
-        assert late.skip_reason == "sizing_entry_closed"
+        assert late.skip_reason == "buy_superseded_by_sell"
 
 
 async def test_late_fragment_cannot_top_up_superseded_entry(sizing_rig):
@@ -639,7 +642,7 @@ async def test_frequent_profile_refresh_attempt_keeps_daily_reference(sizing_rig
 
 async def test_account_bootstrap_uses_settings_without_overwriting_existing_account(sizing_rig):
     settings = sizing_rig.engine.settings.model_copy(update={
-        "default_trade_size": D(7), "max_trade_size": D(24), "default_slippage_bps": 300,
+            "default_trade_size": D(7), "max_trade_size": D(24), "default_slippage_bps": 300,
     })
     async with sizing_rig.sessions() as session:
         await session.delete(await session.get(Account, 1))

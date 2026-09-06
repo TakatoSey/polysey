@@ -41,14 +41,24 @@ def execute_buy_fak_by_budget(
     budget: Decimal,
     fee_rate: Decimal,
     reference_price: Decimal,
-    slippage_bps: int,
+    slippage_bps: int | None = None,
+    *,
+    slippage_price: Decimal | None = None,
 ) -> Fill:
     if budget <= 0 or reference_price <= 0:
         return Fill(
             Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "non_positive_budget"
         )
-    drift = Decimal(slippage_bps) / Decimal(10000)
-    max_price = reference_price * (Decimal(1) + drift)
+    if not book.asks:
+        return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "no_liquidity")
+    distance = (
+        slippage_price
+        if slippage_price is not None
+        else reference_price * Decimal(slippage_bps or 0) / Decimal(10000)
+    )
+    if slippage_price is not None and book.asks and book.asks[0][0] < reference_price - distance:
+        return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "entry_price_drop")
+    max_price = reference_price + distance
     eligible_asks = [(price, size) for price, size in book.asks if price <= max_price]
     if not eligible_asks:
         return Fill(
@@ -103,6 +113,8 @@ def execute_fak(
     fee_rate: Decimal,
     reference_price: Decimal | None = None,
     slippage_bps: int | None = None,
+    *,
+    slippage_price: Decimal | None = None,
 ) -> Fill:
     levels = book.asks if side == "BUY" else book.bids
     if requested_shares <= 0:
@@ -112,10 +124,22 @@ def execute_fak(
             Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "below_min_order_size"
         )
     max_price = min_price = None
-    if reference_price is not None and slippage_bps is not None:
-        drift = Decimal(slippage_bps) / Decimal(10000)
-        max_price = reference_price * (Decimal(1) + drift)
-        min_price = reference_price * (Decimal(1) - drift)
+    if reference_price is not None and (slippage_bps is not None or slippage_price is not None):
+        distance = (
+            slippage_price
+            if slippage_price is not None
+            else reference_price * Decimal(slippage_bps) / Decimal(10000)
+        )
+        max_price = reference_price + distance
+        min_price = reference_price - distance
+    if (
+        side == "BUY"
+        and slippage_price is not None
+        and min_price is not None
+        and levels
+        and levels[0][0] < min_price
+    ):
+        return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "entry_price_drop")
     remaining = requested_shares
     filled = Decimal(0)
     notional = Decimal(0)
@@ -135,7 +159,10 @@ def execute_fak(
         if remaining <= 0:
             break
     if filled <= 0:
-        return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "no_liquidity")
+        reason = (
+            "no_liquidity_within_slippage" if levels and max_price is not None else "no_liquidity"
+        )
+        return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", reason)
     avg = (notional / filled).quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
     fee = fee.quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
     return Fill(filled, avg, notional, fee, "filled" if remaining == 0 else "partial")

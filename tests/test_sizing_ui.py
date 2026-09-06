@@ -85,9 +85,9 @@ def test_sizing_help_discloses_bucket_boundaries_and_residual_accounting():
 
 
 def test_new_rejections_have_human_readable_descriptions():
-    assert set(SIZING_REASONS) == {
+    assert set(SIZING_REASONS) >= {
         "sizing_profile_unavailable", "sizing_entry_closed", "sizing_below_minimum",
-        "sizing_entry_budget_used", "sizing_exposure_limit",
+        "sizing_entry_budget_used", "sizing_exposure_limit", "stale_signal",
     }
     assert all("_" not in value for value in SIZING_REASONS.values())
 
