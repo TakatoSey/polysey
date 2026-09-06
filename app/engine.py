@@ -1036,6 +1036,17 @@ class CopyEngine:
                         spent=str(smart_entry.spent),
                         order_budget=str(buy_budget),
                         reason=decision.reason,
+                        ask=str(ask),
+                        reference_price=str(decision.reference_price),
+                        slippage_price=str(policy.slippage_price),
+                        min_buy_price=str(decision.reference_price - policy.slippage_price),
+                        max_buy_price=str(decision.reference_price + policy.slippage_price),
+                        min_copy_notional=str(self.settings.min_copy_notional),
+                        min_order_notional=str(book.min_order_size * ask),
+                        cash_available=str(account.paper_balance),
+                        exposure_room=str(
+                            max(Decimal(0), self.settings.max_outcome_exposure - exposure)
+                        ),
                     )
                     if decision.reason:
                         copy_trade.status, copy_trade.skip_reason = "skipped", decision.reason
