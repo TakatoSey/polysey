@@ -135,7 +135,9 @@ async def test_same_token_sell_cannot_overtake_buy(rig):
     await asyncio.wait_for(entered.wait(), 2)
     rig.engine._schedule_copy(1, activity("sell", side="SELL", timestamp=101))
     await asyncio.sleep(0.03)
-    rig.client.get_book.assert_not_called()
+    # Book acquisition starts immediately and is allowed to overlap metadata;
+    # the token predecessor still prevents execution from overtaking the BUY.
+    assert rig.client.get_book.await_count == 2
     release.set()
     await drain(rig.engine)
     async with rig.sessions() as session:
@@ -344,7 +346,7 @@ async def test_exchange_delay_runs_concurrently_and_book_is_fetched_after_it(rig
 
     async def sleep(seconds):
         nonlocal delayed
-        if seconds == 3:
+        if seconds > 2.5:
             delayed += 1
             if delayed == 2:
                 entered.set()

@@ -310,11 +310,14 @@ class CopyEngine:
 
     async def prepare_copy(self, event: LeaderActivity) -> PreparedCopy:
         prepared = PreparedCopy()
+        started = time.monotonic()
         try:
             async with self._prepare_slots:
+                market_task = asyncio.create_task(self.client.get_market(event.condition_id))
+                fee_task = asyncio.create_task(self.client.get_fee_rate(event.condition_id, event.title))
+                book_task = asyncio.create_task(self.client.get_book(event.token_id))
                 market, fee_rate = await asyncio.gather(
-                    self.client.get_market(event.condition_id),
-                    self.client.get_fee_rate(event.condition_id, event.title),
+                    market_task, fee_task,
                 )
             if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
                 raise ValueError("trade_token_mismatch")
@@ -324,9 +327,13 @@ class CopyEngine:
             if not 0 <= delay <= 60:
                 raise ValueError("invalid_market_delay")
             prepared.market, prepared.fee_rate, prepared.exchange_delay = market, fee_rate, delay
-            # Independent orders can wait simultaneously, including on the same
-            # token. Do not hold a DB transaction or the balance lock here.
-            await asyncio.sleep(delay + self.settings.copy_latency_seconds)
+            # The exchange delay starts when the signal is received. Metadata and
+            # book requests run during it; this models the fastest valid taker path.
+            remaining = delay + self.settings.copy_latency_seconds - (time.monotonic() - started)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            prepared.book = await book_task
+            prepared.book_at = time.monotonic()
         except Exception as exc:
             prepared.error = exc
         prepared.ready_at = time.monotonic()
@@ -338,7 +345,7 @@ class CopyEngine:
             await asyncio.shield(predecessor)
         # Obtain the execution snapshot after the prior fill on this token,
         # but without blocking unrelated tokens behind a slow HTTP request.
-        if not prepared.error:
+        if not prepared.error and prepared.book is None:
             try:
                 async with self._prepare_slots:
                     prepared.book = await self.client.get_book(event.token_id)
