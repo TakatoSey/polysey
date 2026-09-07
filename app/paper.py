@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 
 from .polymarket import Book
+from .price_limits import MAX_BUY_PRICE, allowed_buy_price
 
 FEE_RATES = {
     "crypto": Decimal("0.07"),
@@ -49,8 +50,16 @@ def execute_buy_fak_by_budget(
         return Fill(
             Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "non_positive_budget"
         )
+    if not allowed_buy_price(reference_price):
+        return Fill(
+            Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "leader_price_out_of_range"
+        )
     if not book.asks:
         return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "no_liquidity")
+    if not allowed_buy_price(book.asks[0][0]):
+        return Fill(
+            Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "buy_price_out_of_range"
+        )
     distance = (
         slippage_price
         if slippage_price is not None
@@ -58,7 +67,7 @@ def execute_buy_fak_by_budget(
     )
     if slippage_price is not None and book.asks and book.asks[0][0] < reference_price - distance:
         return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "entry_price_drop")
-    max_price = reference_price + distance
+    max_price = min(MAX_BUY_PRICE, reference_price + distance)
     eligible_asks = [(price, size) for price, size in book.asks if price <= max_price]
     if not eligible_asks:
         return Fill(
@@ -117,6 +126,20 @@ def execute_fak(
     slippage_price: Decimal | None = None,
 ) -> Fill:
     levels = book.asks if side == "BUY" else book.bids
+    if side == "BUY":
+        if reference_price is not None and not allowed_buy_price(reference_price):
+            return Fill(
+                Decimal(0),
+                Decimal(0),
+                Decimal(0),
+                Decimal(0),
+                "rejected",
+                "leader_price_out_of_range",
+            )
+        if levels and not allowed_buy_price(levels[0][0]):
+            return Fill(
+                Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "buy_price_out_of_range"
+            )
     if requested_shares <= 0:
         return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "non_positive_size")
     if requested_shares < book.min_order_size:
@@ -145,6 +168,8 @@ def execute_fak(
     notional = Decimal(0)
     fee = Decimal(0)
     for price, size in levels:
+        if side == "BUY" and not allowed_buy_price(price):
+            break
         if side == "BUY" and max_price is not None and price > max_price:
             break
         if side == "SELL" and min_price is not None and price < min_price:

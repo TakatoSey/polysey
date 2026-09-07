@@ -1,5 +1,6 @@
 """Read-only ledger reconciliation: python -m app.ledger_audit (no API calls)."""
 
+import argparse
 import asyncio
 import json
 from decimal import Decimal
@@ -75,7 +76,37 @@ def summarize(account, rows, positions, leaders, intents):
     }
 
 
-async def main():
+def export_history(trades, orders, positions, leaders):
+    """Explicit public/trading fields only; no credentials, no database writes."""
+
+    def fields(row, names):
+        return {name: getattr(row, name) for name in names.split()}
+
+    return {
+        "copy_trades": [
+            fields(
+                t,
+                "id leader_id event_key timestamp token_id condition_id side leader_size leader_price status skip_reason created_at",
+            )
+            for t in trades
+        ],
+        "paper_orders": [
+            fields(
+                o,
+                "id copy_trade_id token_id side requested_shares filled_shares average_fill_price fee status reason created_at",
+            )
+            for o in orders
+        ],
+        "positions": [
+            fields(p, "token_id condition_id title outcome shares cost_basis average_price")
+            for p in positions
+        ],
+        "leaders": [fields(l, "id address label") for l in leaders],
+        "note": "Full retained history, not just 30 Telegram rows. Closed/deleted positions may lack titles; match by token_id/condition_id. Contains wallet addresses and trading history; share privately.",
+    }
+
+
+async def main(include_history=False):
     async with SessionLocal() as session:
         if session.bind.dialect.name == "postgresql":
             await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
@@ -94,8 +125,23 @@ async def main():
         leaders = list(await session.scalars(select(Leader)))
         intents = list(await session.scalars(select(ExitIntent).where(ExitIntent.remaining > 0)))
         report = summarize(account, rows, positions, leaders, intents)
+        if include_history:
+            trades = list(
+                await session.scalars(
+                    select(CopyTrade).order_by(CopyTrade.created_at, CopyTrade.id)
+                )
+            )
+            report["history"] = export_history(
+                trades, [order for order, _ in rows], positions, leaders
+            )
     print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--history",
+        action="store_true",
+        help="Include retained events and orders for matching/comparison",
+    )
+    asyncio.run(main(parser.parse_args().history))

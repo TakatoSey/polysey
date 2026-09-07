@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
+from .price_limits import allowed_buy_price
+
 ZERO = Decimal(0)
 ONE = Decimal(1)
 
@@ -110,8 +112,12 @@ def entry_budget(
     )
     if entry.closed:
         reason = "sizing_entry_closed"
+    elif not allowed_buy_price(event_price) or not allowed_buy_price(vwap):
+        reason = "leader_price_out_of_range"
     elif ask <= 0:
         reason = "no_liquidity"
+    elif not allowed_buy_price(ask):
+        reason = "buy_price_out_of_range"
     elif ask > reference + distance:
         reason = "no_liquidity_within_slippage"
     elif slippage_price is not None and ask < max(vwap, event_price) - distance:

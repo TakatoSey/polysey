@@ -33,6 +33,8 @@ from .repository import (
 log = structlog.get_logger(__name__)
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 SIZING_REASONS = {
+    "leader_price_out_of_range": "цена покупки лидера вне разрешённых 2–98¢",
+    "buy_price_out_of_range": "цена в стакане вне разрешённых 2–98¢",
     "sizing_profile_unavailable": "собираем статистику входов трейдера; пока недостаточно данных",
     "sizing_entry_closed": "серия уже завершена; позднюю покупку не догоняем",
     "sizing_below_minimum": "добавка к серии ниже минимума; учитывается при следующей покупке в том же окне",
@@ -619,6 +621,8 @@ class TelegramApp:
         return (
             "<b>⚙️ НАСТРОЙКИ</b>\n\n" + self._sizing_summary(account) + "\n\n"
             "<b>Исполнение и риск</b>\n"
+            "Цена BUY: <b>2–98¢ включительно</b> · у лидера и в нашем стакане.\n"
+            "SELL и выплаты этим диапазоном не ограничены.\n"
             f"Минимум BUY: ${self.settings.min_copy_notional:.2f} · лимит на исход: ${self.settings.max_outcome_exposure:.2f}\n"
             "Также действует минимум shares из стакана.\n"
             f"Допустимое отклонение цены: <b>{policy.slippage_price * 100:.2f}¢</b>\n"

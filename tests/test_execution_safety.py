@@ -57,7 +57,7 @@ def test_five_cents_is_absolute_at_every_price(price):
 def test_drop_filter_and_sell_floor_are_not_symmetric_execution_limits():
     assert (
         execute_buy_fak_by_budget(
-            book(ask="0.01"), D(2), D(0), D("0.12"), slippage_price=D("0.05")
+            book(ask="0.02"), D(2), D(0), D("0.12"), slippage_price=D("0.05")
         ).reason
         == "entry_price_drop"
     )

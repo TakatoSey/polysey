@@ -227,6 +227,12 @@ async def sizing_rig(tmp_path, monkeypatch):
     sessions = async_sessionmaker(db, expire_on_commit=False)
     monkeypatch.setattr("app.engine.SessionLocal", sessions)
     timestamp = entry_bucket(int(time.time()), 2)
+    # Sizing tests use an instantaneous mocked exchange. Keep its clock fixed
+    # so slow host I/O cannot accidentally expire a 250ms book. Latency/expiry
+    # behaviour is covered independently in test_copy_latency/execution_safety.
+    exchange_tick = time.monotonic()
+    clock = SimpleNamespace(time=time.time, monotonic=lambda: exchange_tick)
+    monkeypatch.setattr("app.engine.time", clock)
     async with db.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     async with sessions() as session:
@@ -264,7 +270,7 @@ async def sizing_rig(tmp_path, monkeypatch):
         MAX_OUTCOME_EXPOSURE=50,
     )
     rig = SimpleNamespace(engine=CopyEngine(settings, client), client=client,
-                          sessions=sessions, book=book, timestamp=timestamp)
+                          sessions=sessions, book=book, timestamp=timestamp, clock=clock)
     yield rig
     await rig.engine.stop()
     tasks = list(rig.engine._pending.values()) + list(rig.engine._leader_polls.values()) + list(rig.engine._exit_workers.values())
@@ -365,7 +371,7 @@ async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
 async def test_sell_closes_only_same_leader_same_and_older_buckets(sizing_rig, monkeypatch):
     # This test deliberately presents an out-of-order SELL after a later BUY.
     monkeypatch.setattr("app.engine.time", SimpleNamespace(
-        time=lambda: sizing_rig.timestamp + 4.1, monotonic=time.monotonic))
+        time=lambda: sizing_rig.timestamp + 4.1, monotonic=sizing_rig.clock.monotonic))
     await copy(sizing_rig, "old", "20")
     await copy(sizing_rig, "current", "20", offset=2)
     await copy(sizing_rig, "future", "20", offset=4)

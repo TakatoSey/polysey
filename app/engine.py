@@ -31,6 +31,7 @@ from .models import (
 )
 from .paper import execute_buy_fak_by_budget, execute_fak
 from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key
+from .price_limits import MAX_BUY_PRICE, MIN_BUY_PRICE, allowed_buy_price
 from .priority import PriorityLock
 from .repository import (
     apply_fill,
@@ -426,7 +427,12 @@ class CopyEngine:
             entry_bucket(event.timestamp, self.settings.smart_sizing_burst_seconds),
             self._sell_watermarks.get(owner_key, 0),
         )
-        if event.side == "BUY" and self.settings.smart_sizing_enabled:
+        batch_buy = (
+            event.side == "BUY"
+            and self.settings.smart_sizing_enabled
+            and allowed_buy_price(event.price)
+        )
+        if batch_buy:
             batch = self._buy_batches.get(batch_key)
             if batch:
                 batch[0].append(event)
@@ -436,7 +442,7 @@ class CopyEngine:
         # BUY on the same outcome must not hold up our already-owned exit.
         predecessor = self._token_tails.get(owner_key)
         events = [event]
-        if event.side == "BUY" and self.settings.smart_sizing_enabled:
+        if batch_buy:
             task = asyncio.create_task(
                 self._execute_batch(leader_id, events, batch_key, predecessor)
             )
@@ -465,6 +471,8 @@ class CopyEngine:
     def _buy_signal_reason(self, event):
         if event.side != "BUY":
             return None
+        if not allowed_buy_price(event.price):
+            return "leader_price_out_of_range"
         now = time.time()
         if not self._valid_timestamp(event):
             return "invalid_signal_timestamp"
@@ -906,6 +914,9 @@ class CopyEngine:
                 source=event.source,
                 source_timestamp=event.timestamp,
                 received_age_seconds=round(max(0, event.received_at - event.timestamp), 3),
+                leader_price=str(event.price),
+                allowed_min_buy_price=str(MIN_BUY_PRICE),
+                allowed_max_buy_price=str(MAX_BUY_PRICE),
                 age_limit_seconds=(
                     self.settings.max_signal_age_rtds_seconds
                     if event.source == "rtds"
@@ -1039,8 +1050,15 @@ class CopyEngine:
                         ask=str(ask),
                         reference_price=str(decision.reference_price),
                         slippage_price=str(policy.slippage_price),
-                        min_buy_price=str(decision.reference_price - policy.slippage_price),
-                        max_buy_price=str(decision.reference_price + policy.slippage_price),
+                        min_buy_price=str(
+                            max(
+                                MIN_BUY_PRICE,
+                                max(decision.leader_vwap, event.price) - policy.slippage_price,
+                            )
+                        ),
+                        max_buy_price=str(
+                            min(MAX_BUY_PRICE, decision.reference_price + policy.slippage_price)
+                        ),
                         min_copy_notional=str(self.settings.min_copy_notional),
                         min_order_notional=str(book.min_order_size * ask),
                         cash_available=str(account.paper_balance),
@@ -1125,10 +1143,16 @@ class CopyEngine:
                 leader_price=str(event.price),
                 best_book_price=str(best_price) if best_price is not None else None,
                 requested_shares=str(target_shares),
-                reference_price=str(event.price),
+                reference_price=str(decision.reference_price if decision else event.price),
                 best_ask=str(book.asks[0][0]) if event.side == "BUY" and book.asks else None,
                 slippage_price=str(policy.slippage_price),
-                max_buy_price=str(event.price + policy.slippage_price)
+                max_buy_price=str(
+                    min(
+                        MAX_BUY_PRICE,
+                        (decision.reference_price if decision else event.price)
+                        + policy.slippage_price,
+                    )
+                )
                 if event.side == "BUY"
                 else None,
             )
