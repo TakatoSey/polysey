@@ -4,10 +4,6 @@ from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import select
-
-from .models import CopyTrade, PaperOrder
-
 ZERO = Decimal(0)
 EPS = Decimal("0.000001")
 
@@ -64,6 +60,10 @@ def replay(rows):
 
 
 async def inventory(session, token_id=None):
+    from sqlalchemy import select
+
+    from .models import CopyTrade, PaperOrder
+
     stmt = (
         select(PaperOrder, CopyTrade.leader_id)
         .outerjoin(CopyTrade, CopyTrade.id == PaperOrder.copy_trade_id)

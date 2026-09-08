@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -32,16 +33,19 @@ class LeaderActivity:
     received_monotonic: float = 0.0
     trader_address: str = ""
     source: str = "rest"
+    transaction_hash: str = ""
+    event_slug: str = ""
 
 
 def copy_event_key(key: str, address: str) -> str:
-    """Canonical identity, including wallet, compatible with legacy stored keys."""
-    if key.startswith("v2:"):
+    """Same transaction/economic leg across REST/RTDS timestamp differences."""
+    if key.startswith(("v2:", "v3:")):
         return key
     parts = key.split(":")
     if len(parts) != 7:
         return key  # synthetic events, not network trades
     tx, stamp, condition, asset, side, size, price = parts
+    stable_tx = bool(re.fullmatch(r"0x[0-9a-fA-F]{64}", tx))
 
     def number(value):
         result = format(Decimal(value), "f")
@@ -51,7 +55,7 @@ def copy_event_key(key: str, address: str) -> str:
         (
             address.lower(),
             tx.lower(),
-            str(int(stamp)),
+            *((str(int(stamp)),) if not stable_tx else ()),
             condition.lower(),
             asset,
             side.upper(),
@@ -59,7 +63,38 @@ def copy_event_key(key: str, address: str) -> str:
             number(price),
         )
     )
-    return "v2:" + hashlib.sha256(normalized.encode()).hexdigest()
+    return ("v3:" if stable_tx else "v2:") + hashlib.sha256(normalized.encode()).hexdigest()
+
+
+def receipt_keys(event: LeaderActivity, address: str) -> set[str]:
+    """Bridge old opaque v2 receipts near this timestamp without replaying cash.
+
+    New v3 identity has no timestamp. Keep size/price, token, side and wallet:
+    a transaction hash alone can contain multiple economic legs.
+    """
+    keys = {event.event_key}
+    if not event.transaction_hash or not event.event_key.startswith("v3:"):
+        return keys
+
+    def number(value):
+        result = format(value, "f")
+        return result.rstrip("0").rstrip(".") if "." in result else result
+
+    for stamp in range(event.timestamp - 2, event.timestamp + 3):
+        payload = "|".join(
+            (
+                address.lower(),
+                event.transaction_hash.lower(),
+                str(stamp),
+                event.condition_id.lower(),
+                event.token_id,
+                event.side.upper(),
+                number(event.size),
+                number(event.price),
+            )
+        )
+        keys.add("v2:" + hashlib.sha256(payload.encode()).hexdigest())
+    return keys
 
 
 @dataclass(slots=True)
@@ -158,6 +193,8 @@ class PolymarketClient:
                     received_at=received_at,
                     received_monotonic=received_monotonic,
                     trader_address=address,
+                    transaction_hash=str(tx).lower(),
+                    event_slug=str(item.get("eventSlug") or ""),
                 )
             )
         return sorted(events, key=lambda event: (event.timestamp, event.event_key))
@@ -244,6 +281,21 @@ class PolymarketClient:
         if self.book_stream:
             await self.book_stream.update_meta(token_id, book)
         return book
+
+    async def get_last_trade_price(self, token_id: str) -> Decimal | None:
+        """Return CLOB last-trade mark; this is not an executable bid."""
+        response = await self.http.get(
+            f"{self.settings.clob_api}/last-trade-price", params={"token_id": token_id}
+        )
+        response.raise_for_status()
+        data = response.json()
+        value = data.get("price") if isinstance(data, dict) else None
+        # The API returns price=0.5 with an empty side when no trade exists;
+        # treating that sentinel as a mark would fabricate portfolio value.
+        if value is None or data.get("side") not in {"BUY", "SELL"}:
+            return None
+        price = Decimal(str(value))
+        return price if price.is_finite() and Decimal(0) <= price <= Decimal(1) else None
 
     async def get_market(self, condition_id: str) -> dict:
         return await self._shared_request(

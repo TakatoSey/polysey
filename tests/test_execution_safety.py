@@ -17,6 +17,7 @@ from app.config import Settings
 from app.engine import CopyEngine
 from app.models import (
     Account,
+    BuyIntent,
     CopyTrade,
     ExitIntent,
     Leader,
@@ -181,12 +182,22 @@ async def test_old_or_future_buy_does_no_network_io(rig, stamp, source):
     e.source = source
     rig.engine._schedule_copy(1, e)
     await drain(rig.engine)
-    rig.client.get_book.assert_not_awaited()
-    rig.client.get_market.assert_not_awaited()
+    if stamp == 1000:
+        rig.client.get_book.assert_not_awaited()
+        rig.client.get_market.assert_not_awaited()
+    else:
+        assert rig.client.get_book.await_count == 1
+        assert rig.client.get_market.await_count == 1
     async with rig.sessions() as session:
-        assert (await session.get(Account, 1)).paper_balance == 100
+        assert (await session.get(Account, 1)).paper_balance == (
+            D("95") if stamp != 1000 else D("100")
+        )
         trade = await session.scalar(select(CopyTrade))
-        assert trade.skip_reason in {"stale_signal", "invalid_signal_timestamp"}
+        if stamp == 1000:
+            assert trade.skip_reason == "invalid_signal_timestamp"
+        else:
+            assert trade.skip_reason is None
+            assert (await session.scalar(select(PaperOrder))).status == "filled"
         shadow = await session.scalar(select(LeaderPosition))
         if stamp == 1000:
             assert shadow is None
@@ -204,8 +215,66 @@ async def test_signal_ages_while_waiting_for_ledger(rig, monkeypatch):
     rig.engine._ledger_lock.release()
     await drain(rig.engine)
     async with rig.sessions() as session:
-        assert (await session.scalar(select(CopyTrade))).skip_reason == "stale_signal"
+        assert (await session.scalar(select(PaperOrder))).status == "filled"
+        assert (await session.scalar(select(Position))).shares > 0
+
+
+async def test_price_missed_buy_executes_when_price_returns_and_leader_still_holds(rig):
+    missed = replace(activity("returns"), price=D("0.30"))
+    rig.book.asks[:] = [(D("0.50"), D(1000))]
+    rig.engine._schedule_copy(1, missed)
+    await drain(rig.engine)
+    async with rig.sessions() as session:
+        intent = await session.scalar(select(BuyIntent))
+        trade = await session.scalar(select(CopyTrade))
+        assert intent.active is True
+        assert trade.status == "retry_pending"
+        assert (await session.get(Account, 1)).paper_balance == 100
+        intent.next_attempt = 0
+        await session.commit()
+
+    # The leader has not sold; only the live executable price changed back.
+    rig.book.asks[:] = [(D("0.30"), D(1000))]
+    await rig.engine.retry_buys_once()
+    await rig.engine.retry_buys_once()
+    async with rig.sessions() as session:
+        intent = await session.scalar(select(BuyIntent))
+        trade = await session.scalar(select(CopyTrade))
+        orders = list(await session.scalars(select(PaperOrder).order_by(PaperOrder.id)))
+        assert intent.active is False and intent.last_reason == "filled"
+        assert trade.status == "executed" and trade.skip_reason is None
+        assert [order.status for order in orders] == ["rejected", "filled"]
+        assert orders[-1].reason == "deferred_price_retry"
+        assert (await session.get(Account, 1)).paper_balance == 97
+        assert (await session.scalar(select(Position))).shares == 10
+        # Source inventory was applied once, not once per retry.
+        assert (await session.scalar(select(LeaderPosition))).shares == 10
+
+
+async def test_leader_sell_cancels_price_retry_before_it_can_buy(rig):
+    missed = replace(activity("cancelled-entry"), price=D("0.30"))
+    rig.book.asks[:] = [(D("0.50"), D(1000))]
+    rig.engine._schedule_copy(1, missed)
+    await drain(rig.engine)
+    rig.engine._schedule_copy(
+        1, replace(activity("leader-exit", side="SELL", timestamp=101), price=D("0.30"))
+    )
+    await drain(rig.engine)
+    rig.book.asks[:] = [(D("0.30"), D(1000))]
+    async with rig.sessions() as session:
+        intent = await session.scalar(select(BuyIntent))
+        intent.next_attempt = 0
+        await session.commit()
+    await rig.engine.retry_buys_once()
+    async with rig.sessions() as session:
+        intent = await session.scalar(select(BuyIntent))
+        entry = await session.scalar(
+            select(CopyTrade).where(CopyTrade.event_key == "cancelled-entry")
+        )
+        assert intent.active is False and intent.last_reason == "leader_sold"
+        assert (entry.status, entry.skip_reason) == ("skipped", "leader_sold")
         assert await session.scalar(select(Position)) is None
+        assert (await session.get(Account, 1)).paper_balance == 100
 
 
 async def test_batch_executes_once_and_every_fragment_is_deduplicated(sizing_rig):
@@ -238,6 +307,17 @@ async def sell(rig, key="sell", qty="10", price="0.5", timestamp=101):
     e = replace(activity(key, side="SELL", timestamp=timestamp), size=D(qty), price=D(price))
     rig.engine._schedule_copy(1, e)
     await drain(rig.engine)
+
+
+async def test_successful_copied_sell_sends_clear_notification(rig):
+    await seed_buy(rig)
+    rig.engine.notifications.get_nowait()  # BUY notification
+    await sell(rig)
+    message = rig.engine.notifications.get_nowait()
+    assert "Copy Trade: SELL" in message
+    assert "Позиция: <b>Yes</b>" in message
+    assert "10.00 shares" in message
+    assert "PNL продажи" in message
 
 
 async def retry_due(rig):

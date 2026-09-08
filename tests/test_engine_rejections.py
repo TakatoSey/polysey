@@ -129,9 +129,10 @@ def test_buy_notification_contains_outcome_link_amount_and_shares():
     message = CopyEngine.build_buy_notification(leader, event, fill)
 
     assert "Will A &amp; B win?" in message
-    assert "Исход: <b>Yes</b>" in message
-    assert ">blackewolf83</a>" in message
+    assert "Позиция: <b>Yes</b>" in message
+    assert ">@blackewolf83</a>" in message
     assert "https://polymarket.com/profile/0x09b045" in message
-    assert "Сумма: <b>$1.8500</b>" in message
-    assert "Получено: <b>5.0000 shares</b>" in message
-    assert "Списано всего: $1.8600" in message
+    assert "Лидер купил: <b>$5.00</b> (10.00 shares)" in message
+    assert "Мы купили: <b>$1.85</b> (5.00 shares)" in message
+    assert "Цена входа: <b>37.0¢</b>" in message
+    assert "списано $1.86" in message

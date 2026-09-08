@@ -44,6 +44,12 @@ async def test_user_positions_settle_once_and_release_cash(monkeypatch):
         engine = CopyEngine(Settings(_env_file=None), client)
         await engine.settle_once()
         await engine.settle_once()
+        messages = [engine.notifications.get_nowait() for _ in range(3)]
+        rendered = "\n".join(messages)
+        assert "Позиция автоматически обработана" in rendered
+        assert "btc-up" in rendered and "Up · WON" in rendered
+        assert "nyc-no" in rendered and "No · LOST" in rendered
+        assert "PNL:" in rendered
         async with sessions() as session:
             account = await session.get(Account, 1)
             assert account.paper_balance == Decimal("127.7513")
@@ -54,3 +60,22 @@ async def test_user_positions_settle_once_and_release_cash(monkeypatch):
             assert all(order.status == "settled" for order in records)
     finally:
         await db.dispose()
+
+
+def test_settlement_notification_has_payout_pnl_and_market_link():
+    message = CopyEngine.build_settlement_notification(
+        "Bitcoin Up or Down?",
+        "Down",
+        Decimal("1.447366"),
+        Decimal(1),
+        Decimal("1.10"),
+        "btc-updown-5m-1788857400",
+        "bitcoin-up-or-down-september-8",
+    )
+    assert "Down · WON" in message
+    assert "Выплата: <b>$1.45</b>" in message
+    assert "<b>+$0.35</b>" in message
+    assert (
+        "https://polymarket.com/event/bitcoin-up-or-down-september-8/"
+        "btc-updown-5m-1788857400" in message
+    )

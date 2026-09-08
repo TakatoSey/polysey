@@ -173,6 +173,46 @@ class RuntimeMigration(Base):
     name: Mapped[str] = mapped_column(String(80), primary_key=True)
 
 
+class SourceObservation(Base):
+    """Retain source fragments and market names even after a position is deleted."""
+
+    __tablename__ = "source_observations"
+    event_key: Mapped[str] = mapped_column(String(400), primary_key=True)
+    copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"), index=True)
+    token_id: Mapped[str] = mapped_column(String(100), index=True)
+    source: Mapped[str] = mapped_column(String(20))
+    transaction_hash: Mapped[str] = mapped_column(String(100))
+    timestamp: Mapped[int] = mapped_column(Integer)
+    received_at: Mapped[Decimal | None] = mapped_column(Numeric(20, 6), nullable=True)
+    size: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    price: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    title: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(String(120))
+    slug: Mapped[str] = mapped_column(String(300), default="")
+    event_slug: Mapped[str] = mapped_column(String(300), default="")
+
+
+class BuyIntent(Base):
+    """A price-missed BUY which remains eligible while the leader still holds."""
+
+    __tablename__ = "buy_intents"
+    copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"), primary_key=True)
+    leader_id: Mapped[int] = mapped_column(ForeignKey("leaders.id"), index=True)
+    token_id: Mapped[str] = mapped_column(String(100), index=True)
+    condition_id: Mapped[str] = mapped_column(String(100))
+    source_timestamp: Mapped[int] = mapped_column(Integer)
+    leader_size: Mapped[Decimal] = mapped_column(Numeric(24, 10))
+    leader_price: Mapped[Decimal] = mapped_column(Numeric(20, 10))
+    title: Mapped[str] = mapped_column(Text)
+    outcome: Mapped[str] = mapped_column(String(120))
+    slug: Mapped[str] = mapped_column(String(300), default="")
+    event_slug: Mapped[str] = mapped_column(String(300), default="")
+    active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt: Mapped[Decimal] = mapped_column(Numeric(20, 6), default=0)
+    last_reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
+
+
 class ExitIntent(Base):
     __tablename__ = "exit_intents"
     leader_id: Mapped[int] = mapped_column(ForeignKey("leaders.id"), primary_key=True)

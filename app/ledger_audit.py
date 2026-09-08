@@ -9,7 +9,16 @@ from sqlalchemy import select, text
 
 from .accounting import replay
 from .db import SessionLocal
-from .models import Account, CopyTrade, ExitIntent, Leader, PaperOrder, Position
+from .models import (
+    Account,
+    CopyTrade,
+    ExitIntent,
+    Leader,
+    PaperOrder,
+    Position,
+    SizingAudit,
+    SourceObservation,
+)
 
 
 def summarize(account, rows, positions, leaders, intents):
@@ -76,7 +85,7 @@ def summarize(account, rows, positions, leaders, intents):
     }
 
 
-def export_history(trades, orders, positions, leaders):
+def export_history(trades, orders, positions, leaders, observations=(), sizing_audits=()):
     """Explicit public/trading fields only; no credentials, no database writes."""
 
     def fields(row, names):
@@ -102,6 +111,20 @@ def export_history(trades, orders, positions, leaders):
             for p in positions
         ],
         "leaders": [fields(l, "id address label") for l in leaders],
+        "source_observations": [
+            fields(
+                o,
+                "event_key copy_trade_id token_id source transaction_hash timestamp received_at size price title outcome slug event_slug",
+            )
+            for o in observations
+        ],
+        "sizing_audits": [
+            fields(
+                a,
+                "copy_trade_id bucket_start base_budget reference_notional leader_notional leader_vwap price_factor target_budget spent_before order_budget",
+            )
+            for a in sizing_audits
+        ],
         "note": "Full retained history, not just 30 Telegram rows. Closed/deleted positions may lack titles; match by token_id/condition_id. Contains wallet addresses and trading history; share privately.",
     }
 
@@ -132,8 +155,16 @@ async def main(include_history=False):
                 )
             )
             report["history"] = export_history(
-                trades, [order for order, _ in rows], positions, leaders
+                trades,
+                [order for order, _ in rows],
+                positions,
+                leaders,
+                list(await session.scalars(select(SourceObservation))),
+                list(await session.scalars(select(SizingAudit))),
             )
+            from .history_analysis import analyze_history
+
+            report["execution_analysis"] = analyze_history(report["history"])
     print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
@@ -50,6 +50,21 @@ async def initialize_execution(session, settings):
     from .polymarket import copy_event_key
 
     await get_execution_policy(session, settings)
+    # Repair only terminal status metadata. Never alter old fills or cash.
+    settled_after_signal = (
+        select(PaperOrder.id)
+        .where(
+            PaperOrder.token_id == CopyTrade.token_id,
+            PaperOrder.status == "settled",
+            PaperOrder.created_at >= CopyTrade.created_at,
+        )
+        .exists()
+    )
+    await session.execute(
+        update(CopyTrade)
+        .where(CopyTrade.status == "exit_pending", settled_after_signal)
+        .values(status="closed", skip_reason="market_settled")
+    )
     if await session.get(RuntimeMigration, "source_receipts_v1"):
         return
     existing = set(await session.scalars(select(SourceReceipt.event_key)))
@@ -66,6 +81,15 @@ async def initialize_execution(session, settings):
             session.add(SourceReceipt(event_key=key, copy_trade_id=trade.id))
             existing.add(key)
     session.add(RuntimeMigration(name="source_receipts_v1"))
+
+
+async def finish_exit_signals(session, token_id, *, leader_id=None, reason):
+    stmt = update(CopyTrade).where(
+        CopyTrade.token_id == token_id, CopyTrade.status == "exit_pending"
+    )
+    if leader_id is not None:
+        stmt = stmt.where(CopyTrade.leader_id == leader_id)
+    await session.execute(stmt.values(status="closed", skip_reason=reason))
 
 
 async def get_leaders(session: AsyncSession) -> list[Leader]:

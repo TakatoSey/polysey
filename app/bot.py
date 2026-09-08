@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from datetime import UTC, datetime
@@ -14,13 +15,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import CopyTrade, ExitIntent, Leader, PaperOrder, Position, RiskRule
+from .models import CopyTrade, ExitIntent, Leader, PaperOrder, Position, RiskRule, SourceObservation
 from .repository import (
     add_leader,
     get_execution_policy,
@@ -344,7 +345,14 @@ class TelegramApp:
             log.warning("portfolio_book_failed", token_id=row.token_id, error=str(exc))
             return None, status, "Стакан недоступен · оценка неизвестна"
         if not book.bids:
-            return None, status, "Нет заявок на покупку · оценка неизвестна"
+            try:
+                last = await self.engine.client.get_last_trade_price(row.token_id)
+            except Exception as exc:
+                log.warning("portfolio_last_trade_failed", token_id=row.token_id, error=str(exc))
+                return None, status, "Нет bid · mark last trade недоступен"
+            if last is None or not isinstance(last, Decimal):
+                return None, status, "Нет bid и last trade · оценка неизвестна"
+            return last, status, "Mark по последней сделке; исполнимой заявки на продажу сейчас нет"
         return (
             book.bids[0][0],
             status,
@@ -356,23 +364,74 @@ class TelegramApp:
         per_page = 5
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         page = max(0, min(page, total_pages - 1))
-        current = rows[page * per_page : (page + 1) * per_page]
         lines = [
-            "<b>📊 ПОРТФЕЛЬ · PAPER</b>",
+            "<b>🗂️ Все позиции · PAPER</b>",
             f"Свободно: <b>${account.paper_balance:.2f}</b>",
             f"Зафиксированный PNL: ${account.realized_pnl:+.2f}",
         ]
         if not rows:
             lines.append("\nОткрытых позиций нет.")
             return "\n".join(lines)
-        for row in current:
-            quote, status, note = await self._position_quote(row)
+
+        quote_slots = asyncio.Semaphore(8)
+
+        async def quote_position(row):
+            async with quote_slots:
+                return await self._position_quote(row)
+
+        quote_results = await asyncio.gather(*(quote_position(row) for row in rows))
+        quotes = [
+            (row, quote, status, note)
+            for row, (quote, status, note) in zip(rows, quote_results, strict=True)
+        ]
+
+        total_cost = sum((row.cost_basis for row in rows), Decimal(0))
+        known_value = sum(
+            (row.shares * quote for row, quote, _, _ in quotes if quote is not None),
+            Decimal(0),
+        )
+        unknown_count = sum(quote is None for _, quote, _, _ in quotes)
+
+        for index, (row, quote, status, note) in enumerate(
+            quotes[page * per_page : (page + 1) * per_page],
+            start=page * per_page + 1,
+        ):
             value = row.shares * quote if quote is not None else None
-            mark = f"${value:.2f}" if value is not None else "—"
-            pnl = f" · PNL ${value - row.cost_basis:+.2f}" if value is not None else ""
-            lines.append(
-                f"\n<b>{html.escape(row.title[:95])}</b>\n{html.escape(row.outcome)} · {row.shares:.3f} shares · вход ${row.average_price:.4f}\nОценка: <b>{mark}</b>{pnl}\n{status}\n{note}"
+            pnl_value = value - row.cost_basis if value is not None else None
+            pnl_pct = (
+                pnl_value / row.cost_basis * 100
+                if pnl_value is not None and row.cost_basis
+                else None
             )
+            now = f"{quote * 100:.2f}¢" if quote is not None else "—"
+            value_text = f"${value:.2f}" if value is not None else "—"
+            pnl_text = (
+                (
+                    (f"+${pnl_value:.2f}" if pnl_value >= 0 else f"-${abs(pnl_value):.2f}")
+                    + f" ({pnl_pct:+.1f}%)"
+                )
+                if pnl_pct is not None
+                else "—"
+            )
+            lines.append(
+                f"\n<b>{index}. {html.escape(row.title[:95])}</b>\n"
+                f"  ├ Позиция: {row.shares:.3f} {html.escape(row.outcome)}\n"
+                f"  ├ Средняя/сейчас: {row.average_price * 100:.2f}¢ → {now}\n"
+                f"  ├ Затраты/оценка: ${row.cost_basis:.2f} → {value_text}\n"
+                f"  ├ PNL: {pnl_text}\n"
+                f"  ├ При победе: ${row.shares:.2f}\n"
+                f"  └ Статус: 🟢 открыт\n"
+                f"  <i>{html.escape(note)}</i>"
+            )
+
+        if unknown_count:
+            lines.append(f"\n<b>Итоговый PNL: —</b> · нет mark у {unknown_count} поз.")
+        else:
+            total_pnl = known_value - total_cost
+            total_pct = total_pnl / total_cost * 100 if total_cost else Decimal(0)
+            icon = "📈" if total_pnl >= 0 else "📉"
+            total_pnl_text = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+            lines.append(f"\n<b>{icon} Общий PNL: {total_pnl_text} ({total_pct:+.1f}%)</b>")
         lines.append(f"\nСтраница {page + 1}/{total_pages}. Нажмите на позицию для деталей.")
         lines.append(f"Обновлено: {datetime.now(UTC):%H:%M:%S} UTC")
         return "\n".join(lines)
@@ -400,6 +459,8 @@ class TelegramApp:
             return "<b>Позиция больше не открыта</b>\nПроверьте продажу или выплату в разделе «История»."
         quote, status, note = await self._position_quote(row)
         value = row.shares * quote if quote is not None else None
+        pnl = value - row.cost_basis if value is not None else None
+        pnl_pct = pnl / row.cost_basis * 100 if pnl is not None and row.cost_basis else None
         lines = [
             f"<b>📌 {html.escape(row.title)}</b>",
             f"Исход: <b>{html.escape(row.outcome)}</b>",
@@ -411,6 +472,10 @@ class TelegramApp:
         lines.append(
             f"Текущая оценка: ${value:.4f}" if value is not None else "Текущая оценка: неизвестна"
         )
+        if pnl_pct is not None:
+            pnl_text = f"+${pnl:.4f}" if pnl >= 0 else f"-${abs(pnl):.4f}"
+            lines.append(f"Текущий PNL: <b>{pnl_text} ({pnl_pct:+.1f}%)</b>")
+        lines.append(f"Выплата при победе: ${row.shares:.4f}")
         lines.append(note)
         lines.append(f"\nОбновлено: {datetime.now(UTC):%H:%M:%S} UTC")
         return "\n".join(lines)
@@ -441,6 +506,10 @@ class TelegramApp:
                     book = await self.engine.client.get_book(row.token_id)
                     if book.bids:
                         current = book.bids[0][0]
+                    else:
+                        current = await self.engine.client.get_last_trade_price(row.token_id)
+                        if isinstance(current, Decimal):
+                            label = "последняя сделка · не гарантирует продажу"
             except Exception as exc:
                 log.warning("portfolio_quote_unavailable", token_id=row.token_id, error=str(exc))
             title = html.escape(row.title[:180])
@@ -491,6 +560,32 @@ class TelegramApp:
                 ).all()
             )
             rows: list[PaperOrder] = await orders(session)
+            # One bounded lookup; source metadata survives settlement/deletion.
+            metadata = {}
+            token_ids = {row.token_id for row in rows}
+            if token_ids:
+                latest = (
+                    select(
+                        SourceObservation.event_key,
+                        func.row_number()
+                        .over(
+                            partition_by=SourceObservation.token_id,
+                            order_by=(
+                                SourceObservation.timestamp.desc(),
+                                SourceObservation.event_key,
+                            ),
+                        )
+                        .label("rank"),
+                    )
+                    .where(SourceObservation.token_id.in_(token_ids))
+                    .subquery()
+                )
+                found = await session.scalars(
+                    select(SourceObservation)
+                    .join(latest, latest.c.event_key == SourceObservation.event_key)
+                    .where(latest.c.rank == 1)
+                )
+                metadata = {o.token_id: o for o in found}
             copy_trade_ids = [row.copy_trade_id for row in rows if row.copy_trade_id]
             trades = (
                 list(
@@ -561,6 +656,9 @@ class TelegramApp:
             elif raw_reason.startswith("market_data:") and raw_reason not in reasons:
                 reason = "не удалось подтвердить параметры рынка"
             header = f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>"
+            market = metadata.get(row.token_id)
+            if market:
+                header += f"\n{html.escape(market.title[:60])} · {html.escape(market.outcome[:24])}"
             if row.status == "rejected":
                 details = []
                 if trade:
@@ -570,6 +668,26 @@ class TelegramApp:
                 if row.requested_shares > 0:
                     details.append(f"Наша заявка: {row.requested_shares:.4f} shares")
                 details.append(f"Причина: {html.escape(reason or 'нет исполнения')}")
+                if trade and trade.status == "retry_pending":
+                    details.append(
+                        "⏳ Следим за ценой: BUY исполнится, если цена вернётся в лимит до продажи лидера."
+                    )
+                elif (
+                    trade
+                    and trade.status == "executed"
+                    and raw_reason in CopyEngine.RETRYABLE_BUY_REASONS
+                ):
+                    details.append("✅ Позже цена вернулась в лимит, и BUY был исполнен.")
+                elif trade:
+                    terminal = {
+                        "market_settled": "Позже позиция закрыта выплатой по результату рынка.",
+                        "exit_completed_in_series": "Позже общий выход серии исполнен.",
+                        "position_closed": "Позиция уже закрыта; повтор выхода не требуется.",
+                        "leader_sold": "Лидер продал позицию до возврата цены; отложенный BUY отменён.",
+                        "risk_exit": "Отложенный BUY отменён после срабатывания правила риска.",
+                    }
+                    if trade.skip_reason in terminal:
+                        details.append(terminal[trade.skip_reason])
                 lines.append(header + "\n" + "\n".join(details))
             elif row.status == "settled":
                 proceeds = row.filled_shares * row.average_fill_price
@@ -626,7 +744,7 @@ class TelegramApp:
             f"Минимум BUY: ${self.settings.min_copy_notional:.2f} · лимит на исход: ${self.settings.max_outcome_exposure:.2f}\n"
             "Также действует минимум shares из стакана.\n"
             f"Допустимое отклонение цены: <b>{policy.slippage_price * 100:.2f}¢</b>\n"
-            f"Максимальный возраст BUY: RTDS {self.settings.max_signal_age_rtds_seconds:g} с · REST {self.settings.max_signal_age_rest_seconds:g} с\n"
+            "Возраст сигнала: только диагностика (BUY не отбрасывается по времени)\n"
             "Дневной лимит: выключен · Buy-only: выключен\n\n"
             "Подробности — кнопками ниже. Команды: /setmax, /setslippage, /risk."
         )

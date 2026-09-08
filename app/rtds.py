@@ -1,4 +1,5 @@
 """Verified public RTDS envelopes; REST remains an independent recovery source."""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,8 +12,7 @@ from decimal import Decimal, InvalidOperation
 import structlog
 import websockets
 
-from .polymarket import LeaderActivity
-from .polymarket import copy_event_key
+from .polymarket import LeaderActivity, copy_event_key
 
 log = structlog.get_logger(__name__)
 
@@ -50,13 +50,21 @@ class RTDSTradeStream:
         while not self.stop_event.is_set():
             try:
                 async with websockets.connect(
-                    self.URL, ping_interval=None, open_timeout=8, close_timeout=3,
-                    max_queue=128, max_size=1024 * 1024,
+                    self.URL,
+                    ping_interval=None,
+                    open_timeout=8,
+                    close_timeout=3,
+                    max_queue=128,
+                    max_size=1024 * 1024,
                 ) as ws:
-                    await ws.send(json.dumps({
-                        "action": "subscribe",
-                        "subscriptions": [{"topic": "activity", "type": "trades"}],
-                    }))
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "action": "subscribe",
+                                "subscriptions": [{"topic": "activity", "type": "trades"}],
+                            }
+                        )
+                    )
                     await ws.send("ping")
                     self.last_trade_at = None
                     log.info("rtds_trade_stream_connected", state="awaiting_trade_data")
@@ -74,8 +82,11 @@ class RTDSTradeStream:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.warning("rtds_trade_stream_reconnecting", error=type(exc).__name__,
-                            retry_seconds=backoff)
+                log.warning(
+                    "rtds_trade_stream_reconnecting",
+                    error=type(exc).__name__,
+                    retry_seconds=backoff,
+                )
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=backoff)
             except TimeoutError:
@@ -89,10 +100,17 @@ class RTDSTradeStream:
                 await asyncio.sleep(self.PING_SECONDS)
                 await ws.send("ping")  # RTDS application heartbeat, not WS control ping
                 if time.monotonic() - report_at >= self.HEALTH_SECONDS:
-                    age = None if self.last_trade_at is None else time.monotonic() - self.last_trade_at
-                    log.info("rtds_health", **dict(self.counters),
-                             state="receiving" if age is not None and age < 60 else "no_recent_trades",
-                             last_trade_age_seconds=None if age is None else round(age, 1))
+                    age = (
+                        None
+                        if self.last_trade_at is None
+                        else time.monotonic() - self.last_trade_at
+                    )
+                    log.info(
+                        "rtds_health",
+                        **dict(self.counters),
+                        state="receiving" if age is not None and age < 60 else "no_recent_trades",
+                        last_trade_age_seconds=None if age is None else round(age, 1),
+                    )
                     report_at = time.monotonic()
         except asyncio.CancelledError:
             raise
@@ -150,28 +168,44 @@ class RTDSTradeStream:
             timestamp_value = Decimal(str(item["timestamp"]))
             size, price = Decimal(str(item["size"])), Decimal(str(item["price"]))
             if (
-                side not in ("BUY", "SELL") or not asset.isdigit() or len(asset) > 78
+                side not in ("BUY", "SELL")
+                or not asset.isdigit()
+                or len(asset) > 78
                 or not re.fullmatch(r"0x[0-9a-f]{64}", condition)
                 or not re.fullmatch(r"0x[0-9a-f]{64}", tx)
                 or not re.fullmatch(r"0x[0-9a-f]{40}", address)
                 or not timestamp_value.is_finite()
                 or timestamp_value != timestamp_value.to_integral_value()
                 or not 0 < timestamp_value < 10_000_000_000
-                or not size.is_finite() or not 0 < size < Decimal("1e14")
-                or not price.is_finite() or not 0 < price < 1
+                or not size.is_finite()
+                or not 0 < size < Decimal("1e14")
+                or not price.is_finite()
+                or not 0 < price < 1
             ):
                 return None
             timestamp = int(timestamp_value)
         except (KeyError, ValueError, TypeError, InvalidOperation):
             return None
         return LeaderActivity(
-            event_key=copy_event_key(f"{tx}:{timestamp}:{condition}:{asset}:{side}:{size}:{price}", address),
-            timestamp=timestamp, condition_id=condition, token_id=asset, side=side,
-            size=size, price=price,
+            event_key=copy_event_key(
+                f"{tx}:{timestamp}:{condition}:{asset}:{side}:{size}:{price}", address
+            ),
+            timestamp=timestamp,
+            condition_id=condition,
+            token_id=asset,
+            side=side,
+            size=size,
+            price=price,
             title=str(item.get("title") or item.get("slug") or "Unknown market"),
-            outcome=str(item.get("outcome") or ""), slug=str(item.get("slug") or ""),
+            outcome=str(item.get("outcome") or ""),
+            slug=str(item.get("slug") or ""),
             trader_name=str(item.get("name") or item.get("pseudonym") or "").strip(),
             received_at=time.time() if received_at is None else received_at,
-            received_monotonic=time.monotonic() if received_monotonic is None else received_monotonic,
-            trader_address=address, source="rtds",
+            received_monotonic=time.monotonic()
+            if received_monotonic is None
+            else received_monotonic,
+            trader_address=address,
+            source="rtds",
+            transaction_hash=tx,
+            event_slug=str(item.get("eventSlug") or ""),
         )

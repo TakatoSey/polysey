@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import ClassVar
 
 import structlog
 from sqlalchemy import select, update
@@ -17,6 +18,7 @@ from .accounting import Holding, inventory
 from .config import Settings
 from .db import SessionLocal
 from .models import (
+    BuyIntent,
     CopyTrade,
     ExitIntent,
     Leader,
@@ -27,14 +29,16 @@ from .models import (
     RiskRule,
     SizingAudit,
     SizingEntry,
+    SourceObservation,
     SourceReceipt,
 )
 from .paper import execute_buy_fak_by_budget, execute_fak
-from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key
+from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key, receipt_keys
 from .price_limits import MAX_BUY_PRICE, MIN_BUY_PRICE, allowed_buy_price
 from .priority import PriorityLock
 from .repository import (
     apply_fill,
+    finish_exit_signals,
     get_execution_policy,
     get_or_create_account,
     get_position,
@@ -58,6 +62,13 @@ class PreparedCopy:
 
 
 class CopyEngine:
+    RETRYABLE_BUY_REASONS: ClassVar[set[str]] = {
+        "no_liquidity_within_slippage",
+        "no_liquidity",
+        "entry_price_drop",
+        "buy_price_out_of_range",
+    }
+
     def __init__(self, settings: Settings, client: PolymarketClient):
         self.settings = settings
         self.client = client
@@ -90,19 +101,96 @@ class CopyEngine:
     @staticmethod
     def build_buy_notification(leader: Leader, event: LeaderActivity, fill) -> str:
         trader_name = (
-            event.trader_name or leader.label or (f"{leader.address[:8]}…{leader.address[-6:]}")
+            event.trader_name or leader.label or f"{leader.address[:8]}…{leader.address[-6:]}"
         )
         profile_url = f"https://polymarket.com/profile/{leader.address}"
         total_debit = fill.notional + fill.fee
         return (
-            "✅ <b>BUY скопирован</b>\n\n"
-            f"<b>{html.escape(event.title)}</b>\n"
-            f"Исход: <b>{html.escape(event.outcome)}</b>\n\n"
-            f'Трейдер: <a href="{profile_url}">{html.escape(trader_name)}</a>\n'
-            f"Сумма: <b>${fill.notional:.4f}</b>\n"
-            f"Получено: <b>{fill.shares:.4f} shares</b>\n"
-            f"Цена: ${fill.average_price:.4f} · комиссия ${fill.fee:.5f}\n"
-            f"Списано всего: ${total_debit:.4f}"
+            "📋 <b>Copy Trade: BUY</b>\n\n"
+            f'🟢 Скопировано у <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
+            f"📊 Рынок: <b>{html.escape(event.title)}</b>\n"
+            f"🎯 Позиция: <b>{html.escape(event.outcome)}</b>\n\n"
+            f"💰 Лидер купил: <b>${event.size * event.price:.2f}</b> ({event.size:.2f} shares)\n"
+            f"📈 Цена лидера: <b>{event.price * 100:.1f}¢</b>\n\n"
+            f"💵 Мы купили: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
+            f"🏷️ Цена входа: <b>{fill.average_price * 100:.1f}¢</b>\n"
+            f"Комиссия: ${fill.fee:.4f} · списано ${total_debit:.2f}"
+        )
+
+    @staticmethod
+    def build_sell_notification(leader: Leader, position: Position, fill, pnl: Decimal) -> str:
+        trader_name = leader.label or f"{leader.address[:8]}…{leader.address[-6:]}"
+        profile_url = f"https://polymarket.com/profile/{leader.address}"
+        proceeds = fill.notional - fill.fee
+        icon = "📈" if pnl >= 0 else "📉"
+        pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        return (
+            "📋 <b>Copy Trade: SELL</b>\n\n"
+            f'🔴 Продано вслед за <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
+            f"📊 Рынок: <b>{html.escape(position.title)}</b>\n"
+            f"🎯 Позиция: <b>{html.escape(position.outcome)}</b>\n\n"
+            f"💵 Продано: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
+            f"🏷️ Цена выхода: <b>{fill.average_price * 100:.1f}¢</b>\n"
+            f"Комиссия: ${fill.fee:.4f} · получено ${proceeds:.2f}\n"
+            f"{icon} PNL продажи: <b>{pnl_text}</b>"
+        )
+
+    @staticmethod
+    def build_settlement_notification(
+        title: str,
+        outcome: str,
+        shares: Decimal,
+        payout: Decimal,
+        cost_basis: Decimal,
+        slug: str = "",
+        event_slug: str = "",
+    ) -> str:
+        proceeds = shares * payout
+        pnl = proceeds - cost_basis
+        won = payout > 0
+        result_icon = "🏆" if won else "💀"
+        pnl_icon = "📈" if pnl >= 0 else "📉"
+        pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        result = "WON" if payout == 1 else "LOST" if payout == 0 else "SPLIT"
+        lines = [
+            "🎉 <b>Позиция автоматически обработана</b>",
+            "",
+            f"1. {result_icon} <b>{html.escape(title)}</b>",
+            f"  ├ Исход: <b>{html.escape(outcome)} · {result}</b>",
+            f"  ├ Shares: {shares:.6f}" + (" (списаны)" if payout == 0 else ""),
+        ]
+        if proceeds > 0:
+            lines.append(f"  ├ Выплата: <b>${proceeds:.2f}</b>")
+        lines.append(f"  ├ PNL: {pnl_icon} <b>{pnl_text}</b>")
+        if slug:
+            safe_slug = html.escape(slug.strip("/"), quote=True)
+            safe_event_slug = html.escape((event_slug or slug).strip("/"), quote=True)
+            lines.append(
+                f'  └ <a href="https://polymarket.com/event/{safe_event_slug}/{safe_slug}">Открыть на Polymarket</a>'
+            )
+        if proceeds > 0:
+            lines.extend(("", "━━━━━━━━━━━━━━━━━━━━", f"💰 Получено: <b>${proceeds:.2f}</b>"))
+        return "\n".join(lines)
+
+    @staticmethod
+    def build_risk_sell_notification(position: Position, fill, pnl: Decimal, trigger: str) -> str:
+        proceeds = fill.notional - fill.fee
+        pnl_icon = "📈" if pnl >= 0 else "📉"
+        pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+        rule_name = {
+            "stop-loss": "Stop Loss",
+            "take-profit": "Take Profit",
+            "trailing-stop": "Trailing Stop",
+        }.get(trigger, trigger)
+        return (
+            "📋 <b>Position: SELL</b>\n\n"
+            f"⚙️ Причина: <b>{html.escape(rule_name)}</b>\n\n"
+            f"📊 Рынок: <b>{html.escape(position.title)}</b>\n"
+            f"🎯 Позиция: <b>{html.escape(position.outcome)}</b>\n\n"
+            f"💵 Продано: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
+            f"🏷️ Цена выхода: <b>{fill.average_price * 100:.1f}¢</b>\n"
+            f"Комиссия: ${fill.fee:.4f} · получено ${proceeds:.2f}\n"
+            f"{pnl_icon} PNL продажи: <b>{pnl_text}</b>"
         )
 
     @staticmethod
@@ -174,6 +262,34 @@ class CopyEngine:
                 reason=reason[:240],
             )
         )
+        CopyEngine.record_buy_intent(session, copy_trade, event, reason)
+
+    @staticmethod
+    def record_buy_intent(
+        session, copy_trade: CopyTrade, event: LeaderActivity, reason: str
+    ) -> None:
+        """Keep a missed price entry eligible without replaying its sizing/inventory effects."""
+        if event.side != "BUY" or reason not in CopyEngine.RETRYABLE_BUY_REASONS:
+            return
+        copy_trade.status = "retry_pending"
+        copy_trade.skip_reason = reason
+        session.add(
+            BuyIntent(
+                copy_trade_id=copy_trade.id,
+                leader_id=copy_trade.leader_id,
+                token_id=event.token_id,
+                condition_id=event.condition_id,
+                source_timestamp=event.timestamp,
+                leader_size=event.size,
+                leader_price=event.price,
+                title=event.title,
+                outcome=event.outcome,
+                slug=event.slug,
+                event_slug=event.event_slug,
+                next_attempt=Decimal(str(time.time() + 0.5)),
+                last_reason=reason[:240],
+            )
+        )
 
     async def run(self) -> None:
         log.info(
@@ -183,6 +299,7 @@ class CopyEngine:
             prepare_concurrency=self.settings.copy_prepare_concurrency,
             max_age_rtds_seconds=self.settings.max_signal_age_rtds_seconds,
             max_age_rest_seconds=self.settings.max_signal_age_rest_seconds,
+            age_policy="diagnostic_only_buy_rejected_only_by_price_or_sell_barrier",
             exit_retry_enabled=self.settings.exit_retry_enabled,
             exit_retry_seconds=self.settings.exit_retry_seconds,
         )
@@ -201,6 +318,7 @@ class CopyEngine:
             asyncio.create_task(
                 self._repeat(self.retry_exits_once, self.settings.exit_retry_seconds)
             ),
+            asyncio.create_task(self._repeat(self.retry_buys_once, 0.5)),
         ]
         try:
             await asyncio.gather(*loops)
@@ -473,16 +591,13 @@ class CopyEngine:
             return None
         if not allowed_buy_price(event.price):
             return "leader_price_out_of_range"
-        now = time.time()
         if not self._valid_timestamp(event):
             return "invalid_signal_timestamp"
-        age_limit = (
-            self.settings.max_signal_age_rtds_seconds
-            if event.source == "rtds"
-            else self.settings.max_signal_age_rest_seconds
-        )
-        if now - event.timestamp > age_limit:
-            return "stale_signal"
+        # A historical signal is not intrinsically invalid: the leader may
+        # still hold the outcome and the price may have returned. The only
+        # freshness barrier is the persisted SELL watermark / database SELL
+        # check below. Age is logged for observability, never used to discard
+        # a BUY before its price and leader-position checks.
         return None
 
     @staticmethod
@@ -503,15 +618,24 @@ class CopyEngine:
             if not leader or not leader.active or account.paused:
                 return
             eligible = []
-            received = set(
-                await session.scalars(
-                    select(SourceReceipt.event_key).where(
-                        SourceReceipt.event_key.in_([e.event_key for e in events])
+            received = dict(
+                (
+                    await session.execute(
+                        select(SourceReceipt.event_key, SourceReceipt.copy_trade_id).where(
+                            SourceReceipt.event_key.in_(
+                                set().union(*(receipt_keys(e, leader.address) for e in events))
+                            )
+                        )
                     )
-                )
+                ).all()
             )
             for event in events:
-                if event.event_key in received:
+                matches = receipt_keys(event, leader.address).intersection(received)
+                if matches:
+                    if event.event_key not in received:
+                        owner = min(received[key] for key in matches)
+                        session.add(SourceReceipt(event_key=event.event_key, copy_trade_id=owner))
+                        received[event.event_key] = owner
                     continue
                 if self._buy_signal_reason(event) or not self._valid_trade(event):
                     await self.process_event(session, leader, event, prepared)
@@ -588,15 +712,9 @@ class CopyEngine:
         prepare = asyncio.create_task(self.prepare_copy(event))
         superseded = asyncio.create_task(cancel.wait())
         try:
-            limit = (
-                self.settings.max_signal_age_rtds_seconds
-                if event.source == "rtds"
-                else self.settings.max_signal_age_rest_seconds
-            )
             done, _ = await asyncio.wait(
                 [prepare, superseded],
                 return_when=asyncio.FIRST_COMPLETED,
-                timeout=max(0, event.timestamp + limit - time.time()),
             )
             if not done:
                 return PreparedCopy(
@@ -812,11 +930,48 @@ class CopyEngine:
     ) -> None:
         detection_lag = max(0, (event.received_at or time.time()) - event.timestamp)
         source_events = source_events or [event]
-        if await session.scalar(
-            select(SourceReceipt.event_key)
-            .where(SourceReceipt.event_key.in_([e.event_key for e in source_events]))
-            .limit(1)
-        ):
+        received = dict(
+            (
+                await session.execute(
+                    select(SourceReceipt.event_key, SourceReceipt.copy_trade_id).where(
+                        SourceReceipt.event_key.in_(
+                            set().union(*(receipt_keys(e, leader.address) for e in source_events))
+                        )
+                    )
+                )
+            ).all()
+        )
+        if received:
+            for source in source_events:
+                matches = receipt_keys(source, leader.address).intersection(received)
+                if matches and source.event_key not in received:
+                    copy_trade_id = min(received[key] for key in matches)
+                    session.add(
+                        SourceReceipt(
+                            event_key=source.event_key,
+                            copy_trade_id=copy_trade_id,
+                        )
+                    )
+                    received_value = Decimal(str(source.received_at))
+                    session.add(
+                        SourceObservation(
+                            event_key=source.event_key,
+                            copy_trade_id=copy_trade_id,
+                            token_id=source.token_id,
+                            source=source.source[:20],
+                            transaction_hash=source.transaction_hash[:100],
+                            timestamp=source.timestamp if self._valid_timestamp(source) else 0,
+                            received_at=received_value
+                            if received_value.is_finite() and 0 < received_value < Decimal("1e13")
+                            else None,
+                            size=source.size if source.size.is_finite() else Decimal(0),
+                            price=source.price if source.price.is_finite() else Decimal(0),
+                            title=source.title,
+                            outcome=source.outcome[:120],
+                            slug=source.slug[:300],
+                            event_slug=source.event_slug[:300],
+                        )
+                    )
             return
         if event.trader_name and not leader.label:
             leader.label = event.trader_name[:120]
@@ -839,6 +994,26 @@ class CopyEngine:
                     session.add(
                         SourceReceipt(event_key=source.event_key, copy_trade_id=copy_trade.id)
                     )
+                    received = Decimal(str(source.received_at))
+                    session.add(
+                        SourceObservation(
+                            event_key=source.event_key,
+                            copy_trade_id=copy_trade.id,
+                            token_id=source.token_id,
+                            source=source.source[:20],
+                            transaction_hash=source.transaction_hash[:100],
+                            timestamp=source.timestamp if self._valid_timestamp(source) else 0,
+                            received_at=received
+                            if received.is_finite() and 0 < received < Decimal("1e13")
+                            else None,
+                            size=source.size if source.size.is_finite() else Decimal(0),
+                            price=source.price if source.price.is_finite() else Decimal(0),
+                            title=source.title,
+                            outcome=source.outcome[:120],
+                            slug=source.slug[:300],
+                            event_slug=source.event_slug[:300],
+                        )
+                    )
                 await session.flush()
         except IntegrityError:
             return
@@ -853,6 +1028,35 @@ class CopyEngine:
             return
 
         if event.side == "SELL":
+            pending_buy_ids = list(
+                await session.scalars(
+                    select(BuyIntent.copy_trade_id).where(
+                        BuyIntent.leader_id == leader.id,
+                        BuyIntent.token_id == event.token_id,
+                        BuyIntent.source_timestamp <= event.timestamp,
+                        BuyIntent.active.is_(True),
+                    )
+                )
+            )
+            if pending_buy_ids:
+                await session.execute(
+                    update(CopyTrade)
+                    .where(
+                        CopyTrade.id.in_(pending_buy_ids),
+                        CopyTrade.status == "retry_pending",
+                    )
+                    .values(status="skipped", skip_reason="leader_sold")
+                )
+            await session.execute(
+                update(BuyIntent)
+                .where(
+                    BuyIntent.leader_id == leader.id,
+                    BuyIntent.token_id == event.token_id,
+                    BuyIntent.source_timestamp <= event.timestamp,
+                    BuyIntent.active.is_(True),
+                )
+                .values(active=False, last_reason="leader_sold")
+            )
             await session.execute(
                 update(SizingEntry)
                 .where(
@@ -1127,6 +1331,7 @@ class CopyEngine:
         if fill.shares <= 0:
             copy_trade.status = "skipped"
             copy_trade.skip_reason = fill.reason or "no_fill"
+            self.record_buy_intent(session, copy_trade, event, copy_trade.skip_reason)
             best_price = (
                 book.asks[0][0]
                 if event.side == "BUY" and book.asks
@@ -1189,12 +1394,12 @@ class CopyEngine:
             fee=str(fill.fee),
         )
         # Keep the chat quiet: only successful BUY copies are user-facing
-        # notifications. Rejections/partial misses remain visible in Ордера.
+        # notifications. Rejections remain visible in the order history.
         if event.side == "BUY":
             message = self.build_buy_notification(leader, event, fill)
             if decision:
                 message += (
-                    f"\n\nБюджет серии с комиссией: ${decision.target_budget:.2f}"
+                    f"\n\nЛимит серии с комиссией: ${decision.target_budget:.2f}"
                     f"\nИспользовано в серии: ${smart_entry.spent:.2f}"
                 )
             session.info.setdefault("notifications", []).append(message)
@@ -1329,6 +1534,7 @@ class CopyEngine:
         await asyncio.gather(*(self._monitor_risk_token(token) for token in token_ids))
 
     async def _monitor_risk_token(self, token_id: str) -> None:
+        message = None
         try:
             async with self._maintenance_slots:
                 book = await self.client.get_book(token_id)
@@ -1413,6 +1619,7 @@ class CopyEngine:
                 if fill.shares <= 0:
                     return
                 remaining = position.shares - fill.shares
+                realized_before = account.realized_pnl
                 await apply_fill(
                     session,
                     fill,
@@ -1423,7 +1630,12 @@ class CopyEngine:
                     position.condition_id,
                     account,
                 )
+                message = self.build_risk_sell_notification(
+                    position, fill, account.realized_pnl - realized_before, trigger
+                )
                 rule.enabled = remaining > Decimal("0.00000001")
+                if not rule.enabled:
+                    await finish_exit_signals(session, token_id, reason="position_closed")
                 await session.execute(
                     update(SizingEntry)
                     .where(
@@ -1431,6 +1643,28 @@ class CopyEngine:
                     )
                     .values(closed=True)
                 )
+                pending_buy_ids = list(
+                    await session.scalars(
+                        select(BuyIntent.copy_trade_id).where(
+                            BuyIntent.token_id == token_id,
+                            BuyIntent.active.is_(True),
+                        )
+                    )
+                )
+                if pending_buy_ids:
+                    await session.execute(
+                        update(CopyTrade)
+                        .where(
+                            CopyTrade.id.in_(pending_buy_ids),
+                            CopyTrade.status == "retry_pending",
+                        )
+                        .values(status="skipped", skip_reason="risk_exit")
+                    )
+                    await session.execute(
+                        update(BuyIntent)
+                        .where(BuyIntent.copy_trade_id.in_(pending_buy_ids))
+                        .values(active=False, last_reason="risk_exit")
+                    )
                 await session.execute(
                     update(ExitIntent)
                     .where(
@@ -1455,6 +1689,8 @@ class CopyEngine:
                     )
                 )
                 await session.commit()
+            if message:
+                await self.notify(message)
         except Exception as exc:
             log.warning("risk_data_unavailable", token_id=token_id, error=str(exc))
 
@@ -1464,6 +1700,242 @@ class CopyEngine:
                 (await session.scalars(select(Position).where(Position.shares > 0))).all()
             )
         await asyncio.gather(*(self._settle_position(position) for position in positions))
+
+    @staticmethod
+    def _delay_buy_intent(intent, reason: str) -> None:
+        intent.attempts += 1
+        wait = min(5, 0.5 * 2 ** min(intent.attempts, 4))
+        intent.next_attempt = Decimal(str(time.time() + wait))
+        intent.last_reason = reason[:240]
+
+    async def retry_buys_once(self) -> None:
+        """Reprice missed entries while the corresponding leader entry is still open."""
+        async with SessionLocal() as session:
+            ids = list(
+                await session.scalars(
+                    select(BuyIntent.copy_trade_id)
+                    .where(
+                        BuyIntent.active.is_(True),
+                        BuyIntent.next_attempt <= Decimal(str(time.time())),
+                    )
+                    .order_by(BuyIntent.next_attempt, BuyIntent.copy_trade_id)
+                    .limit(16)
+                )
+            )
+        await asyncio.gather(*(self._retry_buy(intent_id) for intent_id in ids))
+
+    async def _retry_buy(self, intent_id: int) -> None:
+        async with SessionLocal() as session:
+            intent = await session.get(BuyIntent, intent_id)
+            leader = await session.get(Leader, intent.leader_id) if intent else None
+            leader_pos = (
+                await session.scalar(
+                    select(LeaderPosition).where(
+                        LeaderPosition.leader_id == intent.leader_id,
+                        LeaderPosition.token_id == intent.token_id,
+                    )
+                )
+                if intent
+                else None
+            )
+            later_sell = (
+                await session.scalar(
+                    select(CopyTrade.id)
+                    .where(
+                        CopyTrade.leader_id == intent.leader_id,
+                        CopyTrade.token_id == intent.token_id,
+                        CopyTrade.side == "SELL",
+                        CopyTrade.timestamp >= intent.source_timestamp,
+                    )
+                    .limit(1)
+                )
+                if intent
+                else None
+            )
+            if not intent or not intent.active:
+                return
+            if (
+                not leader
+                or not leader.active
+                or not leader_pos
+                or leader_pos.shares <= 0
+                or later_sell
+            ):
+                intent.active = False
+                intent.last_reason = (
+                    "leader_sold"
+                    if later_sell or not leader_pos or leader_pos.shares <= 0
+                    else "leader_inactive"
+                )
+                trade = await session.get(CopyTrade, intent.copy_trade_id)
+                if trade and trade.status == "retry_pending":
+                    trade.status, trade.skip_reason = "skipped", intent.last_reason
+                await session.commit()
+                return
+            event = LeaderActivity(
+                event_key=f"retry:{intent.copy_trade_id}",
+                timestamp=intent.source_timestamp,
+                condition_id=intent.condition_id,
+                token_id=intent.token_id,
+                side="BUY",
+                size=intent.leader_size,
+                price=intent.leader_price,
+                title=intent.title,
+                outcome=intent.outcome,
+                slug=intent.slug,
+                event_slug=intent.event_slug,
+                trader_name=leader.label or "",
+                trader_address=leader.address,
+                source="retry",
+                received_at=time.time(),
+                received_monotonic=time.monotonic(),
+            )
+        prepared = await self.prepare_copy(event)
+        async with self._execution_slot(event, prepared, 20), SessionLocal() as session:
+            intent = await session.get(BuyIntent, intent_id)
+            trade = await session.get(CopyTrade, intent_id)
+            leader = await session.get(Leader, intent.leader_id) if intent else None
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            if not intent or not intent.active or not trade or not leader or account.paused:
+                return
+            leader_pos = await session.scalar(
+                select(LeaderPosition).where(
+                    LeaderPosition.leader_id == intent.leader_id,
+                    LeaderPosition.token_id == intent.token_id,
+                )
+            )
+            later_sell = await session.scalar(
+                select(CopyTrade.id)
+                .where(
+                    CopyTrade.leader_id == intent.leader_id,
+                    CopyTrade.token_id == intent.token_id,
+                    CopyTrade.side == "SELL",
+                    CopyTrade.timestamp >= intent.source_timestamp,
+                )
+                .limit(1)
+            )
+            if later_sell or not leader_pos or leader_pos.shares <= 0:
+                intent.active = False
+                intent.last_reason = "leader_sold"
+                trade.status, trade.skip_reason = "skipped", "leader_sold"
+                await session.commit()
+                return
+            if prepared.error:
+                detail = str(prepared.error) or type(prepared.error).__name__
+                if detail in {
+                    "market_not_accepting_orders",
+                    "trade_token_mismatch",
+                    "invalid_market_delay",
+                }:
+                    intent.active, intent.last_reason = False, detail
+                    trade.status, trade.skip_reason = "skipped", detail
+                else:
+                    self._delay_buy_intent(intent, "market_data_unavailable")
+                await session.commit()
+                return
+            if prepared.book_error or prepared.book is None:
+                self._delay_buy_intent(intent, "market_data_unavailable")
+                await session.commit()
+                return
+            book = prepared.book
+            policy = await get_execution_policy(session, self.settings)
+            position = await get_position(session, intent.token_id)
+            exposure = position.cost_basis if position else Decimal(0)
+            smart_entry = decision = None
+            if self.settings.smart_sizing_enabled:
+                start = entry_bucket(
+                    intent.source_timestamp, self.settings.smart_sizing_burst_seconds
+                )
+                smart_entry = await session.get(
+                    SizingEntry, (intent.leader_id, intent.token_id, start)
+                )
+                ask = book.asks[0][0] if book.asks else Decimal(0)
+                if not smart_entry:
+                    intent.active, intent.last_reason = False, "sizing_entry_missing"
+                    trade.status, trade.skip_reason = "skipped", intent.last_reason
+                    await session.commit()
+                    return
+                decision = entry_budget(
+                    smart_entry,
+                    ask=ask,
+                    event_price=intent.leader_price,
+                    cash=account.paper_balance,
+                    exposure_room=max(Decimal(0), self.settings.max_outcome_exposure - exposure),
+                    current_max=account.max_trade_size,
+                    fee_rate=prepared.fee_rate,
+                    slippage_price=policy.slippage_price,
+                    min_notional=self.settings.min_copy_notional,
+                    min_shares=book.min_order_size,
+                )
+                if decision.reason:
+                    if decision.reason in self.RETRYABLE_BUY_REASONS:
+                        self._delay_buy_intent(intent, decision.reason)
+                    else:
+                        intent.active, intent.last_reason = False, decision.reason
+                        trade.status, trade.skip_reason = "skipped", decision.reason
+                    await session.commit()
+                    return
+                budget = decision.order_budget
+                reference = decision.reference_price
+            else:
+                capacity = self.calculate_own_buy_capacity(
+                    account, self.settings, prepared.fee_rate
+                )
+                budget = self.calculate_buy_budget(
+                    account,
+                    self.settings,
+                    intent.leader_size * intent.leader_price,
+                    prepared.fee_rate,
+                )
+                budget = min(budget, max(Decimal(0), self.settings.max_outcome_exposure - exposure))
+                budget = self.ensure_book_minimum_budget(
+                    budget, capacity, book, intent.leader_price, policy.slippage_price
+                )
+                reference = intent.leader_price
+            fill = execute_buy_fak_by_budget(
+                book, budget, prepared.fee_rate, reference, slippage_price=policy.slippage_price
+            )
+            if fill.shares <= 0:
+                reason = fill.reason or "no_fill"
+                if reason in self.RETRYABLE_BUY_REASONS:
+                    self._delay_buy_intent(intent, reason)
+                else:
+                    intent.active, intent.last_reason = False, reason
+                    trade.status, trade.skip_reason = "skipped", reason
+                await session.commit()
+                return
+            await apply_fill(
+                session,
+                fill,
+                intent.token_id,
+                "BUY",
+                intent.title,
+                intent.outcome,
+                intent.condition_id,
+                account,
+            )
+            session.add(
+                PaperOrder(
+                    copy_trade_id=trade.id,
+                    token_id=intent.token_id,
+                    side="BUY",
+                    requested_shares=budget / book.asks[0][0],
+                    filled_shares=fill.shares,
+                    average_fill_price=fill.average_price,
+                    fee=fill.fee,
+                    status=fill.status,
+                    reason="deferred_price_retry",
+                )
+            )
+            if smart_entry:
+                smart_entry.spent += fill.notional + fill.fee
+            intent.active, intent.last_reason = False, "filled"
+            trade.status, trade.skip_reason = "executed", None
+            await session.commit()
+            message = self.build_buy_notification(leader, event, fill)
+        await self.notify(
+            message + "\n\n<i>Цена стала допустимой после первоначального пропуска.</i>"
+        )
 
     async def retry_exits_once(self) -> None:
         """Only explicit, still-open intents. Never replay old rejected orders."""
@@ -1518,6 +1990,9 @@ class CopyEngine:
                     if current and current.generation == generation:
                         current.remaining = 0
                         current.last_reason = "position_closed"
+                        await finish_exit_signals(
+                            session, key[1], leader_id=key[0], reason="position_closed"
+                        )
                         await session.commit()
                 return
             event = LeaderActivity(
@@ -1549,6 +2024,9 @@ class CopyEngine:
                 return
             await self._fill_exit(session, intent, account, prepared)
             await session.commit()
+            messages = session.info.pop("notifications", [])
+        for message in messages:
+            await self.notify(message)
 
     async def _fill_exit(self, session, intent, account, prepared):
         pos = await get_position(session, intent.token_id)
@@ -1556,6 +2034,9 @@ class CopyEngine:
         own = holdings.get((intent.token_id, intent.leader_id), Holding())
         if not pos or pos.id != intent.position_id or own.shares <= Decimal("0.00000001"):
             intent.remaining, intent.last_reason = 0, "position_closed"
+            await finish_exit_signals(
+                session, intent.token_id, leader_id=intent.leader_id, reason="position_closed"
+            )
             return
         if warnings:
             intent.last_reason = "ambiguous_inventory"
@@ -1575,6 +2056,8 @@ class CopyEngine:
             )
             intent.last_reason = fill.reason
             if fill.shares > 0:
+                realized_before = account.realized_pnl
+                leader = await session.get(Leader, intent.leader_id)
                 await apply_fill(
                     session,
                     fill,
@@ -1586,6 +2069,12 @@ class CopyEngine:
                     account,
                     cost_to_release=own.cost * fill.shares / own.shares,
                 )
+                if leader:
+                    session.info.setdefault("notifications", []).append(
+                        self.build_sell_notification(
+                            leader, pos, fill, account.realized_pnl - realized_before
+                        )
+                    )
                 intent.remaining = max(Decimal(0), intent.remaining - fill.shares)
                 if intent.remaining <= Decimal("0.00000001"):
                     intent.remaining = 0
@@ -1604,6 +2093,13 @@ class CopyEngine:
                 )
                 trade = await session.get(CopyTrade, intent.copy_trade_id)
                 trade.status, trade.skip_reason = "executed", None
+                if intent.remaining == 0:
+                    await finish_exit_signals(
+                        session,
+                        intent.token_id,
+                        leader_id=intent.leader_id,
+                        reason="exit_completed_in_series",
+                    )
                 intent.attempts = 0
                 log.info(
                     "exit_filled",
@@ -1618,6 +2114,7 @@ class CopyEngine:
         intent.next_attempt = Decimal(str(time.time() + wait))
 
     async def _settle_position(self, snapshot: Position) -> None:
+        message = None
         try:
             async with self._maintenance_slots:
                 payout = await self.client.get_resolution(
@@ -1635,8 +2132,29 @@ class CopyEngine:
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
                 proceeds = position.shares * payout
                 pnl = proceeds - position.cost_basis
+                link_slugs = (
+                    await session.execute(
+                        select(SourceObservation.slug, SourceObservation.event_slug)
+                        .where(
+                            SourceObservation.token_id == position.token_id,
+                            SourceObservation.slug != "",
+                        )
+                        .order_by(SourceObservation.timestamp.desc())
+                        .limit(1)
+                    )
+                ).first()
+                message = self.build_settlement_notification(
+                    position.title,
+                    position.outcome,
+                    position.shares,
+                    payout,
+                    position.cost_basis,
+                    link_slugs[0] if link_slugs else "",
+                    link_slugs[1] if link_slugs else "",
+                )
                 account.paper_balance += proceeds
                 account.realized_pnl += pnl
+                await finish_exit_signals(session, position.token_id, reason="market_settled")
                 await session.execute(
                     update(SizingEntry)
                     .where(
@@ -1654,6 +2172,28 @@ class CopyEngine:
                         generation=ExitIntent.generation + 1,
                         last_reason="market_settled",
                     )
+                )
+                pending_buy_ids = list(
+                    await session.scalars(
+                        select(BuyIntent.copy_trade_id).where(
+                            BuyIntent.token_id == position.token_id,
+                            BuyIntent.active.is_(True),
+                        )
+                    )
+                )
+                if pending_buy_ids:
+                    await session.execute(
+                        update(CopyTrade)
+                        .where(
+                            CopyTrade.id.in_(pending_buy_ids),
+                            CopyTrade.status == "retry_pending",
+                        )
+                        .values(status="skipped", skip_reason="market_settled")
+                    )
+                await session.execute(
+                    update(BuyIntent)
+                    .where(BuyIntent.token_id == position.token_id, BuyIntent.active.is_(True))
+                    .values(active=False, last_reason="market_settled")
                 )
                 session.add(
                     PaperOrder(
@@ -1676,6 +2216,8 @@ class CopyEngine:
                     rule.enabled = False
                 await session.delete(position)
                 await session.commit()
+            if message:
+                await self.notify(message)
         except Exception as exc:
             log.warning(
                 "settlement_check_failed", condition_id=snapshot.condition_id, error=str(exc)

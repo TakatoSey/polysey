@@ -41,6 +41,8 @@ async def test_activity_includes_public_polymarket_name():
             "size": 5,
             "price": 0.4,
             "title": "Market",
+            "slug": "market-child",
+            "eventSlug": "market-parent",
             "outcome": "Yes",
             "name": "blackewolf83",
             "pseudonym": "Radiant-Metaphor",
@@ -50,8 +52,32 @@ async def test_activity_includes_public_polymarket_name():
     try:
         events = await client.get_activity("0x" + "1" * 40)
         assert events[0].trader_name == "blackewolf83"
+        assert events[0].slug == "market-child"
+        assert events[0].event_slug == "market-parent"
         assert events[0].received_at > 0
         assert events[0].received_monotonic > 0
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"price": "0.01", "side": "SELL"}, Decimal("0.01")),
+        ({"price": "0.5", "side": ""}, None),
+        ({"price": "NaN", "side": "BUY"}, None),
+    ],
+)
+async def test_last_trade_mark_rejects_no_trade_sentinel_and_invalid_prices(payload, expected):
+    def handler(request):
+        assert request.url.path == "/last-trade-price"
+        assert request.url.params["token_id"] == "11"
+        return httpx.Response(200, json=payload)
+
+    client = client_for(handler)
+    try:
+        assert await client.get_last_trade_price("11") == expected
     finally:
         await client.close()
 

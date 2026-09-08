@@ -51,4 +51,48 @@ async def test_api_failure_and_empty_bid_are_different_states():
     client.get_book.return_value = SimpleNamespace(bids=[])
     quote, _, note = await panel(client)._position_quote(POSITION)
     assert quote is None
-    assert "Нет заявок" in note
+    assert "last trade" in note
+
+
+@pytest.mark.asyncio
+async def test_empty_bid_uses_last_trade_mark_without_claiming_executable_sell():
+    client = AsyncMock()
+    client.get_resolution.return_value = None
+    client.get_book.return_value = SimpleNamespace(bids=[])
+    client.get_last_trade_price.return_value = Decimal("0.01")
+    quote, _, note = await panel(client)._position_quote(POSITION)
+    assert quote == Decimal("0.01")
+    assert "Mark" in note
+    assert "исполнимой" in note
+
+
+@pytest.mark.asyncio
+async def test_portfolio_screen_shows_price_value_pnl_percent_and_win_payout():
+    app = panel(AsyncMock())
+    row = SimpleNamespace(
+        id=1,
+        condition_id="market",
+        token_id="down",
+        title="Bitcoin Up or Down?",
+        outcome="Down",
+        shares=Decimal("14.252714"),
+        average_price=Decimal("0.463"),
+        cost_basis=Decimal("6.60"),
+    )
+    account = SimpleNamespace(paper_balance=Decimal("93.40"), realized_pnl=Decimal(0))
+    app._portfolio_data_v2 = AsyncMock(return_value=([row], account))
+    app._position_quote = AsyncMock(
+        return_value=(
+            Decimal("0.62"),
+            "⏳ Результат ещё не подтверждён",
+            "Mark по последней сделке",
+        )
+    )
+
+    text = await app._portfolio_text_v2()
+
+    assert "Средняя/сейчас: 46.30¢ → 62.00¢" in text
+    assert "Затраты/оценка: $6.60 → $8.84" in text
+    assert "PNL: +$2.24 (+33.9%)" in text
+    assert "При победе: $14.25" in text
+    assert "Общий PNL: +$2.24 (+33.9%)" in text
