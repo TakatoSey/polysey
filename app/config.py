@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         default=Decimal("3"), ge=1, le=10, alias="SMART_SIZING_MAX_MULTIPLIER"
     )
     smart_sizing_burst_seconds: int = Field(
-        default=2, ge=1, le=10, alias="SMART_SIZING_BURST_SECONDS"
+        default=5, ge=1, le=15, alias="SMART_SIZING_BURST_SECONDS"
     )
     smart_sizing_min_samples: int = Field(default=3, ge=1, le=100, alias="SMART_SIZING_MIN_SAMPLES")
     smart_sizing_stats_refresh_seconds: int = Field(

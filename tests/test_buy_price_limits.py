@@ -143,7 +143,14 @@ def test_history_export_retains_matching_ids_without_private_configuration():
 
     leader = SimpleNamespace(id=1, address="0x1", label="gningd", telegram_token="secret")
     result = export_history([], [], [], [leader])
-    assert result["leaders"] == [{"id": 1, "address": "0x1", "label": "gningd"}]
+    assert result["leaders"] == [
+        {
+            "id": 1,
+            "address": "0x1",
+            "label": "gningd",
+            "fixed_trade_size": None,
+        }
+    ]
     assert "telegram_token" not in str(result)
 
 

@@ -107,14 +107,14 @@ class CopyEngine:
         total_debit = fill.notional + fill.fee
         return (
             "📋 <b>Copy Trade: BUY</b>\n\n"
-            f'🟢 Скопировано у <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
-            f"📊 Рынок: <b>{html.escape(event.title)}</b>\n"
-            f"🎯 Позиция: <b>{html.escape(event.outcome)}</b>\n\n"
-            f"💰 Лидер купил: <b>${event.size * event.price:.2f}</b> ({event.size:.2f} shares)\n"
-            f"📈 Цена лидера: <b>{event.price * 100:.1f}¢</b>\n\n"
-            f"💵 Мы купили: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
-            f"🏷️ Цена входа: <b>{fill.average_price * 100:.1f}¢</b>\n"
-            f"Комиссия: ${fill.fee:.4f} · списано ${total_debit:.2f}"
+            f'🟢 Copied from <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
+            f"📊 <b>Market:</b> {html.escape(event.title)}\n"
+            f"🎯 <b>Position:</b> {html.escape(event.outcome)}\n\n"
+            f"💰 <b>Leader bought:</b> ${event.size * event.price:.2f} ({event.size:.2f} shares)\n"
+            f"📈 <b>Leader Price:</b> {event.price * 100:.1f}¢\n\n"
+            f"💵 <b>You bought:</b> ${fill.notional:.2f} ({fill.shares:.2f} shares)\n"
+            f"🏷️ <b>Entry Price:</b> {fill.average_price * 100:.1f}¢\n\n"
+            f"<i>Fee ${fill.fee:.4f} · Total ${total_debit:.2f}</i>"
         )
 
     @staticmethod
@@ -126,13 +126,13 @@ class CopyEngine:
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         return (
             "📋 <b>Copy Trade: SELL</b>\n\n"
-            f'🔴 Продано вслед за <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
-            f"📊 Рынок: <b>{html.escape(position.title)}</b>\n"
-            f"🎯 Позиция: <b>{html.escape(position.outcome)}</b>\n\n"
-            f"💵 Продано: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
-            f"🏷️ Цена выхода: <b>{fill.average_price * 100:.1f}¢</b>\n"
-            f"Комиссия: ${fill.fee:.4f} · получено ${proceeds:.2f}\n"
-            f"{icon} PNL продажи: <b>{pnl_text}</b>"
+            f'🔴 Copied from <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
+            f"📊 <b>Market:</b> {html.escape(position.title)}\n"
+            f"🎯 <b>Position:</b> {html.escape(position.outcome)}\n\n"
+            f"💵 <b>You sold:</b> ${fill.notional:.2f} ({fill.shares:.2f} shares)\n"
+            f"🏷️ <b>Exit Price:</b> {fill.average_price * 100:.1f}¢\n"
+            f"{icon} <b>PnL:</b> {pnl_text}\n\n"
+            f"<i>Fee ${fill.fee:.4f} · Received ${proceeds:.2f}</i>"
         )
 
     @staticmethod
@@ -153,23 +153,23 @@ class CopyEngine:
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         result = "WON" if payout == 1 else "LOST" if payout == 0 else "SPLIT"
         lines = [
-            "🎉 <b>Позиция автоматически обработана</b>",
+            "🎉 <b>Positions Auto-Processed!</b>",
             "",
             f"1. {result_icon} <b>{html.escape(title)}</b>",
-            f"  ├ Исход: <b>{html.escape(outcome)} · {result}</b>",
-            f"  ├ Shares: {shares:.6f}" + (" (списаны)" if payout == 0 else ""),
+            f"  ├ Outcome: <b>{html.escape(outcome)} {result}</b>",
+            f"  ├ Shares: {shares:.6f}" + (" (cleared)" if payout == 0 else ""),
         ]
         if proceeds > 0:
-            lines.append(f"  ├ Выплата: <b>${proceeds:.2f}</b>")
-        lines.append(f"  ├ PNL: {pnl_icon} <b>{pnl_text}</b>")
+            lines.append(f"  ├ Payout: <b>${proceeds:.2f}</b>")
+        lines.append(f"  ├ PnL: {pnl_icon} <b>{pnl_text}</b>")
         if slug:
             safe_slug = html.escape(slug.strip("/"), quote=True)
             safe_event_slug = html.escape((event_slug or slug).strip("/"), quote=True)
             lines.append(
-                f'  └ <a href="https://polymarket.com/event/{safe_event_slug}/{safe_slug}">Открыть на Polymarket</a>'
+                f'  └ <a href="https://polymarket.com/event/{safe_event_slug}/{safe_slug}">View on Polymarket</a>'
             )
         if proceeds > 0:
-            lines.extend(("", "━━━━━━━━━━━━━━━━━━━━", f"💰 Получено: <b>${proceeds:.2f}</b>"))
+            lines.extend(("", "━━━━━━━━━━━━━━━━━━━━", f"💰 <b>Total Claimed: ${proceeds:.2f}</b>"))
         return "\n".join(lines)
 
     @staticmethod
@@ -834,7 +834,8 @@ class CopyEngine:
             exchange_delay_seconds=prepared.exchange_delay,
         )
 
-    async def _get_sizing_entry(self, session, leader_id, event, account):
+    async def _get_sizing_entry(self, session, leader: Leader, event, account):
+        leader_id = leader.id
         seconds = self.settings.smart_sizing_burst_seconds
         start = entry_bucket(event.timestamp, seconds)
         # A SELL is a barrier even if we had no position to sell. A later bucket
@@ -888,25 +889,39 @@ class CopyEngine:
             if overlap is not None or old_fill is not None:
                 return None, "sizing_entry_closed"
             profile = await session.get(LeaderSizingProfile, leader_id)
-            if (
-                profile is None
-                or profile.reference_notional <= 0
-                or profile.sample_count < self.settings.smart_sizing_min_samples
-                or profile.bucket_seconds != seconds
-                or profile.sample_end > start
-                or profile.sample_end < int(time.time()) - 7 * 86400
-            ):
-                return None, "sizing_profile_unavailable"
+            fixed_size = leader.fixed_trade_size
+            if fixed_size is not None and (not fixed_size.is_finite() or fixed_size <= 0):
+                fixed_size = None
+            if fixed_size is None:
+                if (
+                    profile is None
+                    or profile.reference_notional <= 0
+                    or profile.sample_count < self.settings.smart_sizing_min_samples
+                    or profile.bucket_seconds != seconds
+                    or profile.sample_end > start
+                    or profile.sample_end < int(time.time()) - 7 * 86400
+                ):
+                    return None, "sizing_profile_unavailable"
+                reference_notional = profile.reference_notional
+                base_budget = account.paper_balance * self.settings.copy_balance_pct
+                max_budget = account.max_trade_size
+                max_multiplier = self.settings.smart_sizing_max_multiplier
+            else:
+                reference_notional = max(event.size * event.price, Decimal("0.00000001"))
+                base_budget = fixed_size
+                max_budget = min(fixed_size, account.max_trade_size)
+                # Zero is an internal persisted marker for fixed-per-series mode.
+                max_multiplier = Decimal(0)
             entry = SizingEntry(
                 leader_id=leader_id,
                 token_id=event.token_id,
                 bucket_start=start,
                 bucket_seconds=seconds,
                 cash_at_start=account.paper_balance,
-                base_budget=account.paper_balance * self.settings.copy_balance_pct,
-                reference_notional=profile.reference_notional,
-                max_budget=account.max_trade_size,
-                max_multiplier=self.settings.smart_sizing_max_multiplier,
+                base_budget=base_budget,
+                reference_notional=reference_notional,
+                max_budget=max_budget,
+                max_multiplier=max_multiplier,
                 leader_notional=Decimal(0),
                 leader_shares=Decimal(0),
                 spent=Decimal(0),
@@ -1142,7 +1157,9 @@ class CopyEngine:
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
             return
-        smart_buy = event.side == "BUY" and self.settings.smart_sizing_enabled
+        fixed_size = leader.fixed_trade_size
+        leader_fixed = bool(fixed_size is not None and fixed_size.is_finite() and fixed_size > 0)
+        smart_buy = event.side == "BUY" and (self.settings.smart_sizing_enabled or leader_fixed)
         smart_entry = decision = None
         if smart_buy:
             # Sizing needs the executable ask. No fixed-dollar budget is applied.
@@ -1199,7 +1216,7 @@ class CopyEngine:
             if event.side == "BUY":
                 if smart_buy:
                     smart_entry, reason = await self._get_sizing_entry(
-                        session, leader.id, event, account
+                        session, leader, event, account
                     )
                     if smart_entry is None:
                         copy_trade.status, copy_trade.skip_reason = "skipped", reason
@@ -1231,6 +1248,7 @@ class CopyEngine:
                             leader_notional=smart_entry.leader_notional,
                             leader_vwap=decision.leader_vwap,
                             price_factor=decision.price_factor,
+                            odds_factor=decision.odds_factor,
                             target_budget=decision.target_budget,
                             spent_before=smart_entry.spent,
                             order_budget=decision.order_budget,
@@ -1247,6 +1265,7 @@ class CopyEngine:
                         leader_entry=str(smart_entry.leader_notional),
                         leader_vwap=str(decision.leader_vwap),
                         price_factor=str(decision.price_factor),
+                        odds_factor=str(decision.odds_factor),
                         target=str(decision.target_budget),
                         spent=str(smart_entry.spent),
                         order_budget=str(buy_budget),
@@ -1842,7 +1861,11 @@ class CopyEngine:
             position = await get_position(session, intent.token_id)
             exposure = position.cost_basis if position else Decimal(0)
             smart_entry = decision = None
-            if self.settings.smart_sizing_enabled:
+            fixed_size = leader.fixed_trade_size
+            use_smart_entry = self.settings.smart_sizing_enabled or bool(
+                fixed_size is not None and fixed_size.is_finite() and fixed_size > 0
+            )
+            if use_smart_entry:
                 start = entry_bucket(
                     intent.source_timestamp, self.settings.smart_sizing_burst_seconds
                 )

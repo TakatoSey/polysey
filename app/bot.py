@@ -55,6 +55,7 @@ SIZING_REASONS = {
 
 class LeaderForm(StatesGroup):
     address = State()
+    fixed_size = State()
 
 
 class TelegramApp:
@@ -153,6 +154,12 @@ class TelegramApp:
                 account.max_trade_size,
                 account.paper_balance * self.settings.copy_balance_pct,
             )
+        fixed_candidates = [
+            min(row.fixed_trade_size, account.max_trade_size, account.paper_balance)
+            for row in leaders
+            if row.active and row.fixed_trade_size is not None
+        ]
+        max_next_buy = max([max_next_buy, *fixed_candidates])
         cash_warning = (
             "\n\n⚠️ Новые покупки сейчас невозможны: верхний предел бюджета "
             f"${max_next_buy:.2f} ниже минимума ${self.settings.min_copy_notional:.2f}."
@@ -162,7 +169,10 @@ class TelegramApp:
         sizing_status = ""
         if self.settings.smart_sizing_enabled:
             ready_count = sum(
-                1 for row in leaders if row.active and self._sizing_profile_ready(row.id)
+                1
+                for row in leaders
+                if row.active
+                and (row.fixed_trade_size is not None or self._sizing_profile_ready(row.id))
             )
             active_count = sum(1 for row in leaders if row.active)
             sizing_status = (
@@ -191,10 +201,18 @@ class TelegramApp:
             and profile.sample_count >= self.settings.smart_sizing_min_samples
         )
 
-    def _leader_sizing_text(self, leader_id: int) -> str:
+    def _leader_sizing_text(self, leader_id: int, fixed_size: Decimal | None = None) -> str:
+        profile = self.engine._leader_sizing_profiles.get(leader_id)
+        if fixed_size is not None:
+            stats = (
+                f"Типичная серия трейдера: ${profile.reference_notional:.2f} · "
+                f"{profile.sample_count} в выборке\n"
+                if self._sizing_profile_ready(leader_id)
+                else "Статистика серий ещё собирается; фиксированному режиму она не нужна.\n"
+            )
+            return stats
         if not self.settings.smart_sizing_enabled:
             return "Размер входа: <b>классический режим</b>\n"
-        profile = self.engine._leader_sizing_profiles.get(leader_id)
         if not self._sizing_profile_ready(leader_id):
             count = profile.sample_count if profile else 0
             return (
@@ -227,8 +245,11 @@ class TelegramApp:
         for row in current:
             icon = "🟢" if row.active else "⚪"
             name = row.label or f"{row.address[:6]}…{row.address[-4:]}"
-            lines.append(f"{icon} <b>{html.escape(name)}</b>")
-            builder.button(text=f"{icon} {name[:28]}", callback_data=f"leader_view:{row.id}:{page}")
+            mode = f" · ${row.fixed_trade_size:.2f} фикс." if row.fixed_trade_size else ""
+            lines.append(f"{icon} <b>{html.escape(name)}</b>{mode}")
+            builder.button(
+                text=f"{icon} {name[:22]}{mode}", callback_data=f"leader_view:{row.id}:{page}"
+            )
             builder.button(
                 text="⏸" if row.active else "▶️", callback_data=f"leader_toggle:{row.id}:{page}"
             )
@@ -271,6 +292,11 @@ class TelegramApp:
             return
         status = "🟢 активно" if row.active else "⚪ приостановлено"
         label = html.escape(row.label or f"{row.address[:6]}…{row.address[-4:]}")
+        sizing_mode = (
+            f"Фиксировано: ${row.fixed_trade_size:.2f} на серию"
+            if row.fixed_trade_size is not None
+            else "Адаптивно: сумма + odds + размер серии"
+        )
         executed = sum(1 for trade in recent if trade.status == "executed")
         rejected = sum(1 for trade in recent if trade.status in {"skipped", "failed"})
         last_result = "событий пока нет"
@@ -292,9 +318,10 @@ class TelegramApp:
         text = (
             f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
+            f"Размер копии: <b>{sizing_mode}</b>\n"
             f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
             f"Сделки: {buys} покупок · {sells} продаж\n"
-            + self._leader_sizing_text(leader_id)
+            + self._leader_sizing_text(leader_id, row.fixed_trade_size)
             + f"Реализованный PNL: <b>{pnl_label}</b>\n"
             f"Открытая себестоимость: <b>${open_cost:.4f}</b>\n"
             "<i>По каждому исходу и лидеру · комиссии и выплаты учтены</i>\n"
@@ -306,9 +333,18 @@ class TelegramApp:
             text="⏸ Приостановить" if row.active else "▶️ Возобновить",
             callback_data=f"leader_toggle:{row.id}:{page}",
         )
+        builder.button(
+            text="💵 Фиксированная сумма",
+            callback_data=f"leader_fixed:{row.id}:{page}",
+        )
+        if row.fixed_trade_size is not None:
+            builder.button(
+                text="🧠 Вернуть адаптивный размер",
+                callback_data=f"leader_fixed_clear:{row.id}:{page}",
+            )
         builder.button(text="🗑 Удалить", callback_data=f"leader_remove:{row.id}:{page}")
         builder.button(text="⬅️ К списку", callback_data=f"leaders:{page}")
-        builder.adjust(1, 1, 1)
+        builder.adjust(1)
         await self._edit_panel(text, builder.as_markup(), chat_id)
 
     async def _portfolio_data_v2(self):
@@ -360,17 +396,13 @@ class TelegramApp:
         )
 
     async def _portfolio_text_v2(self, page: int = 0) -> str:
-        rows, account = await self._portfolio_data_v2()
+        rows, _account = await self._portfolio_data_v2()
         per_page = 5
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         page = max(0, min(page, total_pages - 1))
-        lines = [
-            "<b>🗂️ Все позиции · PAPER</b>",
-            f"Свободно: <b>${account.paper_balance:.2f}</b>",
-            f"Зафиксированный PNL: ${account.realized_pnl:+.2f}",
-        ]
+        lines = ["🗂️ <b>All Positions</b>"]
         if not rows:
-            lines.append("\nОткрытых позиций нет.")
+            lines.append("\nNo open positions.")
             return "\n".join(lines)
 
         quote_slots = asyncio.Semaphore(8)
@@ -392,7 +424,7 @@ class TelegramApp:
         )
         unknown_count = sum(quote is None for _, quote, _, _ in quotes)
 
-        for index, (row, quote, status, note) in enumerate(
+        for index, (row, quote, _status, note) in enumerate(
             quotes[page * per_page : (page + 1) * per_page],
             start=page * per_page + 1,
         ):
@@ -414,26 +446,27 @@ class TelegramApp:
                 else "—"
             )
             lines.append(
-                f"\n<b>{index}. {html.escape(row.title[:95])}</b>\n"
-                f"  ├ Позиция: {row.shares:.3f} {html.escape(row.outcome)}\n"
-                f"  ├ Средняя/сейчас: {row.average_price * 100:.2f}¢ → {now}\n"
-                f"  ├ Затраты/оценка: ${row.cost_basis:.2f} → {value_text}\n"
-                f"  ├ PNL: {pnl_text}\n"
-                f"  ├ При победе: ${row.shares:.2f}\n"
-                f"  └ Статус: 🟢 открыт\n"
-                f"  <i>{html.escape(note)}</i>"
+                f"\n{index}. <b>{html.escape(row.title[:95])}</b>\n"
+                f"  ├ Position: {row.shares:.2f} {html.escape(row.outcome)}\n"
+                f"  ├ Avg/Now: {row.average_price * 100:.2f}¢ → {now}\n"
+                f"  ├ Cost/Value: ${row.cost_basis:.2f} → {value_text}\n"
+                f"  ├ PnL: {pnl_text}\n"
+                f"  ├ To Win: ${row.shares:.2f}\n"
+                f"  └ Status: 🟢 Open"
             )
 
         if unknown_count:
-            lines.append(f"\n<b>Итоговый PNL: —</b> · нет mark у {unknown_count} поз.")
+            lines.append(f"\n<b>Total PnL: —</b> · no mark for {unknown_count} position(s)")
         else:
             total_pnl = known_value - total_cost
             total_pct = total_pnl / total_cost * 100 if total_cost else Decimal(0)
             icon = "📈" if total_pnl >= 0 else "📉"
             total_pnl_text = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
-            lines.append(f"\n<b>{icon} Общий PNL: {total_pnl_text} ({total_pct:+.1f}%)</b>")
-        lines.append(f"\nСтраница {page + 1}/{total_pages}. Нажмите на позицию для деталей.")
-        lines.append(f"Обновлено: {datetime.now(UTC):%H:%M:%S} UTC")
+            lines.append(f"\n<b>{icon} Total PnL: {total_pnl_text} ({total_pct:+.1f}%)</b>")
+        if total_pages > 1:
+            lines.append(f"\nPage {page + 1}/{total_pages}")
+        if any("Mark" in note for _, _, _, note in quotes):
+            lines.append("\n<i>ℹ️ Now uses last-trade mark when no executable bid exists.</i>")
         return "\n".join(lines)
 
     def _portfolio_keyboard_v2(self, rows, page: int = 0):
@@ -763,7 +796,7 @@ class TelegramApp:
             "<b>Размер копирования · адаптивный</b>\n"
             f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · сейчас ${base:.2f}\n"
             f"Размер серии лидера / его типичный вход · до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
-            "Цена хуже средней в серии → бюджет уменьшается.\n"
+            "Odds мягко меняют размер; худшая цена исполнения уменьшает бюджет.\n"
             f"Максимум на серию: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
             f"Покупки одного исхода за {self.settings.smart_sizing_burst_seconds} с делят один бюджет.\n"
             "/setsize не влияет на адаптивный режим. Максимум: /setmax 30"
@@ -780,14 +813,17 @@ class TelegramApp:
             "<b>💵 Как рассчитывается вход</b>\n\n"
             f"1. База — {self.settings.copy_balance_pct * 100:.1f}% свободных денег в начале серии.\n"
             "2. Масштаб — сумма BUY трейдера в серии / его типичная серия.\n"
-            f"3. Масштаб ограничен {self.settings.smart_sizing_max_multiplier:g}×. "
+            "3. Цена контракта мягко корректирует размер: низкие odds уменьшают его, "
+            "высокие немного увеличивают. Это не считается точной вероятностью.\n"
+            f"4. Масштаб ограничен {self.settings.smart_sizing_max_multiplier:g}×. "
             "Если наша цена выше средней цены трейдера в серии, бюджет уменьшается "
             "в отношении этих цен. Лучшая цена бюджет не увеличивает.\n"
-            "4. Из целевого бюджета вычитаем уже потраченное в этой серии, включая комиссии.\n\n"
+            "5. Из целевого бюджета вычитаем уже потраченное в этой серии, включая комиссии.\n\n"
             f"Серия — трейдер + исход + фиксированное окно {self.settings.smart_sizing_burst_seconds} с "
             "по времени сделки. На границе окна близкие сделки могут разделиться. "
             "Бот не ждёт окончания окна. Мелкие добавки накапливаются только внутри него.\n\n"
-            "Это модель размера позиции, не оценка вероятности победы или капитала трейдера. "
+            "Пять покупок по $20 внутри окна считаются одной серией на $100. "
+            "Для каждого лидера на его экране можно задать фиксированный бюджет серии. "
             "Slippage, доступные деньги и лимит на исход остаются обязательными.\n\n"
             "<b>/setmax 30</b> — потолок серии с комиссиями. "
             "/setsize действует только в классическом режиме. "
@@ -837,6 +873,7 @@ class TelegramApp:
         self.dp.message.register(self.toggle, Command("pause"))
         self.dp.message.register(self.toggle, Command("resume"))
         self.dp.message.register(self.receive_leader, StateFilter(LeaderForm.address))
+        self.dp.message.register(self.receive_leader_fixed, StateFilter(LeaderForm.fixed_size))
         self.dp.callback_query.register(self.callback)
 
     async def start(self, message: Message, state: FSMContext | None = None) -> None:
@@ -927,6 +964,40 @@ class TelegramApp:
             return
         await state.clear()
         await self._save_leader(address, message.chat.id)
+
+    async def receive_leader_fixed(self, message: Message, state: FSMContext) -> None:
+        if not self._allowed(message):
+            return
+        data = await state.get_data()
+        leader_id, page = data.get("leader_id"), data.get("page", 0)
+        await self._delete_input(message)
+        try:
+            value = Decimal((message.text or "").strip().replace(",", "."))
+        except InvalidOperation:
+            value = Decimal(0)
+        async with SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            leader = await session.get(Leader, leader_id) if leader_id else None
+            if (
+                not leader
+                or not value.is_finite()
+                or value < self.settings.min_copy_notional
+                or value > account.max_trade_size
+            ):
+                builder = InlineKeyboardBuilder()
+                if leader_id:
+                    builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
+                await self._edit_panel(
+                    f"Введите сумму от ${self.settings.min_copy_notional:.2f} "
+                    f"до ${account.max_trade_size:.2f}.",
+                    builder.as_markup(),
+                    message.chat.id,
+                )
+                return
+            leader.fixed_trade_size = value
+            await session.commit()
+        await state.clear()
+        await self._leader_detail(leader_id, page, message.chat.id)
 
     async def _save_leader(self, address: str, chat_id: int) -> None:
         if not ADDRESS_RE.fullmatch(address):
@@ -1132,12 +1203,41 @@ class TelegramApp:
             await self._leaders_panel(int(data.split(":", 1)[1]), chat_id)
         elif data.startswith("leader_view:"):
             _, raw_id, raw_page = data.split(":")
+            await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
             await self._leader_detail(int(raw_id), int(raw_page), chat_id)
         elif data == "leader_add":
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).set_state(LeaderForm.address)
             await self._edit_panel(
                 "<b>➕ Добавление лидера</b>\nОтправь EVM-адрес кошелька (0x + 40 hex-символов).",
                 self._back(),
+                chat_id,
+            )
+        elif data.startswith("leader_fixed_clear:"):
+            _, raw_id, raw_page = data.split(":")
+            leader_id, page = int(raw_id), int(raw_page)
+            async with SessionLocal() as session:
+                row = await session.get(Leader, leader_id)
+                if row:
+                    row.fixed_trade_size = None
+                await session.commit()
+            await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
+            await self._leader_detail(leader_id, page, chat_id)
+        elif data.startswith("leader_fixed:"):
+            _, raw_id, raw_page = data.split(":")
+            leader_id, page = int(raw_id), int(raw_page)
+            context = self.dp.fsm.get_context(self.bot, chat_id, chat_id)
+            await context.set_state(LeaderForm.fixed_size)
+            await context.update_data(leader_id=leader_id, page=page)
+            async with SessionLocal() as session:
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
+            await self._edit_panel(
+                "<b>💵 Фиксированная сумма</b>\n\n"
+                "Отправьте сумму в долларах. Она станет общим бюджетом одной серии "
+                "покупок этого трейдера, включая комиссии.\n\n"
+                f"Допустимо: ${self.settings.min_copy_notional:.2f}–${account.max_trade_size:.2f}",
+                builder.as_markup(),
                 chat_id,
             )
         elif data.startswith("leader_remove_confirm:"):

@@ -45,3 +45,13 @@ async def init_db() -> None:
 
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
+        # create_all does not add columns to an existing production table.
+        if connection.dialect.name == "postgresql":
+            await connection.execute(
+                text("ALTER TABLE leaders ADD COLUMN IF NOT EXISTS fixed_trade_size NUMERIC(20, 8)")
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE sizing_audits ADD COLUMN IF NOT EXISTS odds_factor NUMERIC(20, 10)"
+                )
+            )

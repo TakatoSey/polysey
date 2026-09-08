@@ -1,4 +1,5 @@
 """Regression tests for balance-based, cumulative entry allocation."""
+
 import asyncio
 import time
 from datetime import UTC, datetime
@@ -81,9 +82,15 @@ def decision(state=None, **changes):
 
 def test_sampling_groups_fragments_per_token_and_source_bucket():
     sample = sample_entries(
-        [event("a", "10"), event("b", "10", timestamp=101),
-         event("c", "40", timestamp=102), event("d", "60", token="other")],
-        before=106, seconds=2, min_samples=3,
+        [
+            event("a", "10"),
+            event("b", "10", timestamp=101),
+            event("c", "40", timestamp=102),
+            event("d", "60", token="other"),
+        ],
+        before=106,
+        seconds=2,
+        min_samples=3,
     )
     assert sample.reference_notional == 40
     assert sample.sample_count == 3
@@ -94,7 +101,9 @@ def test_sampling_deduplicates_events_before_summing():
     same = event("duplicate", "10")
     sample = sample_entries(
         [same, same, event("other", "30", timestamp=102)],
-        before=104, seconds=2, min_samples=2,
+        before=104,
+        seconds=2,
+        min_samples=2,
     )
     assert sample.reference_notional == 20
     assert sample.sample_count == 2
@@ -104,7 +113,9 @@ def test_sampling_trims_extremes_not_fragments():
     notionals = ["1"] + ["20"] * 8 + ["1000"]
     sample = sample_entries(
         [event(str(i), amount, timestamp=100 + i * 2) for i, amount in enumerate(notionals)],
-        before=120, seconds=2, min_samples=3,
+        before=120,
+        seconds=2,
+        min_samples=3,
     )
     assert sample.reference_notional == 20
     assert sample.sample_count == 10
@@ -113,11 +124,15 @@ def test_sampling_trims_extremes_not_fragments():
 def test_sampling_excludes_open_future_and_older_than_seven_day_buckets():
     cutoff = 1_800_000_101
     sample = sample_entries(
-        [event("closed", "20", timestamp=cutoff - 3),
-         event("open", "200", timestamp=cutoff - 1),
-         event("future", "2000", timestamp=cutoff + 1),
-         event("ancient", "3000", timestamp=cutoff - 7 * 86400 - 3)],
-        before=cutoff, seconds=2, min_samples=1,
+        [
+            event("closed", "20", timestamp=cutoff - 3),
+            event("open", "200", timestamp=cutoff - 1),
+            event("future", "2000", timestamp=cutoff + 1),
+            event("ancient", "3000", timestamp=cutoff - 7 * 86400 - 3),
+        ],
+        before=cutoff,
+        seconds=2,
+        min_samples=1,
     )
     assert sample.reference_notional == 20
     assert sample.sample_count == 1
@@ -126,10 +141,15 @@ def test_sampling_excludes_open_future_and_older_than_seven_day_buckets():
 
 def test_sampling_excludes_buy_sell_mixtures_even_if_sell_seen_first():
     sample = sample_entries(
-        [event("sell", "10", side="SELL"), event("buy", "100"),
-         event("valid", "20", timestamp=102),
-         event("sell-only", "99", timestamp=104, side="SELL")],
-        before=106, seconds=2, min_samples=1,
+        [
+            event("sell", "10", side="SELL"),
+            event("buy", "100"),
+            event("valid", "20", timestamp=102),
+            event("sell-only", "99", timestamp=104, side="SELL"),
+        ],
+        before=106,
+        seconds=2,
+        min_samples=1,
     )
     assert sample.reference_notional == 20
     assert sample.sample_count == 1
@@ -138,8 +158,7 @@ def test_sampling_excludes_buy_sell_mixtures_even_if_sell_seen_first():
 def test_sampling_sell_only_and_invalid_buys_do_not_meet_sample_minimum():
     invalid = event("invalid", "20")
     invalid.size = D("NaN")
-    activities = [event("sell", "20", side="SELL"), invalid,
-                  event("valid", "20", timestamp=102)]
+    activities = [event("sell", "20", side="SELL"), invalid, event("valid", "20", timestamp=102)]
     assert sample_entries(activities, before=104, seconds=2, min_samples=2) is None
 
 
@@ -150,7 +169,9 @@ def test_sampling_does_not_leak_current_burst_into_reference():
     assert sample.sample_end == 100
 
 
-@pytest.mark.parametrize("timestamp,seconds,expected", [(100, 2, 100), (101, 2, 100), (104, 3, 102)])
+@pytest.mark.parametrize(
+    "timestamp,seconds,expected", [(100, 2, 100), (101, 2, 100), (104, 3, 102)]
+)
 def test_bucket_uses_source_time_not_arrival_time(timestamp, seconds, expected):
     assert entry_bucket(timestamp, seconds) == expected
 
@@ -206,12 +227,59 @@ def test_entry_start_max_budget_cannot_be_raised_mid_burst():
     assert result.order_budget == 3
 
 
-@pytest.mark.parametrize("minimum", [{"min_notional": D(11)}, {"min_shares": D(21)}])
-def test_minimum_never_inflates_a_budget(minimum):
+@pytest.mark.parametrize(
+    ("minimum", "expected"),
+    [({"min_notional": D(11)}, D(11)), ({"min_shares": D(21)}, D("10.5"))],
+)
+def test_meaningful_entry_is_raised_to_executable_minimum(minimum, expected):
     result = decision(**minimum)
-    assert result.target_budget == 10
-    assert result.order_budget == 10
-    assert result.reason == "sizing_below_minimum"
+    assert result.target_budget == expected
+    assert result.order_budget == expected
+    assert result.reason is None
+
+
+def test_odds_only_nudge_size_and_low_odds_small_entry_uses_minimum():
+    low = decision(
+        entry(
+            leader_notional=D(10),
+            leader_shares=D(100),
+            reference_notional=D(50),
+        ),
+        ask=D("0.10"),
+        event_price=D("0.10"),
+    )
+    assert low.odds_factor == D("0.68")
+    assert low.target_budget == D("1.10")
+
+    high = decision(
+        entry(
+            leader_notional=D(300),
+            leader_shares=D(300) / D("0.70"),
+            reference_notional=D(50),
+        ),
+        ask=D("0.70"),
+        event_price=D("0.70"),
+    )
+    assert high.odds_factor == D("1.16")
+    assert abs(high.target_budget - D("17.40")) < TOLERANCE
+
+
+def test_fixed_series_marker_ignores_odds_and_leader_relative_size():
+    result = decision(
+        entry(
+            leader_notional=D(2),
+            leader_shares=D(20),
+            reference_notional=D(100),
+            base_budget=D(7),
+            max_budget=D(7),
+            max_multiplier=D(0),
+        ),
+        ask=D("0.10"),
+        event_price=D("0.10"),
+    )
+    assert result.odds_factor == 1
+    assert result.target_budget == 7
+    assert result.order_budget == 7
 
 
 def test_spent_target_and_closed_entry_cannot_receive_new_funds():
@@ -236,26 +304,45 @@ async def sizing_rig(tmp_path, monkeypatch):
     async with db.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     async with sessions() as session:
-        session.add(Account(id=1, paper_balance=100, starting_balance=100,
-                            trade_size=5, max_trade_size=30))
+        session.add(
+            Account(id=1, paper_balance=100, starting_balance=100, trade_size=5, max_trade_size=30)
+        )
         for leader_id in (1, 2):
-            session.add(Leader(id=leader_id, address="0x" + str(leader_id) * 40,
-                               initialized=True, last_timestamp=timestamp - 2))
-            session.add(LeaderSizingProfile(
-                leader_id=leader_id, reference_notional=20, sample_count=10,
-                sample_start=timestamp - 100, sample_end=timestamp - 2,
-                refreshed_at=datetime.now(UTC),
-            ))
+            session.add(
+                Leader(
+                    id=leader_id,
+                    address="0x" + str(leader_id) * 40,
+                    initialized=True,
+                    last_timestamp=timestamp - 2,
+                )
+            )
+            session.add(
+                LeaderSizingProfile(
+                    leader_id=leader_id,
+                    reference_notional=20,
+                    sample_count=10,
+                    sample_start=timestamp - 100,
+                    sample_end=timestamp - 2,
+                    refreshed_at=datetime.now(UTC),
+                )
+            )
         await session.commit()
     book = Book(
-        bids=[(D("0.5"), D(1000))], asks=[(D("0.5"), D(1000))],
-        tick_size=D("0.01"), min_order_size=D(1), neg_risk=False,
+        bids=[(D("0.5"), D(1000))],
+        asks=[(D("0.5"), D(1000))],
+        tick_size=D("0.01"),
+        min_order_size=D(1),
+        neg_risk=False,
     )
     client = SimpleNamespace(
-        get_market=AsyncMock(side_effect=lambda token: {
-            "tokens": [{"token_id": token}], "closed": False,
-            "accepting_orders": True, "seconds_delay": 0,
-        }),
+        get_market=AsyncMock(
+            side_effect=lambda token: {
+                "tokens": [{"token_id": token}],
+                "closed": False,
+                "accepting_orders": True,
+                "seconds_delay": 0,
+            }
+        ),
         get_fee_rate=AsyncMock(return_value=D(0)),
         get_book=AsyncMock(return_value=book),
         get_activity=AsyncMock(return_value=[]),
@@ -264,16 +351,30 @@ async def sizing_rig(tmp_path, monkeypatch):
         get_user_position_value=AsyncMock(side_effect=AssertionError("not leader capital")),
     )
     settings = Settings(
-        _env_file=None, SMART_SIZING_ENABLED=True, COPY_BALANCE_PCT="0.05",
-        SMART_SIZING_BURST_SECONDS=2, SMART_SIZING_MIN_SAMPLES=3,
-        SMART_SIZING_MAX_MULTIPLIER=3, MIN_COPY_NOTIONAL="1.1",
+        _env_file=None,
+        SMART_SIZING_ENABLED=True,
+        COPY_BALANCE_PCT="0.05",
+        SMART_SIZING_BURST_SECONDS=2,
+        SMART_SIZING_MIN_SAMPLES=3,
+        SMART_SIZING_MAX_MULTIPLIER=3,
+        MIN_COPY_NOTIONAL="1.1",
         MAX_OUTCOME_EXPOSURE=50,
     )
-    rig = SimpleNamespace(engine=CopyEngine(settings, client), client=client,
-                          sessions=sessions, book=book, timestamp=timestamp, clock=clock)
+    rig = SimpleNamespace(
+        engine=CopyEngine(settings, client),
+        client=client,
+        sessions=sessions,
+        book=book,
+        timestamp=timestamp,
+        clock=clock,
+    )
     yield rig
     await rig.engine.stop()
-    tasks = list(rig.engine._pending.values()) + list(rig.engine._leader_polls.values()) + list(rig.engine._exit_workers.values())
+    tasks = (
+        list(rig.engine._pending.values())
+        + list(rig.engine._leader_polls.values())
+        + list(rig.engine._exit_workers.values())
+    )
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
@@ -302,10 +403,13 @@ async def test_split_and_unsplit_entries_have_same_cumulative_spend(sizing_rig, 
         assert state.base_budget == 5
         assert abs(state.spent - 10) < TOLERANCE
         assert len(list(await session.scalars(select(SizingEntry)))) == 1
+        audits = list(await session.scalars(select(SizingAudit)))
+        assert audits
+        assert all(audit.odds_factor == 1 for audit in audits)
     sizing_rig.client.get_user_position_value.assert_not_awaited()
 
 
-async def test_subminimum_fragments_accumulate_without_rounding_up(sizing_rig):
+async def test_small_fragments_reach_minimum_only_after_meaningful_share_of_average(sizing_rig):
     await copy(sizing_rig, "tiny-1", "2")
     async with sizing_rig.sessions() as session:
         assert (await session.get(Account, 1)).paper_balance == 100
@@ -313,12 +417,18 @@ async def test_subminimum_fragments_accumulate_without_rounding_up(sizing_rig):
         assert (await session.scalar(select(SizingEntry))).spent == 0
     await copy(sizing_rig, "tiny-2", "2")
     async with sizing_rig.sessions() as session:
-        assert (await session.get(Account, 1)).paper_balance == 100
+        assert (await session.get(Account, 1)).paper_balance == D("98.9")
     await copy(sizing_rig, "tiny-3", "2")
     async with sizing_rig.sessions() as session:
-        assert abs((await session.get(Account, 1)).paper_balance - D("98.5")) < TOLERANCE
+        assert abs((await session.get(Account, 1)).paper_balance - D("98.9")) < TOLERANCE
         assert (await session.scalar(select(SizingEntry))).leader_notional == 6
-        assert (await session.scalar(select(Position))).shares == 3
+        assert (await session.scalar(select(Position))).shares == D("2.2")
+    await copy(sizing_rig, "tiny-4", "2")
+    await copy(sizing_rig, "tiny-5", "2")
+    async with sizing_rig.sessions() as session:
+        assert abs((await session.get(Account, 1)).paper_balance - D("97.5")) < TOLERANCE
+        assert (await session.scalar(select(SizingEntry))).leader_notional == 10
+        assert (await session.scalar(select(Position))).shares == 5
 
 
 async def test_exact_replay_does_not_increase_entry_or_spend(sizing_rig):
@@ -352,6 +462,33 @@ async def test_restart_preserves_entry_cash_reference_and_cumulative_target(sizi
         assert abs((await session.get(Account, 1)).paper_balance - 95) < TOLERANCE
 
 
+async def test_leader_fixed_size_works_without_profile_and_is_total_for_series(sizing_rig):
+    async with sizing_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        leader.fixed_trade_size = D(7)
+        profile = await session.get(LeaderSizingProfile, 1)
+        await session.delete(profile)
+        await session.commit()
+    await copy(sizing_rig, "fixed-one", "2")
+    await copy(sizing_rig, "fixed-two", "200")
+    async with sizing_rig.sessions() as session:
+        state = await session.scalar(select(SizingEntry))
+        assert state.max_multiplier == 0
+        assert state.max_budget == 7
+        assert state.spent == 7
+        assert (await session.get(Account, 1)).paper_balance == 93
+        assert (
+            len(
+                list(
+                    await session.scalars(
+                        select(PaperOrder).where(PaperOrder.status.in_(["filled", "partial"]))
+                    )
+                )
+            )
+            == 1
+        )
+
+
 async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
     async with sizing_rig.sessions() as session:
         (await session.get(LeaderSizingProfile, 2)).reference_notional = 40
@@ -370,8 +507,12 @@ async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
 
 async def test_sell_closes_only_same_leader_same_and_older_buckets(sizing_rig, monkeypatch):
     # This test deliberately presents an out-of-order SELL after a later BUY.
-    monkeypatch.setattr("app.engine.time", SimpleNamespace(
-        time=lambda: sizing_rig.timestamp + 4.1, monotonic=sizing_rig.clock.monotonic))
+    monkeypatch.setattr(
+        "app.engine.time",
+        SimpleNamespace(
+            time=lambda: sizing_rig.timestamp + 4.1, monotonic=sizing_rig.clock.monotonic
+        ),
+    )
     await copy(sizing_rig, "old", "20")
     await copy(sizing_rig, "current", "20", offset=2)
     await copy(sizing_rig, "future", "20", offset=4)
@@ -408,7 +549,9 @@ async def test_slippage_rejection_does_not_consume_cumulative_cash_budget(sizing
     async with sizing_rig.sessions() as session:
         assert (await session.get(Account, 1)).paper_balance == 100
         assert (await session.scalar(select(SizingEntry))).spent == 0
-        assert (await session.scalar(select(CopyTrade))).skip_reason == "no_liquidity_within_slippage"
+        assert (
+            await session.scalar(select(CopyTrade))
+        ).skip_reason == "no_liquidity_within_slippage"
     sizing_rig.book.asks = [(D("0.5"), D(1000))]
     await copy(sizing_rig, "normal-price", "20")
     async with sizing_rig.sessions() as session:
@@ -419,7 +562,9 @@ async def test_audit_explains_target_and_remaining_order_budget(sizing_rig):
     await copy(sizing_rig, "first-part", "10")
     await copy(sizing_rig, "second-part", "10")
     async with sizing_rig.sessions() as session:
-        audits = list(await session.scalars(select(SizingAudit).order_by(SizingAudit.copy_trade_id)))
+        audits = list(
+            await session.scalars(select(SizingAudit).order_by(SizingAudit.copy_trade_id))
+        )
         assert len(audits) == 2
         assert audits[0].target_budget == D("2.5")
         assert audits[0].spent_before == 0
@@ -463,7 +608,9 @@ async def test_new_bucket_snapshots_remaining_own_cash(sizing_rig):
     await copy(sizing_rig, "initial-entry", "20")
     await copy(sizing_rig, "new-entry", "20", offset=2)
     async with sizing_rig.sessions() as session:
-        entries = list(await session.scalars(select(SizingEntry).order_by(SizingEntry.bucket_start)))
+        entries = list(
+            await session.scalars(select(SizingEntry).order_by(SizingEntry.bucket_start))
+        )
         assert len(entries) == 2
         assert entries[0].base_budget == 5
         assert entries[1].cash_at_start == 95
@@ -482,7 +629,9 @@ async def test_late_buy_cannot_reopen_bucket_after_sell(sizing_rig):
         assert state.leader_notional == 20
         assert (await session.get(Account, 1)).paper_balance == 100
         assert await session.scalar(select(Position)) is None
-        late = await session.scalar(select(CopyTrade).where(CopyTrade.event_key == "late-entry-fragment"))
+        late = await session.scalar(
+            select(CopyTrade).where(CopyTrade.event_key == "late-entry-fragment")
+        )
         assert late.skip_reason == "buy_superseded_by_sell"
 
 
@@ -502,9 +651,13 @@ async def test_late_fragment_cannot_top_up_superseded_entry(sizing_rig):
     await copy(sizing_rig, "late-old-fragment", "40")
     async with sizing_rig.sessions() as session:
         assert (await session.get(Account, 1)).paper_balance == D("90.25")
-        entries = list(await session.scalars(select(SizingEntry).order_by(SizingEntry.bucket_start)))
+        entries = list(
+            await session.scalars(select(SizingEntry).order_by(SizingEntry.bucket_start))
+        )
         assert entries[0].leader_notional == 20
-        late = await session.scalar(select(CopyTrade).where(CopyTrade.event_key == "late-old-fragment"))
+        late = await session.scalar(
+            select(CopyTrade).where(CopyTrade.event_key == "late-old-fragment")
+        )
         assert late.skip_reason == "sizing_entry_closed"
 
 
@@ -543,7 +696,9 @@ async def test_changed_duration_cannot_reallocate_existing_entry(sizing_rig):
         state = await session.scalar(select(SizingEntry))
         assert state.bucket_seconds == 2
         assert state.leader_notional == 20
-        late = await session.scalar(select(CopyTrade).where(CopyTrade.event_key == "changed-duration"))
+        late = await session.scalar(
+            select(CopyTrade).where(CopyTrade.event_key == "changed-duration")
+        )
         assert late.skip_reason == "sizing_entry_closed"
 
 
@@ -564,9 +719,9 @@ async def test_changed_duration_cannot_create_overlapping_entry(sizing_rig):
     async with sizing_rig.sessions() as session:
         assert (await session.get(Account, 1)).paper_balance == 95
         assert len(list(await session.scalars(select(SizingEntry)))) == 1
-        late = await session.scalar(select(CopyTrade).where(
-            CopyTrade.event_key == "overlapping-two-second-entry"
-        ))
+        late = await session.scalar(
+            select(CopyTrade).where(CopyTrade.event_key == "overlapping-two-second-entry")
+        )
         assert late.skip_reason == "sizing_entry_closed"
 
 
@@ -588,9 +743,9 @@ async def test_switching_legacy_to_smart_cannot_remint_same_entry_budget(sizing_
     async with sizing_rig.sessions() as session:
         assert (await session.get(Account, 1)).paper_balance == 96
         assert await session.scalar(select(SizingEntry)) is None
-        late = await session.scalar(select(CopyTrade).where(
-            CopyTrade.event_key == "smart-fragment-of-legacy-entry"
-        ))
+        late = await session.scalar(
+            select(CopyTrade).where(CopyTrade.event_key == "smart-fragment-of-legacy-entry")
+        )
         assert late.skip_reason == "sizing_entry_closed"
     # A genuinely new bucket remains eligible after the mode switch.
     await copy(sizing_rig, "new-smart-entry", "20", offset=2)
@@ -632,24 +787,30 @@ async def test_restart_keeps_saved_profile_when_activity_window_has_no_samples(s
 
 
 async def test_frequent_profile_refresh_attempt_keeps_daily_reference(sizing_rig):
-    activities = [event(f"old-{i}", "20", timestamp=sizing_rig.timestamp - 10 - i * 2)
-                  for i in range(3)]
+    activities = [
+        event(f"old-{i}", "20", timestamp=sizing_rig.timestamp - 10 - i * 2) for i in range(3)
+    ]
     async with sizing_rig.sessions() as session:
         leader = await session.get(Leader, 1)
         await sizing_rig.engine._refresh_sizing_profile(session, leader, activities)
         profile = await session.get(LeaderSizingProfile, 1)
         first_refreshed_at = profile.refreshed_at
-        bigger = [event(f"big-{i}", "200", timestamp=sizing_rig.timestamp - 10 - i * 2)
-                  for i in range(3)]
+        bigger = [
+            event(f"big-{i}", "200", timestamp=sizing_rig.timestamp - 10 - i * 2) for i in range(3)
+        ]
         await sizing_rig.engine._refresh_sizing_profile(session, leader, bigger)
         assert profile.reference_notional == 20
         assert profile.refreshed_at == first_refreshed_at
 
 
 async def test_account_bootstrap_uses_settings_without_overwriting_existing_account(sizing_rig):
-    settings = sizing_rig.engine.settings.model_copy(update={
-            "default_trade_size": D(7), "max_trade_size": D(24), "default_slippage_bps": 300,
-    })
+    settings = sizing_rig.engine.settings.model_copy(
+        update={
+            "default_trade_size": D(7),
+            "max_trade_size": D(24),
+            "default_slippage_bps": 300,
+        }
+    )
     async with sizing_rig.sessions() as session:
         await session.delete(await session.get(Account, 1))
         await session.commit()

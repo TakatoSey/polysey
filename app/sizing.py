@@ -74,6 +74,7 @@ def sample_entries(
 class BudgetDecision:
     leader_vwap: Decimal
     price_factor: Decimal
+    odds_factor: Decimal
     target_budget: Decimal
     order_budget: Decimal  # notional, fee reserve already removed
     reference_price: Decimal
@@ -94,15 +95,33 @@ def entry_budget(
     min_notional: Decimal,
     min_shares: Decimal,
 ) -> BudgetDecision:
-    """Cumulative all-in target minus actual prior cash debits; never round up."""
+    """Cumulative all-in target using size, odds and actual prior cash debits."""
     vwap = entry.leader_notional / entry.leader_shares
     reference = min(vwap, event_price)
-    factor = min(ONE, vwap / ask) if ask > 0 else ZERO
-    intensity = min(entry.max_multiplier, entry.leader_notional / entry.reference_notional)
-    target = min(entry.max_budget, current_max, entry.base_budget * intensity * factor)
+    price_factor = min(ONE, vwap / ask) if ask > 0 else ZERO
+    # Contract price is not a verified probability, so it only nudges size:
+    # 10c -> 0.68x, 50c -> 1.00x, 70c -> 1.16x, 98c -> 1.38x.
+    odds_factor = min(
+        Decimal("1.40"), max(Decimal("0.60"), Decimal("0.60") + vwap * Decimal("0.80"))
+    )
+    reserve = ONE + max(ZERO, fee_rate) * (ONE - ask)
+    cap = min(entry.max_budget, current_max)
+    fixed = entry.max_multiplier == ZERO
+    if fixed:
+        target = cap
+        odds_factor = ONE
+    else:
+        intensity = min(entry.max_multiplier, entry.leader_notional / entry.reference_notional)
+        raw_target = entry.base_budget * intensity * price_factor * odds_factor
+        # A meaningful small leader entry receives our executable minimum; dust
+        # does not get inflated. Further fragments keep one cumulative target.
+        meaningful = entry.leader_notional >= max(
+            min_notional, entry.reference_notional * Decimal("0.20")
+        )
+        minimum_all_in = max(min_notional, min_shares * ask) * reserve if meaningful else ZERO
+        target = min(cap, max(raw_target, minimum_all_in))
     remaining = max(ZERO, target - entry.spent)
     # _level_fee / notional = rate * (1-price). At >= ask this is an upper bound.
-    reserve = ONE + max(ZERO, fee_rate) * (ONE - ask)
     budget = max(ZERO, min(remaining, cash, exposure_room)) / reserve
     reason = None
     distance = (
@@ -128,4 +147,4 @@ def entry_budget(
         reason = "sizing_exposure_limit"
     elif budget < max(min_notional, min_shares * ask):
         reason = "sizing_below_minimum"
-    return BudgetDecision(vwap, factor, target, budget, reference, reason)
+    return BudgetDecision(vwap, price_factor, odds_factor, target, budget, reference, reason)

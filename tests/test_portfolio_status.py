@@ -91,8 +91,8 @@ async def test_portfolio_screen_shows_price_value_pnl_percent_and_win_payout():
 
     text = await app._portfolio_text_v2()
 
-    assert "Средняя/сейчас: 46.30¢ → 62.00¢" in text
-    assert "Затраты/оценка: $6.60 → $8.84" in text
-    assert "PNL: +$2.24 (+33.9%)" in text
-    assert "При победе: $14.25" in text
-    assert "Общий PNL: +$2.24 (+33.9%)" in text
+    assert "Avg/Now: 46.30¢ → 62.00¢" in text
+    assert "Cost/Value: $6.60 → $8.84" in text
+    assert "PnL: +$2.24 (+33.9%)" in text
+    assert "To Win: $14.25" in text
+    assert "Total PnL: +$2.24 (+33.9%)" in text

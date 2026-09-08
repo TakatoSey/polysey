@@ -89,7 +89,9 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
     """Explicit public/trading fields only; no credentials, no database writes."""
 
     def fields(row, names):
-        return {name: getattr(row, name) for name in names.split()}
+        # Keep exports compatible with historical rows/test fixtures created before
+        # a newly exported public field existed.
+        return {name: getattr(row, name, None) for name in names.split()}
 
     return {
         "copy_trades": [
@@ -110,7 +112,7 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
             fields(p, "token_id condition_id title outcome shares cost_basis average_price")
             for p in positions
         ],
-        "leaders": [fields(l, "id address label") for l in leaders],
+        "leaders": [fields(l, "id address label fixed_trade_size") for l in leaders],
         "source_observations": [
             fields(
                 o,
@@ -121,7 +123,7 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
         "sizing_audits": [
             fields(
                 a,
-                "copy_trade_id bucket_start base_budget reference_notional leader_notional leader_vwap price_factor target_budget spent_before order_budget",
+                "copy_trade_id bucket_start base_budget reference_notional leader_notional leader_vwap price_factor odds_factor target_budget spent_before order_budget",
             )
             for a in sizing_audits
         ],

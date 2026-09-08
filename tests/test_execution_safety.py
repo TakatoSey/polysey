@@ -315,9 +315,9 @@ async def test_successful_copied_sell_sends_clear_notification(rig):
     await sell(rig)
     message = rig.engine.notifications.get_nowait()
     assert "Copy Trade: SELL" in message
-    assert "Позиция: <b>Yes</b>" in message
+    assert "<b>Position:</b> Yes" in message
     assert "10.00 shares" in message
-    assert "PNL продажи" in message
+    assert "<b>PnL:</b>" in message
 
 
 async def retry_due(rig):
