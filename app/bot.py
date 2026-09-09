@@ -413,18 +413,17 @@ class TelegramApp:
 
         quote_results = await asyncio.gather(*(quote_position(row) for row in rows))
         quotes = [
-            (row, quote, status, note)
-            for row, (quote, status, note) in zip(rows, quote_results, strict=True)
+            (row, quote) for row, (quote, _status, _note) in zip(rows, quote_results, strict=True)
         ]
 
         total_cost = sum((row.cost_basis for row in rows), Decimal(0))
         known_value = sum(
-            (row.shares * quote for row, quote, _, _ in quotes if quote is not None),
+            (row.shares * quote for row, quote in quotes if quote is not None),
             Decimal(0),
         )
-        unknown_count = sum(quote is None for _, quote, _, _ in quotes)
+        unknown_count = sum(quote is None for _, quote in quotes)
 
-        for index, (row, quote, _status, note) in enumerate(
+        for index, (row, quote) in enumerate(
             quotes[page * per_page : (page + 1) * per_page],
             start=page * per_page + 1,
         ):
@@ -465,8 +464,6 @@ class TelegramApp:
             lines.append(f"\n<b>{icon} Total PnL: {total_pnl_text} ({total_pct:+.1f}%)</b>")
         if total_pages > 1:
             lines.append(f"\nPage {page + 1}/{total_pages}")
-        if any("Mark" in note for _, _, _, note in quotes):
-            lines.append("\n<i>ℹ️ Now uses last-trade mark when no executable bid exists.</i>")
         return "\n".join(lines)
 
     def _portfolio_keyboard_v2(self, rows, page: int = 0):
