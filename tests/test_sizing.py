@@ -301,6 +301,49 @@ def test_fixed_series_marker_ignores_odds_and_leader_relative_size():
     assert result.order_budget == 7
 
 
+def test_conviction_power_widens_the_gap_between_a_big_and_a_small_entry():
+    weights = {"conviction_power": D("1.5"), "odds_weight": D("0.5")}
+    big, small = entry(leader_notional=D(40)), entry(leader_notional=D(10))
+    plain = decision(big).target_budget / decision(small).target_budget
+    weighted = decision(big, **weights).target_budget / decision(small, **weights).target_budget
+    assert weighted > plain
+
+
+def test_odds_weight_shrinks_the_price_nudge_toward_neutral():
+    # 26c and 47c leader entries, the pair that motivated the weighting.
+    cheap = entry(leader_notional=D(52), leader_shares=D(200), reference_notional=D(30))
+    dear = entry(leader_notional=D("27.43"), leader_shares=D("58.60"), reference_notional=D(30))
+    full = decision(cheap, ask=D("0.26")).odds_factor / decision(dear, ask=D("0.47")).odds_factor
+    half = (
+        decision(cheap, ask=D("0.26"), odds_weight=D("0.5")).odds_factor
+        / decision(dear, ask=D("0.47"), odds_weight=D("0.5")).odds_factor
+    )
+    # Still cheaper-is-smaller, just less of it.
+    assert full < half < 1
+
+
+def test_a_larger_entry_still_outsizes_a_smaller_one_at_the_same_norm():
+    weights = {"conviction_power": D("1.5"), "odds_weight": D("0.5")}
+    cheap_big = decision(
+        entry(leader_notional=D(52), leader_shares=D(200), reference_notional=D(30)),
+        ask=D("0.26"),
+        event_price=D("0.26"),
+        **weights,
+    )
+    dear_small = decision(
+        entry(leader_notional=D("27.43"), leader_shares=D("58.60"), reference_notional=D(30)),
+        ask=D("0.47"),
+        event_price=D("0.47"),
+        **weights,
+    )
+    assert cheap_big.target_budget > dear_small.target_budget * 2
+
+
+def test_neutral_weights_reproduce_the_plain_proportional_size():
+    neutral = decision(conviction_power=D(1), odds_weight=D(1))
+    assert neutral.target_budget == decision().target_budget
+
+
 def test_spent_target_and_closed_entry_cannot_receive_new_funds():
     result = decision(entry(spent=D(12)))
     assert result.order_budget == 0
@@ -387,6 +430,10 @@ async def sizing_rig(tmp_path, monkeypatch):
         SMART_SIZING_MAX_MULTIPLIER=3,
         MIN_COPY_NOTIONAL="1.1",
         MAX_OUTCOME_EXPOSURE=50,
+        # These cover accounting invariants — batching, replay, partial fills —
+        # so hold the weighting curve neutral and test it separately.
+        SIZING_CONVICTION_POWER=1,
+        SIZING_ODDS_WEIGHT=1,
     )
     rig = SimpleNamespace(
         engine=CopyEngine(settings, client),

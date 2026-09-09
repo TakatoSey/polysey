@@ -65,6 +65,16 @@ class Settings(BaseSettings):
     sizing_floor_max_multiple: Decimal = Field(
         default=Decimal("2"), ge=1, le=10, alias="SIZING_FLOOR_MAX_MULTIPLE"
     )
+    # Above 1 an entry far from the leader's own norm counts for more than the
+    # ratio alone; 1 keeps the plain proportional behaviour.
+    sizing_conviction_power: Decimal = Field(
+        default=Decimal("1.5"), ge=1, le=3, alias="SIZING_CONVICTION_POWER"
+    )
+    # Share of the contract-price nudge that is applied. 0 ignores odds, 1 is
+    # the full 0.60-1.40 swing.
+    sizing_odds_weight: Decimal = Field(
+        default=Decimal("0.5"), ge=0, le=1, alias="SIZING_ODDS_WEIGHT"
+    )
     # Human units: 5 cents = $0.05; stored separately from legacy percentage bps.
     default_slippage_cents: Decimal = Field(
         default=Decimal("5"), ge=0, lt=100, alias="DEFAULT_SLIPPAGE_CENTS"

@@ -95,16 +95,20 @@ def entry_budget(
     min_notional: Decimal,
     min_shares: Decimal,
     floor_multiple: Decimal = Decimal(2),
+    conviction_power: Decimal = Decimal(1),
+    odds_weight: Decimal = Decimal(1),
 ) -> BudgetDecision:
     """Cumulative all-in target using size, odds and actual prior cash debits."""
     vwap = entry.leader_notional / entry.leader_shares
     reference = min(vwap, event_price)
     price_factor = min(ONE, vwap / ask) if ask > 0 else ZERO
     # Contract price is not a verified probability, so it only nudges size:
-    # 10c -> 0.68x, 50c -> 1.00x, 70c -> 1.16x, 98c -> 1.38x.
+    # 10c -> 0.68x, 50c -> 1.00x, 70c -> 1.16x, 98c -> 1.38x. The weight pulls
+    # that nudge back toward neutral without removing its direction.
     odds_factor = min(
         Decimal("1.40"), max(Decimal("0.60"), Decimal("0.60") + vwap * Decimal("0.80"))
     )
+    odds_factor = ONE + (odds_factor - ONE) * odds_weight
     reserve = ONE + max(ZERO, fee_rate) * (ONE - ask)
     cap = min(entry.max_budget, current_max)
     fixed = entry.max_multiplier == ZERO
@@ -112,7 +116,12 @@ def entry_budget(
         target = cap
         odds_factor = ONE
     else:
-        intensity = min(entry.max_multiplier, entry.leader_notional / entry.reference_notional)
+        # How far this entry departs from the leader's own norm. Raising it to a
+        # power makes an unusually large entry count for more than an unusually
+        # favourable price, which a contract price cannot tell us anyway.
+        ratio = entry.leader_notional / entry.reference_notional
+        conviction = ratio**conviction_power if ratio > ZERO else ZERO
+        intensity = min(entry.max_multiplier, conviction)
         raw_target = entry.base_budget * intensity * price_factor * odds_factor
         # A meaningful small leader entry receives our executable minimum; dust
         # does not get inflated. Further fragments keep one cumulative target.

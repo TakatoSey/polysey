@@ -16,6 +16,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .db import Base
 
 
+def utc_now() -> datetime:
+    """Aware UTC. The columns are timezone-aware; naive values shift with TZ."""
+    return datetime.now(UTC)
+
+
 class Account(Base):
     __tablename__ = "accounts"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -33,9 +38,9 @@ class Account(Base):
         Numeric(8, 6), default=Decimal("0.05"), nullable=False
     )
     paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
 
@@ -48,7 +53,7 @@ class Leader(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     initialized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_timestamp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class Position(Base):
@@ -62,9 +67,9 @@ class Position(Base):
     average_price: Mapped[Decimal] = mapped_column(Numeric(20, 10), default=0, nullable=False)
     cost_basis: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=0, nullable=False)
     realized_pnl: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=0, nullable=False)
-    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
     )
 
 
@@ -81,7 +86,7 @@ class CopyTrade(Base):
     leader_price: Mapped[Decimal] = mapped_column(Numeric(20, 10))
     status: Mapped[str] = mapped_column(String(24), default="detected")
     skip_reason: Mapped[str | None] = mapped_column(String(200), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class PaperOrder(Base):
@@ -97,7 +102,7 @@ class PaperOrder(Base):
     fee: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=0)
     status: Mapped[str] = mapped_column(String(24), default="submitted")
     reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class LeaderSizingProfile(Base):
@@ -108,9 +113,7 @@ class LeaderSizingProfile(Base):
     sample_start: Mapped[int] = mapped_column(Integer)
     sample_end: Mapped[int] = mapped_column(Integer)
     bucket_seconds: Mapped[int] = mapped_column(Integer, default=2)
-    refreshed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), default=lambda: datetime.now(UTC)
-    )
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
 class SizingEntry(Base):

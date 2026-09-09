@@ -34,7 +34,10 @@ sizing_rig = _sizing_rig
 def network_event(base, tx="a"):
     address = "0x" + "1" * 40
     transaction = "0x" + tx * 64
-    raw = f"{transaction}:{base.timestamp}:{base.condition_id}:{base.token_id}:{base.side}:{base.size}:{base.price}"
+    raw = (
+        f"{transaction}:{base.timestamp}:{base.condition_id}:{base.token_id}:"
+        f"{base.side}:{base.size}:{base.price}"
+    )
     return replace(
         base,
         event_key=copy_event_key(raw, address),

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.bot as bot_module
@@ -153,6 +153,68 @@ async def test_reset_clears_trading_state_and_restores_the_starting_balance(admi
         assert leader is not None and leader.last_timestamp == 99
         assert (await session.get(LeaderSizingProfile, 1)).sample_count == 9
     assert admin_rig.app.engine._buy_batches == {}
+
+
+async def test_stats_screen_reports_copy_rate_and_ranks_skip_reasons(admin_rig):
+    async with admin_rig.sessions() as session:
+        for index, (status, reason) in enumerate(
+            [
+                ("skipped", "no_liquidity_within_slippage"),
+                ("skipped", "no_liquidity_within_slippage"),
+                ("skipped", "sizing_below_minimum"),
+                ("retry_pending", "entry_price_drop"),
+            ]
+        ):
+            session.add(
+                CopyTrade(
+                    id=index + 2,
+                    leader_id=1,
+                    event_key=f"skip-{index}",
+                    timestamp=1,
+                    token_id="token",
+                    condition_id="condition",
+                    side="BUY",
+                    leader_size=D(10),
+                    leader_price=D("0.5"),
+                    status=status,
+                    skip_reason=reason,
+                )
+            )
+        await session.commit()
+
+    text = await admin_rig.app._stats_text()
+
+    # One executed from the fixture, three skipped, one still waiting on price.
+    assert "Сигналов BUY: <b>5</b>" in text
+    assert "Исполнено: <b>1</b> (20%)" in text
+    assert "Ждут цену: 1" in text
+    assert "2 · цена вне slippage" in text
+    assert "1 · минимум рынка выше нашего размера" in text
+
+
+async def test_stats_screen_says_so_when_there_were_no_signals(admin_rig):
+    async with admin_rig.sessions() as session:
+        await session.execute(delete(CopyTrade))
+        await session.commit()
+    assert "Сигналов BUY не было" in await admin_rig.app._stats_text()
+
+
+@pytest.mark.parametrize(
+    "data", ["position:1", "leader_view:x:0", "leaders:abc", "portfolio:none", "leader_toggle:1"]
+)
+async def test_stale_keyboard_data_answers_instead_of_dying_silently(admin_rig, data):
+    app = admin_rig.app
+    app.callback = TelegramApp.callback.__get__(app)
+    query = SimpleNamespace(
+        data=data,
+        from_user=SimpleNamespace(id=7),
+        message=SimpleNamespace(message_id=5),
+        answer=AsyncMock(),
+    )
+
+    await app.callback(query)
+
+    assert "устарела" in app._edit_panel.await_args.args[0]
 
 
 async def test_reset_asks_before_wiping_and_only_the_owner_may_ask(admin_rig):
