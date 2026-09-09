@@ -67,6 +67,53 @@ async def test_empty_bid_uses_last_trade_mark_without_claiming_executable_sell()
 
 
 @pytest.mark.asyncio
+async def test_closed_market_without_a_published_result_says_so():
+    client = AsyncMock()
+    client.get_resolution.return_value = None
+    client.get_book.return_value = SimpleNamespace(bids=[])
+    client.get_last_trade_price.return_value = None
+    client.get_market.return_value = {"closed": True}
+
+    quote, status, note = await panel(client)._position_quote(POSITION)
+
+    assert quote is None
+    assert "Settling" in status
+    assert "итог ещё не опубликован" in note
+
+
+@pytest.mark.asyncio
+async def test_an_unpriced_position_does_not_blank_the_total_for_the_others():
+    app = panel(AsyncMock())
+
+    def position(identifier, cost):
+        return SimpleNamespace(
+            id=identifier,
+            condition_id="market",
+            token_id=f"t{identifier}",
+            title=f"Market {identifier}",
+            outcome="Yes",
+            shares=Decimal(10),
+            average_price=Decimal("0.5"),
+            cost_basis=cost,
+        )
+
+    rows = [position(1, Decimal(5)), position(2, Decimal(4))]
+    app._portfolio_data_v2 = AsyncMock(return_value=(rows, SimpleNamespace()))
+    app._position_quote = AsyncMock(
+        side_effect=[
+            (Decimal("0.7"), "🟢 Open", "Оценка по лучшему bid"),
+            (None, "⏳ Settling", "Рынок закрыт, итог ещё не опубликован"),
+        ]
+    )
+
+    text = await app._portfolio_text_v2()
+
+    # Priced leg is 10 shares at 70c against a $5 cost.
+    assert "Total PnL: +$2.00 (+40.0%)" in text
+    assert "без оценки: 1 из 2" in text
+
+
+@pytest.mark.asyncio
 async def test_portfolio_screen_shows_price_value_pnl_percent_and_win_payout():
     app = panel(AsyncMock())
     row = SimpleNamespace(
