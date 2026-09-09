@@ -422,9 +422,22 @@ class TelegramApp:
                 log.warning("portfolio_last_trade_failed", token_id=row.token_id, error=str(exc))
                 return None, status, "Нет bid, last trade недоступен"
             if last is None or not isinstance(last, Decimal):
+                # An empty book with no trades is usually a market that stopped
+                # trading, not one we lost track of. Say which, rather than
+                # leaving the position looking open and unpriced forever.
+                if await self._market_closed(row):
+                    return None, "⏳ Settling", "Рынок закрыт, итог ещё не опубликован"
                 return None, status, "Нет bid и last trade"
             return last, status, "Mark по последней сделке"
         return book.bids[0][0], status, "Оценка по лучшему bid"
+
+    async def _market_closed(self, row) -> bool:
+        try:
+            market = await self.engine.client.get_market(row.condition_id)
+        except Exception as exc:
+            log.warning("portfolio_market_failed", token_id=row.token_id, error=str(exc))
+            return False
+        return market.get("closed") is True
 
     async def _portfolio_text_v2(self, page: int = 0) -> str:
         rows, _account = await self._portfolio_data_v2()
@@ -448,12 +461,11 @@ class TelegramApp:
             for row, (quote, status, _note) in zip(rows, quote_results, strict=True)
         ]
 
-        total_cost = sum((row.cost_basis for row in rows), Decimal(0))
-        known_value = sum(
-            (row.shares * quote for row, quote, _ in quotes if quote is not None),
-            Decimal(0),
-        )
-        unknown_count = sum(quote is None for _, quote, _ in quotes)
+        # An unpriced position must not blank the total for every other one.
+        priced = [(row, quote) for row, quote, _ in quotes if quote is not None]
+        total_cost = sum((row.cost_basis for row, _ in priced), Decimal(0))
+        known_value = sum((row.shares * quote for row, quote in priced), Decimal(0))
+        unknown_count = len(quotes) - len(priced)
 
         for index, (row, quote, status) in enumerate(
             quotes[page * per_page : (page + 1) * per_page],
@@ -481,15 +493,17 @@ class TelegramApp:
                 f"  └ Status: {status}"
             )
 
-        if unknown_count:
-            lines.append(f"\n<b>Total PnL: —</b> · no mark for {unknown_count} position(s)")
-        else:
+        if priced:
             total_pnl = known_value - total_cost
             total_pct = total_pnl / total_cost * 100 if total_cost else Decimal(0)
             icon = "📈" if total_pnl >= 0 else "📉"
             lines.append(
                 f"\n<b>{icon} Total PnL: {signed_money(total_pnl)} ({total_pct:+.1f}%)</b>"
             )
+        else:
+            lines.append("\n<b>Total PnL: —</b>")
+        if unknown_count:
+            lines.append(f"без оценки: {unknown_count} из {len(quotes)}")
         if total_pages > 1:
             lines.append(f"\nPage {page + 1}/{total_pages}")
         return "\n".join(lines)
