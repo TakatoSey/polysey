@@ -97,14 +97,16 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
         "copy_trades": [
             fields(
                 t,
-                "id leader_id event_key timestamp token_id condition_id side leader_size leader_price status skip_reason created_at",
+                "id leader_id event_key timestamp token_id condition_id side leader_size "
+                "leader_price status skip_reason created_at",
             )
             for t in trades
         ],
         "paper_orders": [
             fields(
                 o,
-                "id copy_trade_id token_id side requested_shares filled_shares average_fill_price fee status reason created_at",
+                "id copy_trade_id token_id side requested_shares filled_shares "
+                "average_fill_price fee status reason created_at",
             )
             for o in orders
         ],
@@ -112,22 +114,26 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
             fields(p, "token_id condition_id title outcome shares cost_basis average_price")
             for p in positions
         ],
-        "leaders": [fields(l, "id address label fixed_trade_size") for l in leaders],
+        "leaders": [fields(row, "id address label fixed_trade_size") for row in leaders],
         "source_observations": [
             fields(
                 o,
-                "event_key copy_trade_id token_id source transaction_hash timestamp received_at size price title outcome slug event_slug",
+                "event_key copy_trade_id token_id source transaction_hash timestamp "
+                "received_at size price title outcome slug event_slug",
             )
             for o in observations
         ],
         "sizing_audits": [
             fields(
                 a,
-                "copy_trade_id bucket_start base_budget reference_notional leader_notional leader_vwap price_factor odds_factor target_budget spent_before order_budget",
+                "copy_trade_id bucket_start base_budget reference_notional leader_notional "
+                "leader_vwap price_factor odds_factor target_budget spent_before order_budget",
             )
             for a in sizing_audits
         ],
-        "note": "Full retained history, not just 30 Telegram rows. Closed/deleted positions may lack titles; match by token_id/condition_id. Contains wallet addresses and trading history; share privately.",
+        "note": "Full retained history, not just 30 Telegram rows. Closed/deleted positions "
+        "may lack titles; match by token_id/condition_id. Contains wallet addresses and "
+        "trading history; share privately.",
     }
 
 

@@ -106,7 +106,8 @@ class CopyEngine:
         profile_url = f"https://polymarket.com/profile/{leader.address}"
         return (
             "<b>Copy Trade: BUY</b>\n\n"
-            f'🟢 Copied from <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
+            f'🟢 Copied from <a href="{profile_url}">'
+            f"@{html.escape(trader_name.lstrip('@'))}</a>\n\n"
             f"📊 <b>Market:</b> {html.escape(event.title)}\n"
             f"🎯 <b>Position:</b> {html.escape(event.outcome)}\n\n"
             f"💰 <b>Leader bought:</b> ${event.size * event.price:.2f} ({event.size:.2f} shares)\n"
@@ -123,7 +124,8 @@ class CopyEngine:
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         return (
             "<b>Copy Trade: SELL</b>\n\n"
-            f'🔴 Copied from <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
+            f'🔴 Copied from <a href="{profile_url}">'
+            f"@{html.escape(trader_name.lstrip('@'))}</a>\n\n"
             f"📊 <b>Market:</b> {html.escape(position.title)}\n"
             f"🎯 <b>Position:</b> {html.escape(position.outcome)}\n\n"
             f"💵 <b>You sold:</b> ${fill.notional:.2f} ({fill.shares:.2f} shares)\n"
@@ -162,7 +164,8 @@ class CopyEngine:
             safe_slug = html.escape(slug.strip("/"), quote=True)
             safe_event_slug = html.escape((event_slug or slug).strip("/"), quote=True)
             lines.append(
-                f'  └ <a href="https://polymarket.com/event/{safe_event_slug}/{safe_slug}">View on Polymarket</a>'
+                f'  └ <a href="https://polymarket.com/event/{safe_event_slug}/'
+                f'{safe_slug}">View on Polymarket</a>'
             )
         if proceeds > 0:
             lines.extend(("", "━━━━━━━━━━━━━━━━━━━━", f"💰 <b>Total Claimed: ${proceeds:.2f}</b>"))
@@ -338,7 +341,7 @@ class CopyEngine:
             remaining = max(0.05, interval - (time.monotonic() - started))
             try:
                 await asyncio.wait_for(self.stop_event.wait(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     async def stop(self) -> None:
@@ -839,6 +842,31 @@ class CopyEngine:
         reserve = equity * self.settings.min_cash_reserve_pct
         return max(Decimal(0), account.paper_balance - reserve)
 
+    def _entry_decision(
+        self, entry, *, ask, event_price, cash, exposure, account, fee_rate, policy, book
+    ):
+        """The one place account, market and policy limits become a budget.
+
+        Both the first attempt and the retry price the same entry; a limit added
+        to only one of them would size those two paths differently.
+        """
+        return entry_budget(
+            entry,
+            ask=ask,
+            event_price=event_price,
+            cash=cash,
+            exposure_room=self.exposure_room(exposure),
+            current_max=account.max_trade_size,
+            fee_rate=fee_rate,
+            slippage_price=policy.slippage_price,
+            min_notional=self.settings.min_copy_notional,
+            min_shares=book.min_order_size,
+            floor_multiple=self.settings.sizing_floor_max_multiple,
+        )
+
+    def exposure_room(self, exposure: Decimal) -> Decimal:
+        return max(Decimal(0), self.settings.max_outcome_exposure - exposure)
+
     async def _get_sizing_entry(self, session, leader: Leader, event, account):
         leader_id = leader.id
         seconds = self.settings.smart_sizing_burst_seconds
@@ -1186,7 +1214,7 @@ class CopyEngine:
             own_capacity = min(
                 base_capacity,
                 deployable,
-                max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
+                self.exposure_room(existing_exposure),
             )
             buy_budget = min(
                 buy_budget,
@@ -1234,20 +1262,16 @@ class CopyEngine:
                     existing = await get_position(session, event.token_id)
                     exposure = existing.cost_basis if existing else Decimal(0)
                     ask = book.asks[0][0] if book.asks else Decimal(0)
-                    decision = entry_budget(
+                    decision = self._entry_decision(
                         smart_entry,
                         ask=ask,
                         event_price=event.price,
                         cash=deployable,
-                        exposure_room=max(
-                            Decimal(0), self.settings.max_outcome_exposure - exposure
-                        ),
-                        current_max=account.max_trade_size,
+                        exposure=exposure,
+                        account=account,
                         fee_rate=fee_rate,
-                        slippage_price=policy.slippage_price,
-                        min_notional=self.settings.min_copy_notional,
-                        min_shares=book.min_order_size,
-                        floor_multiple=self.settings.sizing_floor_max_multiple,
+                        policy=policy,
+                        book=book,
                     )
                     session.add(
                         SizingAudit(
@@ -1296,9 +1320,7 @@ class CopyEngine:
                         min_order_notional=str(book.min_order_size * ask),
                         cash_available=str(account.paper_balance),
                         cash_deployable=str(deployable),
-                        exposure_room=str(
-                            max(Decimal(0), self.settings.max_outcome_exposure - exposure)
-                        ),
+                        exposure_room=str(self.exposure_room(exposure)),
                     )
                     if decision.reason:
                         copy_trade.status, copy_trade.skip_reason = "skipped", decision.reason
@@ -1889,18 +1911,16 @@ class CopyEngine:
                     trade.status, trade.skip_reason = "skipped", intent.last_reason
                     await session.commit()
                     return
-                decision = entry_budget(
+                decision = self._entry_decision(
                     smart_entry,
                     ask=ask,
                     event_price=intent.leader_price,
                     cash=await self._deployable_cash(session, account),
-                    exposure_room=max(Decimal(0), self.settings.max_outcome_exposure - exposure),
-                    current_max=account.max_trade_size,
+                    exposure=exposure,
+                    account=account,
                     fee_rate=prepared.fee_rate,
-                    slippage_price=policy.slippage_price,
-                    min_notional=self.settings.min_copy_notional,
-                    min_shares=book.min_order_size,
-                    floor_multiple=self.settings.sizing_floor_max_multiple,
+                    policy=policy,
+                    book=book,
                 )
                 if decision.reason:
                     if decision.reason in self.RETRYABLE_BUY_REASONS:
@@ -1922,7 +1942,7 @@ class CopyEngine:
                     intent.leader_size * intent.leader_price,
                     prepared.fee_rate,
                 )
-                budget = min(budget, max(Decimal(0), self.settings.max_outcome_exposure - exposure))
+                budget = min(budget, self.exposure_room(exposure))
                 budget = self.ensure_book_minimum_budget(
                     budget, capacity, book, intent.leader_price, policy.slippage_price
                 )

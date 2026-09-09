@@ -6,22 +6,6 @@ from decimal import ROUND_DOWN, Decimal
 from .polymarket import Book
 from .price_limits import MAX_BUY_PRICE, allowed_buy_price
 
-FEE_RATES = {
-    "crypto": Decimal("0.07"),
-    "sports": Decimal("0.05"),
-    "finance": Decimal("0.04"),
-    "politics": Decimal("0.04"),
-    "geopolitics": Decimal("0"),
-}
-
-
-def fee_rate_for_title(title: str) -> Decimal:
-    text = title.lower()
-    for category, rate in FEE_RATES.items():
-        if category in text:
-            return rate
-    return Decimal("0.05")
-
 
 @dataclass(slots=True)
 class Fill:

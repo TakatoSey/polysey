@@ -21,7 +21,7 @@ ZERO = D(0)
 def analyze_history(history):
     # Accept the live export (Decimal/datetime) and its JSON representation.
     trades = {t["id"]: t for t in history["copy_trades"]}
-    names = {l["id"]: l.get("label") or l["address"] for l in history["leaders"]}
+    names = {row["id"]: row.get("label") or row["address"] for row in history["leaders"]}
     observations = history.get("source_observations", [])
     metadata = {o["token_id"]: o for o in observations}
     rows = []
@@ -113,8 +113,9 @@ def analyze_history(history):
         "markets": sorted(by_token, key=lambda row: row["realized_pnl"]),
         "warnings": warnings,
         "note": "All retained history, not necessarily today. BUY signals may be batched. "
-        "Source-to-record delay includes publication, detection, queue and processing, not VPS latency alone. "
-        "Price comparisons use the same filled shares; they are not an achievable counterfactual PNL. "
+        "Source-to-record delay includes publication, detection, queue and processing, "
+        "not VPS latency alone. Price comparisons use the same filled shares; they are "
+        "not an achievable counterfactual PNL. "
         "Missing historical market names/transaction hashes are not inferred.",
     }
 

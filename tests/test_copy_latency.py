@@ -44,7 +44,9 @@ def market(condition):
 @pytest.fixture
 async def rig(tmp_path, monkeypatch):
     # Deterministic source clock; monotonic time still measures real async waits.
-    monkeypatch.setattr("app.engine.time", SimpleNamespace(time=lambda: 100.5, monotonic=time.monotonic))
+    monkeypatch.setattr(
+        "app.engine.time", SimpleNamespace(time=lambda: 100.5, monotonic=time.monotonic)
+    )
     # Separate real connections, unlike an in-memory SQLite StaticPool.
     db = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'latency.db'}")
     sessions = async_sessionmaker(db, expire_on_commit=False)
@@ -76,12 +78,17 @@ async def rig(tmp_path, monkeypatch):
     )
     # This fixture tests ledger/latency independently of history-based sizing.
     # Adaptive sizing has a separate fixture with seeded historical profiles.
-    settings = Settings(_env_file=None, COPY_BALANCE_PCT=1, LEADER_ORDER_SCALE=1,
-                        SMART_SIZING_ENABLED=False)
+    settings = Settings(
+        _env_file=None, COPY_BALANCE_PCT=1, LEADER_ORDER_SCALE=1, SMART_SIZING_ENABLED=False
+    )
     engine = CopyEngine(settings, client)
     yield SimpleNamespace(engine=engine, client=client, sessions=sessions, book=book)
     await engine.stop()
-    tasks = list(engine._pending.values()) + list(engine._leader_polls.values()) + list(engine._exit_workers.values())
+    tasks = (
+        list(engine._pending.values())
+        + list(engine._leader_polls.values())
+        + list(engine._exit_workers.values())
+    )
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)

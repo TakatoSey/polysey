@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import html
 import re
-from datetime import UTC, datetime
+from collections import Counter
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 import structlog
@@ -34,6 +35,7 @@ from .models import (
     SizingEntry,
     SourceObservation,
     SourceReceipt,
+    utc_now,
 )
 from .repository import (
     add_leader,
@@ -69,6 +71,21 @@ SIZING_REASONS = {
     "ambiguous_inventory": "нужна сверка истории",
     "exit_market_data_unavailable": "нет данных рынка",
     "exit_book_expired": "стакан устарел",
+}
+
+# Everything a copy can be rejected for, in one table shared by the history and
+# statistics screens.
+SKIP_REASONS = {
+    **SIZING_REASONS,
+    "no_liquidity_within_slippage": "цена вне slippage",
+    "no_liquidity": "нет ликвидности",
+    "below_min_order_size": "меньше минимума биржи",
+    "below_min_copy_notional": "ниже нашего минимума",
+    "insufficient_balance": "недостаточно средств",
+    "no_position_to_sell": "нет позиции для продажи",
+    "invalid_size_or_price": "некорректный размер или цена",
+    "market_data:market_not_accepting_orders": "рынок закрыт для ордеров",
+    "market_data:unsupported_fee_exponent": "устаревший расчёт комиссии",
 }
 
 
@@ -151,13 +168,14 @@ class TelegramApp:
             ("📊 Портфель", "portfolio:0"),
             ("👥 Копирование", "leaders:0"),
             ("🧾 История", "orders:0"),
+            ("📈 Статистика", "stats"),
             ("⚙️ Настройки", "settings"),
             ("⏸ Приостановить" if not paused else "▶️ Возобновить", "toggle"),
             ("🔄 Обновить", "home"),
             ("❓ Помощь", "help"),
         ]:
             builder.button(text=text, callback_data=data)
-        builder.adjust(2, 2, 2, 1)
+        builder.adjust(2, 2, 2, 2)
         return builder.as_markup()
 
     def _back(self):
@@ -589,24 +607,14 @@ class TelegramApp:
             "settled": "выплата",
             "submitted": "ожидает",
         }
-        reasons = {
-            **SIZING_REASONS,
-            "no_liquidity_within_slippage": "цена вне slippage",
-            "no_liquidity": "нет ликвидности",
-            "below_min_order_size": "меньше минимума биржи",
-            "below_min_copy_notional": "ниже нашего минимума",
-            "insufficient_balance": "недостаточно средств",
-            "no_position_to_sell": "нет позиции для продажи",
-            "invalid_size_or_price": "некорректный размер или цена",
-            "market_data:market_not_accepting_orders": "рынок закрыт для ордеров",
-            "market_data:unsupported_fee_exponent": "устаревший расчёт комиссии",
-        }
+        reasons = SKIP_REASONS
         lines = ["<b>🧾 История</b>"]
         if pending:
             lines.append("\n<b>⏳ Незавершённые выходы</b>")
             for intent, name, title in pending:
                 lines.append(
-                    f"{html.escape(name or 'Лидер')} · {html.escape((title or intent.token_id)[:65])}"
+                    f"{html.escape(name or 'Лидер')} · "
+                    f"{html.escape((title or intent.token_id)[:65])}"
                     f"\n{intent.remaining:.2f} shares · мин. {intent.min_price * 100:.1f}¢"
                 )
             if not self.settings.exit_retry_enabled:
@@ -666,6 +674,39 @@ class TelegramApp:
             lines.append(f"\nСтраница {page + 1}/{total_pages}")
         return "\n".join(lines)
 
+    async def _stats_text(self, hours: int = 24) -> str:
+        """Copy rate and why the rest was missed, so limits are tuned from data."""
+        since = utc_now() - timedelta(hours=hours)
+        async with SessionLocal() as session:
+            rows = list(
+                await session.execute(
+                    select(CopyTrade.status, CopyTrade.skip_reason, func.count())
+                    .where(CopyTrade.side == "BUY", CopyTrade.created_at >= since)
+                    .group_by(CopyTrade.status, CopyTrade.skip_reason)
+                )
+            )
+        executed = sum(count for status, _, count in rows if status == "executed")
+        waiting = sum(count for status, _, count in rows if status in {"detected", "retry_pending"})
+        missed = Counter()
+        for status, reason, count in rows:
+            if status not in {"executed", "detected", "retry_pending"}:
+                missed[SKIP_REASONS.get(reason, reason or status)] += count
+        total = executed + waiting + sum(missed.values())
+        lines = [f"<b>📈 Статистика</b> · {hours} ч\n"]
+        if not total:
+            lines.append("Сигналов BUY не было.")
+            return "\n".join(lines)
+        lines.append(f"Сигналов BUY: <b>{total}</b>")
+        lines.append(f"Исполнено: <b>{executed}</b> ({executed / total * 100:.0f}%)")
+        if waiting:
+            lines.append(f"Ждут цену: {waiting}")
+        if missed:
+            lines.append(f"Пропущено: <b>{sum(missed.values())}</b>\n")
+            lines.append("<b>Причины</b>")
+            for reason, count in missed.most_common(8):
+                lines.append(f"{count} · {html.escape(str(reason))}")
+        return "\n".join(lines)
+
     async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):
         async with SessionLocal() as session:
             rows = await orders(session)
@@ -713,7 +754,8 @@ class TelegramApp:
         if not self.settings.smart_sizing_enabled:
             return (
                 "<b>Размер · классический</b>\n"
-                f"Размер сделки: <b>${account.trade_size:.2f}</b> · максимум ${account.max_trade_size:.2f}\n"
+                f"Размер сделки: <b>${account.trade_size:.2f}</b> · "
+                f"максимум ${account.max_trade_size:.2f}\n"
                 f"От баланса: {self.settings.copy_balance_pct * 100:.1f}% · "
                 f"от сделки лидера: {self.settings.leader_order_scale * 100:.1f}%\n"
                 "/setsize 5 · /setmax 30"
@@ -721,7 +763,8 @@ class TelegramApp:
         base = max(Decimal(0), account.paper_balance) * self.settings.copy_balance_pct
         return (
             "<b>Размер · адаптивный</b>\n"
-            f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · сейчас ${base:.2f}\n"
+            f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · "
+            f"сейчас ${base:.2f}\n"
             f"Масштаб: до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
             f"Максимум серии: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
             f"Окно серии: {self.settings.smart_sizing_burst_seconds} с\n"
@@ -1118,6 +1161,19 @@ class TelegramApp:
         self.panel_message_id = query.message.message_id if query.message else self.panel_message_id
         data = query.data or "home"
         chat_id = query.from_user.id
+        try:
+            await self._dispatch(data, chat_id)
+        except (ValueError, IndexError):
+            # A keyboard from an older build can carry callback data this one no
+            # longer parses. A dead button is worse than saying so.
+            log.warning("callback_unparsed", data=data)
+            await self._edit_panel(
+                "<b>Кнопка устарела</b>\nОткройте панель заново: /start",
+                self._back(),
+                chat_id,
+            )
+
+    async def _dispatch(self, data: str, chat_id: int) -> None:
         if data == "home":
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
             await self._home(chat_id)
@@ -1176,6 +1232,8 @@ class TelegramApp:
             await self._edit_panel(
                 details.get(section, "Раздел не найден"), self._settings_keyboard_v2(), chat_id
             )
+        elif data == "stats":
+            await self._edit_panel(await self._stats_text(), self._back(), chat_id)
         elif data == "reset_prompt":
             await self._reset_prompt(chat_id)
         elif data == "reset_confirm":
@@ -1195,8 +1253,9 @@ class TelegramApp:
             await self._leaders_panel(int(data.split(":", 1)[1]), chat_id)
         elif data.startswith("leader_view:"):
             _, raw_id, raw_page = data.split(":")
+            leader_id, page = int(raw_id), int(raw_page)
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
-            await self._leader_detail(int(raw_id), int(raw_page), chat_id)
+            await self._leader_detail(leader_id, page, chat_id)
         elif data == "leader_add":
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).set_state(LeaderForm.address)
             await self._edit_panel(
