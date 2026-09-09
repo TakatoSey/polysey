@@ -20,6 +20,8 @@ def panel(*, smart=True, profiles=None):
         smart_sizing_max_multiplier=Decimal(3),
         smart_sizing_burst_seconds=2,
         smart_sizing_min_samples=3,
+        sizing_conviction_power=Decimal("1.5"),
+        sizing_odds_weight=Decimal("0.5"),
         min_copy_notional=Decimal("1.10"),
         paper_initial_balance=Decimal(100),
         telegram_allowed_user_id=7,

@@ -862,6 +862,8 @@ class CopyEngine:
             min_notional=self.settings.min_copy_notional,
             min_shares=book.min_order_size,
             floor_multiple=self.settings.sizing_floor_max_multiple,
+            conviction_power=self.settings.sizing_conviction_power,
+            odds_weight=self.settings.sizing_odds_weight,
         )
 
     def exposure_room(self, exposure: Decimal) -> Decimal:
