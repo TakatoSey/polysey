@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     smart_sizing_stats_refresh_seconds: int = Field(
         default=86400, ge=60, alias="SMART_SIZING_STATS_REFRESH_SECONDS"
     )
+    # How long a market's unresolved state is reused before asking again. This
+    # is the dominant delay in noticing a settlement, not the maintenance loop.
+    resolution_cache_seconds: float = Field(
+        default=5.0, ge=1, le=120, alias="RESOLUTION_CACHE_SECONDS"
+    )
     min_copy_notional: Decimal = Field(default=Decimal("1.10"), alias="MIN_COPY_NOTIONAL")
     max_outcome_exposure: Decimal = Field(default=Decimal("50"), alias="MAX_OUTCOME_EXPOSURE")
     # Cash kept back from equity so a burst of signals cannot deploy everything.

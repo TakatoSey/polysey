@@ -15,13 +15,26 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import CopyTrade, ExitIntent, Leader, PaperOrder, Position, RiskRule, SourceObservation
+from .models import (
+    BuyIntent,
+    CopyTrade,
+    ExitIntent,
+    Leader,
+    LeaderPosition,
+    PaperOrder,
+    Position,
+    RiskRule,
+    SizingAudit,
+    SizingEntry,
+    SourceObservation,
+    SourceReceipt,
+)
 from .repository import (
     add_leader,
     get_execution_policy,
@@ -75,6 +88,8 @@ class TelegramApp:
         "/setslippage 5 — отклонение цены в центах\n"
         "/setsize 5 — размер сделки (классический режим)\n"
         "/risk TOKEN sl=0.2 tp=0.25 trail=0.1\n"
+        "/addbalance 50 — пополнить paper-баланс\n"
+        "/reset — стереть сделки и начать тест заново\n"
         "/pause · /resume"
     )
 
@@ -744,8 +759,9 @@ class TelegramApp:
         builder.button(text="📏 Лимиты", callback_data="settings:limits")
         builder.button(text="📉 Slippage", callback_data="settings:slippage")
         builder.button(text="🛡️ Stop-loss / TP", callback_data="settings:risk")
+        builder.button(text="🧪 Сброс базы", callback_data="reset_prompt")
         builder.button(text="⬅️ На главную", callback_data="home")
-        builder.adjust(2, 2, 1)
+        builder.adjust(2, 2, 1, 1)
         return builder.as_markup()
 
     def _register(self) -> None:
@@ -762,6 +778,8 @@ class TelegramApp:
         self.dp.message.register(self.setsize, Command("setsize"))
         self.dp.message.register(self.setmax, Command("setmax"))
         self.dp.message.register(self.setslippage, Command("setslippage"))
+        self.dp.message.register(self.addbalance, Command("addbalance"))
+        self.dp.message.register(self.reset, Command("reset"))
         self.dp.message.register(self.toggle, Command("pause"))
         self.dp.message.register(self.toggle, Command("resume"))
         self.dp.message.register(self.receive_leader, StateFilter(LeaderForm.address))
@@ -974,6 +992,76 @@ class TelegramApp:
             f"✅ Slippage: {cents:.2f}¢ (${cents / 100:.4f})", self._back(), message.chat.id
         )
 
+    async def addbalance(self, message: Message) -> None:
+        """Deposit paper cash. Starting balance moves too, so PNL stays a result."""
+        if not self._allowed(message):
+            return
+        parts = (message.text or "").split()
+        await self._delete_input(message)
+        try:
+            amount = Decimal(parts[1].replace(",", ".")) if len(parts) == 2 else Decimal(0)
+        except (InvalidOperation, IndexError):
+            amount = Decimal(0)
+        if not amount.is_finite() or amount <= 0:
+            await self._edit_panel("Формат: /addbalance 50", self._back(), message.chat.id)
+            return
+        async with self.engine._ledger_lock.hold(0), SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            account.paper_balance += amount
+            account.starting_balance += amount
+            balance = account.paper_balance
+            await session.commit()
+        await self._edit_panel(
+            f"✅ Пополнено на ${amount:.2f}\nБаланс: <b>${balance:.2f}</b>",
+            self._back(),
+            message.chat.id,
+        )
+
+    async def reset(self, message: Message) -> None:
+        if not self._allowed(message):
+            return
+        await self._delete_input(message)
+        await self._reset_prompt(message.chat.id)
+
+    async def _reset_prompt(self, chat_id: int) -> None:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Да, стереть", callback_data="reset_confirm")
+        builder.button(text="Отмена", callback_data="home")
+        await self._edit_panel(
+            "<b>Сбросить базу?</b>\n"
+            "Удалятся сделки, ордера, позиции, серии и незавершённые выходы.\n"
+            f"Баланс станет ${self.settings.paper_initial_balance:.2f}.\n\n"
+            "Трейдеры и их статистика останутся. Отменить нельзя.",
+            builder.as_markup(),
+            chat_id,
+        )
+
+    async def _reset_database(self) -> Decimal:
+        """Wipe trading state for a clean test run; keep leaders and profiles."""
+        async with self.engine._ledger_lock.hold(0), SessionLocal() as session:
+            for model in (
+                SourceReceipt,
+                SourceObservation,
+                SizingAudit,
+                SizingEntry,
+                BuyIntent,
+                ExitIntent,
+                LeaderPosition,
+                RiskRule,
+                PaperOrder,
+                Position,
+                CopyTrade,
+            ):
+                await session.execute(delete(model))
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            account.paper_balance = self.settings.paper_initial_balance
+            account.starting_balance = self.settings.paper_initial_balance
+            account.realized_pnl = Decimal(0)
+            await session.commit()
+        # In-memory batches reference rows that no longer exist.
+        self.engine._buy_batches.clear()
+        return self.settings.paper_initial_balance
+
     async def risk(self, message: Message) -> None:
         if not self._allowed(message):
             return
@@ -1087,6 +1175,13 @@ class TelegramApp:
             }
             await self._edit_panel(
                 details.get(section, "Раздел не найден"), self._settings_keyboard_v2(), chat_id
+            )
+        elif data == "reset_prompt":
+            await self._reset_prompt(chat_id)
+        elif data == "reset_confirm":
+            balance = await self._reset_database()
+            await self._edit_panel(
+                f"✅ База очищена. Баланс: <b>${balance:.2f}</b>", self._back(), chat_id
             )
         elif data == "help":
             await self._edit_panel(self.HELP_TEXT, self._back(), chat_id)

@@ -78,7 +78,7 @@ class CopyEngine:
         self._ledger_lock = PriorityLock()
         self._prepare_slots = asyncio.Semaphore(settings.copy_prepare_concurrency)
         self._poll_slots = asyncio.Semaphore(8)
-        self._maintenance_slots = asyncio.Semaphore(4)
+        self._maintenance_slots = asyncio.Semaphore(8)
         self._exit_slots = asyncio.Semaphore(2)
         self._exit_workers = {}
         self._buy_batches = {}
