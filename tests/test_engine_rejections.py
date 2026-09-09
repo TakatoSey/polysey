@@ -135,4 +135,4 @@ def test_buy_notification_contains_outcome_link_amount_and_shares():
     assert "<b>Leader bought:</b> $5.00 (10.00 shares)" in message
     assert "<b>You bought:</b> $1.85 (5.00 shares)" in message
     assert "<b>Entry Price:</b> 37.0¢" in message
-    assert "Total $1.86" in message
+    assert "Fee" not in message

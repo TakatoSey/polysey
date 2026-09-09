@@ -104,35 +104,31 @@ class CopyEngine:
             event.trader_name or leader.label or f"{leader.address[:8]}…{leader.address[-6:]}"
         )
         profile_url = f"https://polymarket.com/profile/{leader.address}"
-        total_debit = fill.notional + fill.fee
         return (
-            "📋 <b>Copy Trade: BUY</b>\n\n"
+            "<b>Copy Trade: BUY</b>\n\n"
             f'🟢 Copied from <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
             f"📊 <b>Market:</b> {html.escape(event.title)}\n"
             f"🎯 <b>Position:</b> {html.escape(event.outcome)}\n\n"
             f"💰 <b>Leader bought:</b> ${event.size * event.price:.2f} ({event.size:.2f} shares)\n"
             f"📈 <b>Leader Price:</b> {event.price * 100:.1f}¢\n\n"
             f"💵 <b>You bought:</b> ${fill.notional:.2f} ({fill.shares:.2f} shares)\n"
-            f"🏷️ <b>Entry Price:</b> {fill.average_price * 100:.1f}¢\n\n"
-            f"<i>Fee ${fill.fee:.4f} · Total ${total_debit:.2f}</i>"
+            f"🏷️ <b>Entry Price:</b> {fill.average_price * 100:.1f}¢"
         )
 
     @staticmethod
     def build_sell_notification(leader: Leader, position: Position, fill, pnl: Decimal) -> str:
         trader_name = leader.label or f"{leader.address[:8]}…{leader.address[-6:]}"
         profile_url = f"https://polymarket.com/profile/{leader.address}"
-        proceeds = fill.notional - fill.fee
         icon = "📈" if pnl >= 0 else "📉"
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         return (
-            "📋 <b>Copy Trade: SELL</b>\n\n"
+            "<b>Copy Trade: SELL</b>\n\n"
             f'🔴 Copied from <a href="{profile_url}">@{html.escape(trader_name.lstrip("@"))}</a>\n\n'
             f"📊 <b>Market:</b> {html.escape(position.title)}\n"
             f"🎯 <b>Position:</b> {html.escape(position.outcome)}\n\n"
             f"💵 <b>You sold:</b> ${fill.notional:.2f} ({fill.shares:.2f} shares)\n"
             f"🏷️ <b>Exit Price:</b> {fill.average_price * 100:.1f}¢\n"
-            f"{icon} <b>PnL:</b> {pnl_text}\n\n"
-            f"<i>Fee ${fill.fee:.4f} · Received ${proceeds:.2f}</i>"
+            f"{icon} <b>PnL:</b> {pnl_text}"
         )
 
     @staticmethod
@@ -174,7 +170,6 @@ class CopyEngine:
 
     @staticmethod
     def build_risk_sell_notification(position: Position, fill, pnl: Decimal, trigger: str) -> str:
-        proceeds = fill.notional - fill.fee
         pnl_icon = "📈" if pnl >= 0 else "📉"
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         rule_name = {
@@ -183,13 +178,12 @@ class CopyEngine:
             "trailing-stop": "Trailing Stop",
         }.get(trigger, trigger)
         return (
-            "📋 <b>Position: SELL</b>\n\n"
+            "<b>Position: SELL</b>\n\n"
             f"⚙️ Причина: <b>{html.escape(rule_name)}</b>\n\n"
             f"📊 Рынок: <b>{html.escape(position.title)}</b>\n"
             f"🎯 Позиция: <b>{html.escape(position.outcome)}</b>\n\n"
             f"💵 Продано: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
             f"🏷️ Цена выхода: <b>{fill.average_price * 100:.1f}¢</b>\n"
-            f"Комиссия: ${fill.fee:.4f} · получено ${proceeds:.2f}\n"
             f"{pnl_icon} PNL продажи: <b>{pnl_text}</b>"
         )
 
