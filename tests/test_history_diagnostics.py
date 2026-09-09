@@ -213,7 +213,7 @@ async def test_startup_repairs_old_terminal_statuses_without_repaying(rig, monke
     app = object.__new__(TelegramApp)
     app.settings = rig.engine.settings
     text = await app._orders_text_v2()
-    assert "Позже позиция закрыта выплатой" in text
+    assert "закрыто выплатой" in text
     assert "Незавершённые выходы" not in text
 
 

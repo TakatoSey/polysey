@@ -57,10 +57,9 @@ def test_profile_warming_up_is_visible_until_minimum_samples():
     )
     assert not app._sizing_profile_ready(1)
     text = app._leader_sizing_text(1)
-    assert "собираем статистику" in text
-    assert "2; нужно минимум 3" in text
-    assert "Новые BUY пока пропускаются" in text
-    assert "собираем статистику" in app._leader_sizing_text(2)
+    assert "2 из 3 серий" in text
+    assert "BUY пропускаются" in text
+    assert "0 из 3 серий" in app._leader_sizing_text(2)
 
 
 @pytest.mark.parametrize(
@@ -82,11 +81,10 @@ def test_profile_shows_grouped_entry_sample_count_and_utc_time(stamp):
         }
     )
     text = app._leader_sizing_text(1)
-    assert "Типичная серия входа" in text
+    assert "Типичная серия" in text
     assert "$14.60" in text
-    assert "Серий в выборке: 42" in text
+    assert "42 в выборке" in text
     assert "06.09 12:30 UTC" in text
-    assert "не баланс трейдера" in text
 
 
 def test_sizing_help_discloses_bucket_boundaries_and_residual_accounting():
@@ -96,6 +94,7 @@ def test_sizing_help_discloses_bucket_boundaries_and_residual_accounting():
     assert "На границе окна" in text
     assert "не ждёт окончания окна" in text
     assert "Лучшая цена бюджет не увеличивает" in text
+    assert "не баланс трейдера" in text
 
 
 def test_new_rejections_have_human_readable_descriptions():
