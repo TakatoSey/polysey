@@ -11,7 +11,7 @@ from decimal import Decimal
 from typing import ClassVar
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .accounting import Holding, inventory
@@ -828,6 +828,17 @@ class CopyEngine:
             exchange_delay_seconds=prepared.exchange_delay,
         )
 
+    async def _deployable_cash(self, session, account) -> Decimal:
+        """Cash a new BUY may use, holding a reserve back from total equity.
+
+        Signals arrive in bursts across many markets; sizing each one against
+        the whole remaining balance let a single burst deploy everything.
+        """
+        open_cost = await session.scalar(select(func.coalesce(func.sum(Position.cost_basis), 0)))
+        equity = account.paper_balance + Decimal(str(open_cost or 0))
+        reserve = equity * self.settings.min_cash_reserve_pct
+        return max(Decimal(0), account.paper_balance - reserve)
+
     async def _get_sizing_entry(self, session, leader: Leader, event, account):
         leader_id = leader.id
         seconds = self.settings.smart_sizing_burst_seconds
@@ -1155,6 +1166,9 @@ class CopyEngine:
         leader_fixed = bool(fixed_size is not None and fixed_size.is_finite() and fixed_size > 0)
         smart_buy = event.side == "BUY" and (self.settings.smart_sizing_enabled or leader_fixed)
         smart_entry = decision = None
+        deployable = (
+            await self._deployable_cash(session, account) if event.side == "BUY" else Decimal(0)
+        )
         if smart_buy:
             # Sizing needs the executable ask. No fixed-dollar budget is applied.
             target_shares = Decimal(0)
@@ -1171,6 +1185,7 @@ class CopyEngine:
             base_capacity = self.calculate_own_buy_capacity(account, self.settings, fee_rate)
             own_capacity = min(
                 base_capacity,
+                deployable,
                 max(Decimal(0), self.settings.max_outcome_exposure - existing_exposure),
             )
             buy_budget = min(
@@ -1223,7 +1238,7 @@ class CopyEngine:
                         smart_entry,
                         ask=ask,
                         event_price=event.price,
-                        cash=account.paper_balance,
+                        cash=deployable,
                         exposure_room=max(
                             Decimal(0), self.settings.max_outcome_exposure - exposure
                         ),
@@ -1232,6 +1247,7 @@ class CopyEngine:
                         slippage_price=policy.slippage_price,
                         min_notional=self.settings.min_copy_notional,
                         min_shares=book.min_order_size,
+                        floor_multiple=self.settings.sizing_floor_max_multiple,
                     )
                     session.add(
                         SizingAudit(
@@ -1279,6 +1295,7 @@ class CopyEngine:
                         min_copy_notional=str(self.settings.min_copy_notional),
                         min_order_notional=str(book.min_order_size * ask),
                         cash_available=str(account.paper_balance),
+                        cash_deployable=str(deployable),
                         exposure_room=str(
                             max(Decimal(0), self.settings.max_outcome_exposure - exposure)
                         ),
@@ -1876,13 +1893,14 @@ class CopyEngine:
                     smart_entry,
                     ask=ask,
                     event_price=intent.leader_price,
-                    cash=account.paper_balance,
+                    cash=await self._deployable_cash(session, account),
                     exposure_room=max(Decimal(0), self.settings.max_outcome_exposure - exposure),
                     current_max=account.max_trade_size,
                     fee_rate=prepared.fee_rate,
                     slippage_price=policy.slippage_price,
                     min_notional=self.settings.min_copy_notional,
                     min_shares=book.min_order_size,
+                    floor_multiple=self.settings.sizing_floor_max_multiple,
                 )
                 if decision.reason:
                     if decision.reason in self.RETRYABLE_BUY_REASONS:

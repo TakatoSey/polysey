@@ -44,7 +44,7 @@ SIZING_REASONS = {
     "buy_price_out_of_range": "цена в стакане вне 2–98¢",
     "sizing_profile_unavailable": "сбор статистики трейдера",
     "sizing_entry_closed": "серия закрыта",
-    "sizing_below_minimum": "добавка ниже минимума",
+    "sizing_below_minimum": "минимум рынка выше нашего размера",
     "sizing_entry_budget_used": "бюджет серии израсходован",
     "sizing_exposure_limit": "лимит на исход",
     "stale_signal": "устаревший сигнал",
@@ -641,9 +641,7 @@ class TelegramApp:
                 lines.append(header + "\n" + "\n".join(details))
             elif row.status == "settled":
                 proceeds = row.filled_shares * row.average_fill_price
-                lines.append(
-                    header + f"\n{row.filled_shares:.2f} shares · выплата ${proceeds:.2f}"
-                )
+                lines.append(header + f"\n{row.filled_shares:.2f} shares · выплата ${proceeds:.2f}")
             else:
                 lines.append(
                     header
@@ -692,6 +690,7 @@ class TelegramApp:
             "Цена BUY: <b>2–98¢</b>\n"
             f"Минимум BUY: <b>${self.settings.min_copy_notional:.2f}</b>\n"
             f"Лимит на исход: <b>${self.settings.max_outcome_exposure:.2f}</b>\n"
+            f"Резерв кэша: <b>{self.settings.min_cash_reserve_pct * 100:.0f}%</b> капитала\n"
             f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>"
         )
 

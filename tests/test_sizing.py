@@ -227,15 +227,34 @@ def test_entry_start_max_budget_cannot_be_raised_mid_burst():
     assert result.order_budget == 3
 
 
+# base_budget 5 earns a raw target of 5 here, so the exchange minimum decides.
+SMALL_TARGET = {"reference_notional": D(40)}
+
+
 @pytest.mark.parametrize(
     ("minimum", "expected"),
-    [({"min_notional": D(11)}, D(11)), ({"min_shares": D(21)}, D("10.5"))],
+    [({"min_notional": D(9)}, D(9)), ({"min_shares": D(19)}, D("9.5"))],
 )
-def test_meaningful_entry_is_raised_to_executable_minimum(minimum, expected):
-    result = decision(**minimum)
+def test_meaningful_entry_is_raised_to_affordable_executable_minimum(minimum, expected):
+    result = decision(entry(**SMALL_TARGET), **minimum)
     assert result.target_budget == expected
     assert result.order_budget == expected
     assert result.reason is None
+
+
+@pytest.mark.parametrize("minimum", [{"min_notional": D(11)}, {"min_shares": D(21)}])
+def test_market_minimum_far_above_our_base_is_skipped_instead_of_overspent(minimum):
+    # The default multiple allows at most 2x the base all-in. Paying an 11
+    # minimum out of a base of 5 would silently override the base percentage.
+    result = decision(entry(**SMALL_TARGET), **minimum)
+    assert result.target_budget == 10
+    assert result.reason == "sizing_below_minimum"
+
+
+def test_floor_multiple_controls_how_far_the_minimum_may_stretch_the_base():
+    stretched = decision(entry(**SMALL_TARGET), min_notional=D(11), floor_multiple=D(3))
+    assert stretched.target_budget == 11
+    assert stretched.reason is None
 
 
 def test_odds_only_nudge_size_and_low_odds_small_entry_uses_minimum():
@@ -287,6 +306,15 @@ def test_spent_target_and_closed_entry_cannot_receive_new_funds():
     assert result.order_budget == 0
     assert result.reason == "sizing_entry_budget_used"
     assert decision(entry(closed=True)).reason == "sizing_entry_closed"
+
+
+def test_dust_left_in_a_started_entry_reports_the_budget_as_used_not_too_small():
+    # A later fragment of an entry that already spent its target must not look
+    # like a fresh signal that was merely below the exchange minimum.
+    started = decision(entry(spent=D("9.999995")))
+    assert started.order_budget < D("0.0001")
+    assert started.reason == "sizing_entry_budget_used"
+    assert decision(entry(base_budget=D("0.02"))).reason == "sizing_below_minimum"
 
 
 @pytest.fixture
@@ -503,6 +531,19 @@ async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
         assert abs(entries[0].spent - 5) < TOLERANCE
         assert abs(entries[1].spent - D("2.375")) < TOLERANCE
         assert abs((await session.get(Account, 1)).paper_balance - D("92.625")) < TOLERANCE
+
+
+async def test_a_burst_across_markets_cannot_deploy_the_whole_balance(sizing_rig):
+    # Each signal was sized against the full remaining balance, so a burst of
+    # independent markets drained the account within seconds.
+    for index in range(30):
+        await copy(sizing_rig, f"burst-{index}", "20", token=f"token-{index}")
+    async with sizing_rig.sessions() as session:
+        account = await session.get(Account, 1)
+        open_cost = sum((row.cost_basis for row in await session.scalars(select(Position))), D(0))
+        equity = account.paper_balance + open_cost
+        assert account.paper_balance >= equity * D("0.25") - TOLERANCE
+        assert open_cost > 0
 
 
 async def test_sell_closes_only_same_leader_same_and_older_buckets(sizing_rig, monkeypatch):

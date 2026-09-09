@@ -94,6 +94,7 @@ def entry_budget(
     slippage_bps: int | None = None,
     min_notional: Decimal,
     min_shares: Decimal,
+    floor_multiple: Decimal = Decimal(2),
 ) -> BudgetDecision:
     """Cumulative all-in target using size, odds and actual prior cash debits."""
     vwap = entry.leader_notional / entry.leader_shares
@@ -118,7 +119,17 @@ def entry_budget(
         meaningful = entry.leader_notional >= max(
             min_notional, entry.reference_notional * Decimal("0.20")
         )
-        minimum_all_in = max(min_notional, min_shares * ask) * reserve if meaningful else ZERO
+        # An expensive market can demand many times the budget this entry
+        # earned. Raising to that minimum would silently override the base
+        # percentage, so past this multiple we skip the market instead.
+        minimum_all_in = (
+            min(
+                max(min_notional, min_shares * ask) * reserve,
+                entry.base_budget * floor_multiple,
+            )
+            if meaningful
+            else ZERO
+        )
         target = min(cap, max(raw_target, minimum_all_in))
     remaining = max(ZERO, target - entry.spent)
     # _level_fee / notional = rate * (1-price). At >= ask this is an upper bound.
@@ -146,5 +157,7 @@ def entry_budget(
     elif exposure_room <= 0:
         reason = "sizing_exposure_limit"
     elif budget < max(min_notional, min_shares * ask):
-        reason = "sizing_below_minimum"
+        # A started entry whose leftover cannot reach the exchange minimum is
+        # finished, not merely small: every fragment shares one target.
+        reason = "sizing_entry_budget_used" if entry.spent > ZERO else "sizing_below_minimum"
     return BudgetDecision(vwap, price_factor, odds_factor, target, budget, reference, reason)
