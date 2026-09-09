@@ -15,13 +15,26 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
-from .models import CopyTrade, ExitIntent, Leader, PaperOrder, Position, RiskRule, SourceObservation
+from .models import (
+    BuyIntent,
+    CopyTrade,
+    ExitIntent,
+    Leader,
+    LeaderPosition,
+    PaperOrder,
+    Position,
+    RiskRule,
+    SizingAudit,
+    SizingEntry,
+    SourceObservation,
+    SourceReceipt,
+)
 from .repository import (
     add_leader,
     get_execution_policy,
@@ -33,23 +46,29 @@ from .repository import (
 
 log = structlog.get_logger(__name__)
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+
+
+def signed_money(value: Decimal) -> str:
+    return f"+${value:.2f}" if value >= 0 else f"-${abs(value):.2f}"
+
+
 SIZING_REASONS = {
-    "leader_price_out_of_range": "цена покупки лидера вне разрешённых 2–98¢",
-    "buy_price_out_of_range": "цена в стакане вне разрешённых 2–98¢",
-    "sizing_profile_unavailable": "собираем статистику входов трейдера; пока недостаточно данных",
-    "sizing_entry_closed": "серия уже завершена; позднюю покупку не догоняем",
-    "sizing_below_minimum": "добавка к серии ниже минимума; учитывается при следующей покупке в том же окне",
-    "sizing_entry_budget_used": "бюджет этой серии уже использован",
-    "sizing_exposure_limit": "достигнут лимит на исход с учётом комиссии",
-    "stale_signal": "сигнал слишком старый; покупку не догоняем",
-    "entry_price_drop": "цена резко упала после входа лидера; новую покупку не открываем",
-    "buy_superseded_by_sell": "лидер уже продаёт; запоздалую покупку не открываем",
-    "invalid_signal_timestamp": "некорректное время сигнала; проверьте часы VPS",
-    "exit_pending": "сначала завершаем запрошенный выход из этой позиции",
-    "out_of_order_exit": "продажа относится к более ранним событиям; новую позицию не затрагиваем",
-    "ambiguous_inventory": "старая история не позволяет однозначно распределить доли; нужна сверка",
-    "exit_market_data_unavailable": "выход сохранён; ждём подтверждённых данных рынка",
-    "exit_book_expired": "выход сохранён; обновляем стакан",
+    "leader_price_out_of_range": "цена лидера вне 2–98¢",
+    "buy_price_out_of_range": "цена в стакане вне 2–98¢",
+    "sizing_profile_unavailable": "сбор статистики трейдера",
+    "sizing_entry_closed": "серия закрыта",
+    "sizing_below_minimum": "минимум рынка выше нашего размера",
+    "sizing_entry_budget_used": "бюджет серии израсходован",
+    "sizing_exposure_limit": "лимит на исход",
+    "stale_signal": "устаревший сигнал",
+    "entry_price_drop": "цена упала после входа лидера",
+    "buy_superseded_by_sell": "лидер уже продал",
+    "invalid_signal_timestamp": "некорректное время сигнала",
+    "exit_pending": "ожидается выход из позиции",
+    "out_of_order_exit": "продажа вне очереди",
+    "ambiguous_inventory": "нужна сверка истории",
+    "exit_market_data_unavailable": "нет данных рынка",
+    "exit_book_expired": "стакан устарел",
 }
 
 
@@ -60,6 +79,19 @@ class LeaderForm(StatesGroup):
 
 class TelegramApp:
     """Single-message Russian Telegram control panel; trade notifications are separate."""
+
+    HELP_TEXT = (
+        "<b>❓ Помощь</b>\n\n"
+        "Управление — кнопками панели.\n\n"
+        "<b>Команды</b>\n"
+        "/setmax 30 — максимум серии\n"
+        "/setslippage 5 — отклонение цены в центах\n"
+        "/setsize 5 — размер сделки (классический режим)\n"
+        "/risk TOKEN sl=0.2 tp=0.25 trail=0.1\n"
+        "/addbalance 50 — пополнить paper-баланс\n"
+        "/reset — стереть сделки и начать тест заново\n"
+        "/pause · /resume"
+    )
 
     def __init__(self, settings: Settings, engine: CopyEngine):
         self.settings = settings
@@ -161,11 +193,12 @@ class TelegramApp:
         ]
         max_next_buy = max([max_next_buy, *fixed_candidates])
         cash_warning = (
-            "\n\n⚠️ Новые покупки сейчас невозможны: верхний предел бюджета "
-            f"${max_next_buy:.2f} ниже минимума ${self.settings.min_copy_notional:.2f}."
+            f"\n\n⚠️ Бюджет ${max_next_buy:.2f} ниже минимума "
+            f"${self.settings.min_copy_notional:.2f} — покупки недоступны."
             if not account.paused and max_next_buy < self.settings.min_copy_notional
             else ""
         )
+        active_count = sum(1 for row in leaders if row.active)
         sizing_status = ""
         if self.settings.smart_sizing_enabled:
             ready_count = sum(
@@ -174,21 +207,18 @@ class TelegramApp:
                 if row.active
                 and (row.fixed_trade_size is not None or self._sizing_profile_ready(row.id))
             )
-            active_count = sum(1 for row in leaders if row.active)
             sizing_status = (
-                f"Размер входа: <b>адаптивный · {self.settings.copy_balance_pct * 100:.1f}% базы</b>\n"
-                f"Статистика входов: {ready_count}/{active_count} готовы\n"
+                f"Режим: адаптивный · {self.settings.copy_balance_pct * 100:.1f}% базы\n"
+                f"Статистика: {ready_count}/{active_count}\n"
             )
         text = (
-            "<b>POLYSEY · PAPER</b>\n\n"
-            f"Свободно: <b>${account.paper_balance:.2f}</b>\n"
-            f"Стартовый капитал: ${account.starting_balance:.2f}\n"
-            f"Состояние копирования: {state}\n"
-            f"Активных трейдеров: <b>{sum(1 for row in leaders if row.active)}</b>\n"
+            "<b>POLYSEY</b> · paper\n\n"
+            f"Баланс: <b>${account.paper_balance:.2f}</b> · старт ${account.starting_balance:.2f}\n"
+            f"PNL: <b>{signed_money(account.realized_pnl)}</b>\n"
+            f"Позиции: <b>{len(open_positions)}</b>\n"
+            f"Трейдеры: <b>{active_count}</b> из {len(leaders)}\n"
             f"{sizing_status}"
-            f"Открытых позиций: <b>{len(open_positions)}</b>\n"
-            f"Зафиксированный PNL: <b>${account.realized_pnl:+.2f}</b>\n\n"
-            "Стоимость открытых позиций доступна в разделе «Портфель»."
+            f"Статус: {state}"
             f"{cash_warning}"
         )
         await self._edit_panel(text, self._menu(account.paused), chat_id)
@@ -204,30 +234,27 @@ class TelegramApp:
     def _leader_sizing_text(self, leader_id: int, fixed_size: Decimal | None = None) -> str:
         profile = self.engine._leader_sizing_profiles.get(leader_id)
         if fixed_size is not None:
-            stats = (
-                f"Типичная серия трейдера: ${profile.reference_notional:.2f} · "
+            return (
+                f"Типичная серия: ${profile.reference_notional:.2f} · "
                 f"{profile.sample_count} в выборке\n"
                 if self._sizing_profile_ready(leader_id)
-                else "Статистика серий ещё собирается; фиксированному режиму она не нужна.\n"
+                else ""
             )
-            return stats
         if not self.settings.smart_sizing_enabled:
-            return "Размер входа: <b>классический режим</b>\n"
+            return "Режим: классический\n"
         if not self._sizing_profile_ready(leader_id):
             count = profile.sample_count if profile else 0
             return (
-                "Размер входа: <b>⏳ собираем статистику</b>\n"
-                f"Серий в выборке: {count}; нужно минимум {self.settings.smart_sizing_min_samples}.\n"
-                "Новые BUY пока пропускаются; это не пауза копирования.\n"
+                f"Статистика: <b>⏳ {count} из "
+                f"{self.settings.smart_sizing_min_samples} серий</b> · BUY пропускаются\n"
             )
         refreshed = profile.refreshed_at
         if refreshed.tzinfo is None:
             refreshed = refreshed.replace(tzinfo=UTC)
         return (
-            f"Типичная серия входа: <b>${profile.reference_notional:.2f}</b>\n"
-            f"Серий в выборке: {profile.sample_count} · окно {self.settings.smart_sizing_burst_seconds} с\n"
-            f"Статистика: {refreshed.astimezone(UTC):%d.%m %H:%M} UTC\n"
-            "<i>При 10+ сериях убираем крайние 10% с каждой стороны; это не баланс трейдера.</i>\n"
+            f"Типичная серия: <b>${profile.reference_notional:.2f}</b> · "
+            f"{profile.sample_count} в выборке\n"
+            f"Обновлено: {refreshed.astimezone(UTC):%d.%m %H:%M} UTC\n"
         )
 
     async def _leaders_panel(self, page: int = 0, chat_id: int | None = None) -> None:
@@ -237,23 +264,22 @@ class TelegramApp:
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         page = max(0, min(page, total_pages - 1))
         current = rows[page * per_page : (page + 1) * per_page]
-        lines = [
-            f"<b>👥 Копирование</b> · {len(rows)} трейдеров",
-            "Выбери трейдера для просмотра и управления.",
-        ]
+        active = sum(1 for row in rows if row.active)
+        lines = [f"<b>👥 Копирование</b>\n{active} из {len(rows)} активны"]
+        if not rows:
+            lines = ["<b>👥 Копирование</b>\nСписок пуст"]
         builder = InlineKeyboardBuilder()
         for row in current:
             icon = "🟢" if row.active else "⚪"
             name = row.label or f"{row.address[:6]}…{row.address[-4:]}"
             mode = f" · ${row.fixed_trade_size:.2f} фикс." if row.fixed_trade_size else ""
-            lines.append(f"{icon} <b>{html.escape(name)}</b>{mode}")
             builder.button(
                 text=f"{icon} {name[:22]}{mode}", callback_data=f"leader_view:{row.id}:{page}"
             )
             builder.button(
                 text="⏸" if row.active else "▶️", callback_data=f"leader_toggle:{row.id}:{page}"
             )
-        builder.button(text="➕ Добавить лидера", callback_data="leader_add")
+        builder.button(text="➕ Добавить трейдера", callback_data="leader_add")
         if page > 0:
             builder.button(text="◀️", callback_data=f"leaders:{page - 1}")
         if page + 1 < total_pages:
@@ -290,12 +316,12 @@ class TelegramApp:
         if not row:
             await self._leaders_panel(page, chat_id)
             return
-        status = "🟢 активно" if row.active else "⚪ приостановлено"
+        status = "🟢 активен" if row.active else "⚪ на паузе"
         label = html.escape(row.label or f"{row.address[:6]}…{row.address[-4:]}")
         sizing_mode = (
-            f"Фиксировано: ${row.fixed_trade_size:.2f} на серию"
+            f"фикс. ${row.fixed_trade_size:.2f} на серию"
             if row.fixed_trade_size is not None
-            else "Адаптивно: сумма + odds + размер серии"
+            else "адаптивный"
         )
         executed = sum(1 for trade in recent if trade.status == "executed")
         rejected = sum(1 for trade in recent if trade.status in {"skipped", "failed"})
@@ -314,19 +340,16 @@ class TelegramApp:
         open_cost = sum((h.cost for h in owned), Decimal(0))
         buys = sum(o.side == "BUY" for o in all_orders)
         sells = sum(o.side == "SELL" for o in all_orders)
-        pnl_label = "нужна сверка истории" if warnings else f"${realized_pnl:+.4f}"
+        pnl_label = "нужна сверка истории" if warnings else signed_money(realized_pnl)
         text = (
-            f"<b>👤 {label}</b>\n\nАдрес:\n<code>{row.address}</code>\n\n"
-            f"Статус: <b>{status}</b>\nИнициализация: {'готово' if row.initialized else 'в процессе'}\n"
-            f"Размер копии: <b>{sizing_mode}</b>\n"
-            f"Последние 20 событий: {executed} скопировано · {rejected} пропущено\n"
-            f"Сделки: {buys} покупок · {sells} продаж\n"
+            f"<b>👤 {label}</b>\n<code>{row.address}</code>\n\n"
+            f"Статус: <b>{status}</b>\n"
+            f"Размер: <b>{sizing_mode}</b>\n"
             + self._leader_sizing_text(leader_id, row.fixed_trade_size)
-            + f"Реализованный PNL: <b>{pnl_label}</b>\n"
-            f"Открытая себестоимость: <b>${open_cost:.4f}</b>\n"
-            "<i>По каждому исходу и лидеру · комиссии и выплаты учтены</i>\n"
-            f"Последний результат: <b>{last_result}</b>\n\n"
-            "Все новые сделки этого адреса обрабатываются по общим настройкам."
+            + f"PNL: <b>{pnl_label}</b> · открыто ${open_cost:.2f}\n"
+            f"Сделки: {buys} BUY · {sells} SELL\n"
+            f"Последние 20: {executed} скопировано · {rejected} пропущено\n"
+            f"Последнее: {last_result}"
         )
         builder = InlineKeyboardBuilder()
         builder.button(
@@ -362,38 +385,28 @@ class TelegramApp:
             )
         except Exception as exc:
             log.warning("portfolio_resolution_failed", token_id=row.token_id, error=str(exc))
-            status = "⚠️ Не удалось проверить результат рынка"
+            status = "⚠️ Unknown"
         else:
             if payout is not None:
-                status = (
-                    "✅ Победа"
-                    if payout == 1
-                    else "Проигрыш"
-                    if payout == 0
-                    else "Разделённая выплата"
-                )
-                return payout, status, f"Выплата ${payout:.4f}/share · ожидает зачисления"
-            status = "⏳ Результат ещё не подтверждён"
+                status = "✅ Won" if payout == 1 else "❌ Lost" if payout == 0 else "◦ Split"
+                return payout, status, f"Выплата ${payout:.2f}/share"
+            status = "🟢 Open"
         # An unavailable resolution endpoint must not hide a usable quote.
         try:
             book = await self.engine.client.get_book(row.token_id)
         except Exception as exc:
             log.warning("portfolio_book_failed", token_id=row.token_id, error=str(exc))
-            return None, status, "Стакан недоступен · оценка неизвестна"
+            return None, status, "Стакан недоступен"
         if not book.bids:
             try:
                 last = await self.engine.client.get_last_trade_price(row.token_id)
             except Exception as exc:
                 log.warning("portfolio_last_trade_failed", token_id=row.token_id, error=str(exc))
-                return None, status, "Нет bid · mark last trade недоступен"
+                return None, status, "Нет bid, last trade недоступен"
             if last is None or not isinstance(last, Decimal):
-                return None, status, "Нет bid и last trade · оценка неизвестна"
-            return last, status, "Mark по последней сделке; исполнимой заявки на продажу сейчас нет"
-        return (
-            book.bids[0][0],
-            status,
-            "Оценка по лучшему bid до комиссии; весь объём может стоить меньше",
-        )
+                return None, status, "Нет bid и last trade"
+            return last, status, "Mark по последней сделке"
+        return book.bids[0][0], status, "Оценка по лучшему bid"
 
     async def _portfolio_text_v2(self, page: int = 0) -> str:
         rows, _account = await self._portfolio_data_v2()
@@ -413,17 +426,18 @@ class TelegramApp:
 
         quote_results = await asyncio.gather(*(quote_position(row) for row in rows))
         quotes = [
-            (row, quote) for row, (quote, _status, _note) in zip(rows, quote_results, strict=True)
+            (row, quote, status)
+            for row, (quote, status, _note) in zip(rows, quote_results, strict=True)
         ]
 
         total_cost = sum((row.cost_basis for row in rows), Decimal(0))
         known_value = sum(
-            (row.shares * quote for row, quote in quotes if quote is not None),
+            (row.shares * quote for row, quote, _ in quotes if quote is not None),
             Decimal(0),
         )
-        unknown_count = sum(quote is None for _, quote in quotes)
+        unknown_count = sum(quote is None for _, quote, _ in quotes)
 
-        for index, (row, quote) in enumerate(
+        for index, (row, quote, status) in enumerate(
             quotes[page * per_page : (page + 1) * per_page],
             start=page * per_page + 1,
         ):
@@ -437,12 +451,7 @@ class TelegramApp:
             now = f"{quote * 100:.2f}¢" if quote is not None else "—"
             value_text = f"${value:.2f}" if value is not None else "—"
             pnl_text = (
-                (
-                    (f"+${pnl_value:.2f}" if pnl_value >= 0 else f"-${abs(pnl_value):.2f}")
-                    + f" ({pnl_pct:+.1f}%)"
-                )
-                if pnl_pct is not None
-                else "—"
+                f"{signed_money(pnl_value)} ({pnl_pct:+.1f}%)" if pnl_pct is not None else "—"
             )
             lines.append(
                 f"\n{index}. <b>{html.escape(row.title[:95])}</b>\n"
@@ -451,7 +460,7 @@ class TelegramApp:
                 f"  ├ Cost/Value: ${row.cost_basis:.2f} → {value_text}\n"
                 f"  ├ PnL: {pnl_text}\n"
                 f"  ├ To Win: ${row.shares:.2f}\n"
-                f"  └ Status: 🟢 Open"
+                f"  └ Status: {status}"
             )
 
         if unknown_count:
@@ -460,8 +469,9 @@ class TelegramApp:
             total_pnl = known_value - total_cost
             total_pct = total_pnl / total_cost * 100 if total_cost else Decimal(0)
             icon = "📈" if total_pnl >= 0 else "📉"
-            total_pnl_text = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
-            lines.append(f"\n<b>{icon} Total PnL: {total_pnl_text} ({total_pct:+.1f}%)</b>")
+            lines.append(
+                f"\n<b>{icon} Total PnL: {signed_money(total_pnl)} ({total_pct:+.1f}%)</b>"
+            )
         if total_pages > 1:
             lines.append(f"\nPage {page + 1}/{total_pages}")
         return "\n".join(lines)
@@ -486,95 +496,28 @@ class TelegramApp:
         async with SessionLocal() as session:
             row = await session.get(Position, position_id)
         if not row:
-            return "<b>Позиция больше не открыта</b>\nПроверьте продажу или выплату в разделе «История»."
+            return "<b>Позиция закрыта</b>"
         quote, status, note = await self._position_quote(row)
         value = row.shares * quote if quote is not None else None
         pnl = value - row.cost_basis if value is not None else None
         pnl_pct = pnl / row.cost_basis * 100 if pnl is not None and row.cost_basis else None
-        lines = [
-            f"<b>📌 {html.escape(row.title)}</b>",
-            f"Исход: <b>{html.escape(row.outcome)}</b>",
-            f"Количество: {row.shares:.6f} shares",
-            f"Средняя себестоимость с комиссией: ${row.average_price:.6f}",
-            f"Затрачено: ${row.cost_basis:.4f}",
-            f"Статус: {status}",
-        ]
-        lines.append(
-            f"Текущая оценка: ${value:.4f}" if value is not None else "Текущая оценка: неизвестна"
+        now = f"{quote * 100:.2f}¢" if quote is not None else "—"
+        value_text = f"${value:.2f}" if value is not None else "—"
+        pnl_text = f"{signed_money(pnl)} ({pnl_pct:+.1f}%)" if pnl_pct is not None else "—"
+        return "\n".join(
+            [
+                f"📌 <b>{html.escape(row.title)}</b>",
+                "",
+                f"Position: {row.shares:.2f} {html.escape(row.outcome)}",
+                f"Avg/Now: {row.average_price * 100:.2f}¢ → {now}",
+                f"Cost/Value: ${row.cost_basis:.2f} → {value_text}",
+                f"PnL: {pnl_text}",
+                f"To Win: ${row.shares:.2f}",
+                f"Status: {status}",
+                "",
+                f"<i>{note} · {datetime.now(UTC):%H:%M} UTC</i>",
+            ]
         )
-        if pnl_pct is not None:
-            pnl_text = f"+${pnl:.4f}" if pnl >= 0 else f"-${abs(pnl):.4f}"
-            lines.append(f"Текущий PNL: <b>{pnl_text} ({pnl_pct:+.1f}%)</b>")
-        lines.append(f"Выплата при победе: ${row.shares:.4f}")
-        lines.append(note)
-        lines.append(f"\nОбновлено: {datetime.now(UTC):%H:%M:%S} UTC")
-        return "\n".join(lines)
-
-    async def _portfolio_text(self) -> str:
-        async with SessionLocal() as session:
-            rows = await positions(session)
-            account = await get_or_create_account(session, self.settings.paper_initial_balance)
-            await session.commit()
-        lines = [
-            "<b>📊 Портфель · PAPER</b>",
-            f"Свободно: <b>${account.paper_balance:.2f}</b>",
-            f"Зафиксированный PNL: ${account.realized_pnl:+.2f}",
-        ]
-        marked_value = Decimal(0)
-        unknown = 0
-        for row in rows:
-            current = None
-            label = "лучшая цена продажи"
-            try:
-                payout = await self.engine.client.get_resolution(
-                    row.condition_id, row.outcome, row.token_id
-                )
-                if payout is not None:
-                    current = payout
-                    label = "выплата за share · ожидает зачисления"
-                else:
-                    book = await self.engine.client.get_book(row.token_id)
-                    if book.bids:
-                        current = book.bids[0][0]
-                    else:
-                        current = await self.engine.client.get_last_trade_price(row.token_id)
-                        if isinstance(current, Decimal):
-                            label = "последняя сделка · не гарантирует продажу"
-            except Exception as exc:
-                log.warning("portfolio_quote_unavailable", token_id=row.token_id, error=str(exc))
-            title = html.escape(row.title[:180])
-            outcome = html.escape(row.outcome)
-            entry = f"\n<b>{title}</b>\n{outcome} · {row.shares:.4f} shares\nЗатрачено: ${row.cost_basis:.2f}"
-            if current is None:
-                unknown += 1
-                entry += "\nЦена и PNL: <b>нет подтверждённых данных</b>"
-            else:
-                value = row.shares * current
-                marked_value += value
-                entry += f"\n{label}: ${current:.4f}\nОценка: ${value:.2f} · PNL ${value - row.cost_basis:+.2f}"
-            lines.append(entry)
-        if unknown:
-            summary = f"Общая стоимость и PNL: <b>недоступны</b>\nНет цены у позиций: {unknown}"
-        else:
-            equity = account.paper_balance + marked_value
-            summary = (
-                f"Оценка позиций: ${marked_value:.2f}\n"
-                f"Общая оценка: <b>${equity:.2f}</b> · PNL ${equity - account.starting_balance:+.2f}\n"
-                "Оценка по лучшему bid до комиссии; продажа всего объёма может дать меньше."
-            )
-        lines.insert(2, summary)
-        if not rows:
-            lines.append("\nОткрытых позиций нет.")
-        # Keep one Telegram screen under the platform text limit.
-        rendered = []
-        length = 0
-        for line in lines:
-            if length + len(line) > 3600:
-                rendered.append("\nОстальные позиции скрыты: превышен размер экрана.")
-                break
-            rendered.append(line)
-            length += len(line) + 1
-        return "\n".join(rendered)
 
     async def _orders_text_v2(self, page: int = 0, status_filter: str = "all") -> str:
         async with SessionLocal() as session:
@@ -648,43 +591,37 @@ class TelegramApp:
         }
         reasons = {
             **SIZING_REASONS,
-            "no_liquidity_within_slippage": "цена вышла за slippage",
+            "no_liquidity_within_slippage": "цена вне slippage",
             "no_liquidity": "нет ликвидности",
-            "below_min_order_size": "меньше минимума",
-            "below_min_copy_notional": "расчётная сумма ниже нашего минимума",
+            "below_min_order_size": "меньше минимума биржи",
+            "below_min_copy_notional": "ниже нашего минимума",
             "insufficient_balance": "недостаточно средств",
-            "no_position_to_sell": "у нас нет позиции для повторения продажи",
+            "no_position_to_sell": "нет позиции для продажи",
             "invalid_size_or_price": "некорректный размер или цена",
-            "market_data:market_not_accepting_orders": "рынок уже не принимает ордера",
+            "market_data:market_not_accepting_orders": "рынок закрыт для ордеров",
             "market_data:unsupported_fee_exponent": "устаревший расчёт комиссии",
         }
-        lines = [
-            "<b>🧾 ИСТОРИЯ · PAPER</b>",
-            "Сделки и пропуски копирования — без технического шума.",
-        ]
+        lines = ["<b>🧾 История</b>"]
         if pending:
             lines.append("\n<b>⏳ Незавершённые выходы</b>")
             for intent, name, title in pending:
                 lines.append(
                     f"{html.escape(name or 'Лидер')} · {html.escape((title or intent.token_id)[:65])}"
-                    f"\nОстаток {intent.remaining:.4f} shares · не ниже {intent.min_price * 100:.2f}¢"
+                    f"\n{intent.remaining:.2f} shares · мин. {intent.min_price * 100:.1f}¢"
                 )
-            lines.append(
-                "Повторяем по актуальному стакану в пределах лимита. Пауза останавливает повторы.\n"
-                if self.settings.exit_retry_enabled
-                else "Автоматические повторы выключены в настройках сервера.\n"
-            )
+            if not self.settings.exit_retry_enabled:
+                lines.append("Автоповторы выключены")
         if not current:
-            lines.append("\nЗаписей в этом фильтре нет.")
+            lines.append("\nЗаписей нет.")
         for row in current:
             when = row.created_at.strftime("%d.%m %H:%M") if row.created_at else "—"
             trade = trades_by_id.get(row.copy_trade_id)
             raw_reason = row.reason or ""
             reason = reasons.get(raw_reason, raw_reason)
             if raw_reason.startswith("book_error:"):
-                reason = "не удалось получить актуальный стакан"
+                reason = "стакан недоступен"
             elif raw_reason.startswith("market_data:") and raw_reason not in reasons:
-                reason = "не удалось подтвердить параметры рынка"
+                reason = "нет параметров рынка"
             header = f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>"
             market = metadata.get(row.token_id)
             if market:
@@ -693,44 +630,40 @@ class TelegramApp:
                 details = []
                 if trade:
                     details.append(
-                        f"Лидер: {trade.leader_size:.4f} shares @ ${trade.leader_price:.4f}"
+                        f"Лидер: {trade.leader_size:.2f} shares @ {trade.leader_price * 100:.1f}¢"
                     )
                 if row.requested_shares > 0:
-                    details.append(f"Наша заявка: {row.requested_shares:.4f} shares")
+                    details.append(f"Заявка: {row.requested_shares:.2f} shares")
                 details.append(f"Причина: {html.escape(reason or 'нет исполнения')}")
                 if trade and trade.status == "retry_pending":
-                    details.append(
-                        "⏳ Следим за ценой: BUY исполнится, если цена вернётся в лимит до продажи лидера."
-                    )
+                    details.append("⏳ ждём возврата цены")
                 elif (
                     trade
                     and trade.status == "executed"
                     and raw_reason in CopyEngine.RETRYABLE_BUY_REASONS
                 ):
-                    details.append("✅ Позже цена вернулась в лимит, и BUY был исполнен.")
+                    details.append("✅ исполнен позже")
                 elif trade:
                     terminal = {
-                        "market_settled": "Позже позиция закрыта выплатой по результату рынка.",
-                        "exit_completed_in_series": "Позже общий выход серии исполнен.",
-                        "position_closed": "Позиция уже закрыта; повтор выхода не требуется.",
-                        "leader_sold": "Лидер продал позицию до возврата цены; отложенный BUY отменён.",
-                        "risk_exit": "Отложенный BUY отменён после срабатывания правила риска.",
+                        "market_settled": "закрыто выплатой",
+                        "exit_completed_in_series": "выход исполнен",
+                        "position_closed": "позиция закрыта",
+                        "leader_sold": "лидер продал",
+                        "risk_exit": "сработало правило риска",
                     }
                     if trade.skip_reason in terminal:
                         details.append(terminal[trade.skip_reason])
                 lines.append(header + "\n" + "\n".join(details))
             elif row.status == "settled":
                 proceeds = row.filled_shares * row.average_fill_price
-                lines.append(
-                    header + f"\nЗакрыто: {row.filled_shares:.4f} shares · выплата ${proceeds:.4f}"
-                )
+                lines.append(header + f"\n{row.filled_shares:.2f} shares · выплата ${proceeds:.2f}")
             else:
                 lines.append(
                     header
-                    + f"\nИсполнено: {row.filled_shares:.4f} shares @ ${row.average_fill_price:.4f}"
-                    + (f" · комиссия ${row.fee:.5f}" if row.fee else "")
+                    + f"\n{row.filled_shares:.2f} shares @ {row.average_fill_price * 100:.1f}¢"
                 )
-        lines.append(f"\nСтраница {page + 1}/{total_pages}")
+        if total_pages > 1:
+            lines.append(f"\nСтраница {page + 1}/{total_pages}")
         return "\n".join(lines)
 
     async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):
@@ -767,78 +700,58 @@ class TelegramApp:
             policy = await get_execution_policy(session, self.settings)
             await session.commit()
         return (
-            "<b>⚙️ НАСТРОЙКИ</b>\n\n" + self._sizing_summary(account) + "\n\n"
-            "<b>Исполнение и риск</b>\n"
-            "Цена BUY: <b>2–98¢ включительно</b> · у лидера и в нашем стакане.\n"
-            "SELL и выплаты этим диапазоном не ограничены.\n"
-            f"Минимум BUY: ${self.settings.min_copy_notional:.2f} · лимит на исход: ${self.settings.max_outcome_exposure:.2f}\n"
-            "Также действует минимум shares из стакана.\n"
-            f"Допустимое отклонение цены: <b>{policy.slippage_price * 100:.2f}¢</b>\n"
-            "Возраст сигнала: только диагностика (BUY не отбрасывается по времени)\n"
-            "Дневной лимит: выключен · Buy-only: выключен\n\n"
-            "Подробности — кнопками ниже. Команды: /setmax, /setslippage, /risk."
+            "<b>⚙️ Настройки</b>\n\n" + self._sizing_summary(account) + "\n\n"
+            "<b>Исполнение</b>\n"
+            "Цена BUY: <b>2–98¢</b>\n"
+            f"Минимум BUY: <b>${self.settings.min_copy_notional:.2f}</b>\n"
+            f"Лимит на исход: <b>${self.settings.max_outcome_exposure:.2f}</b>\n"
+            f"Резерв кэша: <b>{self.settings.min_cash_reserve_pct * 100:.0f}%</b> капитала\n"
+            f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>"
         )
 
     def _sizing_summary(self, account) -> str:
         if not self.settings.smart_sizing_enabled:
             return (
-                "<b>Размер копирования · классический</b>\n"
-                f"Фиксированный предел: <b>${account.trade_size:.2f}</b> · максимум ${account.max_trade_size:.2f}\n"
-                f"От свободного баланса: {self.settings.copy_balance_pct * 100:.1f}%\n"
-                f"Масштаб отдельной сделки лидера: {self.settings.leader_order_scale * 100:.1f}%\n"
-                "Изменить предел: /setsize 5 · максимум: /setmax 30"
+                "<b>Размер · классический</b>\n"
+                f"Размер сделки: <b>${account.trade_size:.2f}</b> · максимум ${account.max_trade_size:.2f}\n"
+                f"От баланса: {self.settings.copy_balance_pct * 100:.1f}% · "
+                f"от сделки лидера: {self.settings.leader_order_scale * 100:.1f}%\n"
+                "/setsize 5 · /setmax 30"
             )
         base = max(Decimal(0), account.paper_balance) * self.settings.copy_balance_pct
         return (
-            "<b>Размер копирования · адаптивный</b>\n"
+            "<b>Размер · адаптивный</b>\n"
             f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · сейчас ${base:.2f}\n"
-            f"Размер серии лидера / его типичный вход · до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
-            "Odds мягко меняют размер; худшая цена исполнения уменьшает бюджет.\n"
-            f"Максимум на серию: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
-            f"Покупки одного исхода за {self.settings.smart_sizing_burst_seconds} с делят один бюджет.\n"
-            "/setsize не влияет на адаптивный режим. Максимум: /setmax 30"
+            f"Масштаб: до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
+            f"Максимум серии: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
+            f"Окно серии: {self.settings.smart_sizing_burst_seconds} с\n"
+            "/setsize не влияет на адаптивный режим · /setmax 30"
         )
 
     def _sizing_help(self) -> str:
         if not self.settings.smart_sizing_enabled:
             return (
-                "<b>💵 Размер сделки · классический</b>\n"
-                "Бюджет ограничен свободными деньгами, их процентом, размером сделки лидера "
-                "и установленными пределами.\n\n/setsize 5 · /setmax 30"
+                "<b>💵 Размер сделки · классический</b>\n\n"
+                "Бюджет = min(свободные деньги, % от баланса, доля сделки лидера, пределы)\n\n"
+                "/setsize 5 · /setmax 30"
             )
         return (
-            "<b>💵 Как рассчитывается вход</b>\n\n"
-            f"1. База — {self.settings.copy_balance_pct * 100:.1f}% свободных денег в начале серии.\n"
-            "2. Масштаб — сумма BUY трейдера в серии / его типичная серия.\n"
-            "3. Цена контракта мягко корректирует размер: низкие odds уменьшают его, "
-            "высокие немного увеличивают. Это не считается точной вероятностью.\n"
-            f"4. Масштаб ограничен {self.settings.smart_sizing_max_multiplier:g}×. "
-            "Если наша цена выше средней цены трейдера в серии, бюджет уменьшается "
-            "в отношении этих цен. Лучшая цена бюджет не увеличивает.\n"
-            "5. Из целевого бюджета вычитаем уже потраченное в этой серии, включая комиссии.\n\n"
-            f"Серия — трейдер + исход + фиксированное окно {self.settings.smart_sizing_burst_seconds} с "
-            "по времени сделки. На границе окна близкие сделки могут разделиться. "
-            "Бот не ждёт окончания окна. Мелкие добавки накапливаются только внутри него.\n\n"
-            "Пять покупок по $20 внутри окна считаются одной серией на $100. "
-            "Для каждого лидера на его экране можно задать фиксированный бюджет серии. "
-            "Slippage, доступные деньги и лимит на исход остаются обязательными.\n\n"
-            "<b>/setmax 30</b> — потолок серии с комиссиями. "
-            "/setsize действует только в классическом режиме. "
-            "Процент базы меняется через COPY_BALANCE_PCT в .env; "
-            "после изменения контейнер нужно пересоздать."
+            "<b>💵 Расчёт входа</b>\n\n"
+            f"База — {self.settings.copy_balance_pct * 100:.1f}% свободных денег на старте серии.\n"
+            f"Масштаб — серия трейдера / его типичная серия, до "
+            f"{self.settings.smart_sizing_max_multiplier:g}×.\n"
+            "Цена — если наша хуже средней цены трейдера, бюджет уменьшается. "
+            "Лучшая цена бюджет не увеличивает.\n"
+            "Odds — низкая цена контракта уменьшает размер, высокая немного увеличивает.\n"
+            "Из цели вычитается уже потраченное в серии, включая комиссии.\n\n"
+            f"<b>Серия</b> — трейдер + исход + окно {self.settings.smart_sizing_burst_seconds} с "
+            "по времени сделки. Пять покупок по $20 внутри окна — одна серия на $100. "
+            "Бот не ждёт окончания окна. На границе окна близкие сделки могут разделиться.\n\n"
+            "Типичная серия — по последним 500 записям за 7 дней; "
+            "при 10+ сериях крайние 10% отбрасываются. Это не баланс трейдера.\n\n"
+            "Фиксированный бюджет серии задаётся в карточке трейдера. "
+            "Slippage, свободные деньги и лимит на исход действуют всегда."
         )
-
-    async def _orders_text(self) -> str:
-        async with SessionLocal() as session:
-            rows = await orders(session)
-        if not rows:
-            return "<b>📋 Ордера</b>\nОрдеров пока нет."
-        lines = ["<b>📋 Последние paper-ордера</b>"]
-        for row in rows[:15]:
-            lines.append(
-                f"{row.side} {row.status}: {row.filled_shares:.4f} @ ${row.average_fill_price:.4f} ({html.escape(row.reason or 'copy')})"
-            )
-        return "\n".join(lines)
 
     def _settings_keyboard_v2(self):
         builder = InlineKeyboardBuilder()
@@ -846,12 +759,10 @@ class TelegramApp:
         builder.button(text="📏 Лимиты", callback_data="settings:limits")
         builder.button(text="📉 Slippage", callback_data="settings:slippage")
         builder.button(text="🛡️ Stop-loss / TP", callback_data="settings:risk")
+        builder.button(text="🧪 Сброс базы", callback_data="reset_prompt")
         builder.button(text="⬅️ На главную", callback_data="home")
-        builder.adjust(2, 2, 1)
+        builder.adjust(2, 2, 1, 1)
         return builder.as_markup()
-
-    async def _settings_text(self) -> str:
-        return await self._settings_text_v2()
 
     def _register(self) -> None:
         self.dp.message.register(self.start, Command("start"))
@@ -867,6 +778,8 @@ class TelegramApp:
         self.dp.message.register(self.setsize, Command("setsize"))
         self.dp.message.register(self.setmax, Command("setmax"))
         self.dp.message.register(self.setslippage, Command("setslippage"))
+        self.dp.message.register(self.addbalance, Command("addbalance"))
+        self.dp.message.register(self.reset, Command("reset"))
         self.dp.message.register(self.toggle, Command("pause"))
         self.dp.message.register(self.toggle, Command("resume"))
         self.dp.message.register(self.receive_leader, StateFilter(LeaderForm.address))
@@ -886,11 +799,7 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(
-            "<b>❓ Помощь</b>\nУправляй ботом кнопками ниже. Добавление лидеров: 👥 Лидеры → ➕ Добавить лидера.\n\nКоманды /setsize, /setmax, /setslippage и /risk остаются доступны.",
-            self._back(),
-            message.chat.id,
-        )
+        await self._edit_panel(self.HELP_TEXT, self._back(), message.chat.id)
 
     async def status(self, message: Message) -> None:
         if not self._allowed(message):
@@ -942,7 +851,7 @@ class TelegramApp:
             await state.set_state(LeaderForm.address)
             await self._delete_input(message)
             await self._edit_panel(
-                "<b>➕ Добавление лидера</b>\nОтправь EVM-адрес кошелька (0x + 40 hex-символов). Это сообщение будет удалено после обработки.",
+                "<b>➕ Новый трейдер</b>\nОтправьте адрес кошелька: 0x + 40 hex-символов.",
                 self._back(),
                 message.chat.id,
             )
@@ -954,7 +863,7 @@ class TelegramApp:
         await self._delete_input(message)
         if not ADDRESS_RE.fullmatch(address):
             await self._edit_panel(
-                "❌ Неверный адрес. Нужен формат 0x + 40 hex-символов. Попробуй ещё раз.",
+                "❌ Неверный адрес. Нужен формат 0x + 40 hex-символов.",
                 self._back(),
                 message.chat.id,
             )
@@ -1039,7 +948,7 @@ class TelegramApp:
             setattr(account, field, value)
             await session.commit()
         note = (
-            "\nСохранено для классического режима; в адаптивном режиме /setsize не используется."
+            "\n/setsize не используется в адаптивном режиме."
             if field == "trade_size" and self.settings.smart_sizing_enabled
             else ""
         )
@@ -1082,6 +991,76 @@ class TelegramApp:
         await self._edit_panel(
             f"✅ Slippage: {cents:.2f}¢ (${cents / 100:.4f})", self._back(), message.chat.id
         )
+
+    async def addbalance(self, message: Message) -> None:
+        """Deposit paper cash. Starting balance moves too, so PNL stays a result."""
+        if not self._allowed(message):
+            return
+        parts = (message.text or "").split()
+        await self._delete_input(message)
+        try:
+            amount = Decimal(parts[1].replace(",", ".")) if len(parts) == 2 else Decimal(0)
+        except (InvalidOperation, IndexError):
+            amount = Decimal(0)
+        if not amount.is_finite() or amount <= 0:
+            await self._edit_panel("Формат: /addbalance 50", self._back(), message.chat.id)
+            return
+        async with self.engine._ledger_lock.hold(0), SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            account.paper_balance += amount
+            account.starting_balance += amount
+            balance = account.paper_balance
+            await session.commit()
+        await self._edit_panel(
+            f"✅ Пополнено на ${amount:.2f}\nБаланс: <b>${balance:.2f}</b>",
+            self._back(),
+            message.chat.id,
+        )
+
+    async def reset(self, message: Message) -> None:
+        if not self._allowed(message):
+            return
+        await self._delete_input(message)
+        await self._reset_prompt(message.chat.id)
+
+    async def _reset_prompt(self, chat_id: int) -> None:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Да, стереть", callback_data="reset_confirm")
+        builder.button(text="Отмена", callback_data="home")
+        await self._edit_panel(
+            "<b>Сбросить базу?</b>\n"
+            "Удалятся сделки, ордера, позиции, серии и незавершённые выходы.\n"
+            f"Баланс станет ${self.settings.paper_initial_balance:.2f}.\n\n"
+            "Трейдеры и их статистика останутся. Отменить нельзя.",
+            builder.as_markup(),
+            chat_id,
+        )
+
+    async def _reset_database(self) -> Decimal:
+        """Wipe trading state for a clean test run; keep leaders and profiles."""
+        async with self.engine._ledger_lock.hold(0), SessionLocal() as session:
+            for model in (
+                SourceReceipt,
+                SourceObservation,
+                SizingAudit,
+                SizingEntry,
+                BuyIntent,
+                ExitIntent,
+                LeaderPosition,
+                RiskRule,
+                PaperOrder,
+                Position,
+                CopyTrade,
+            ):
+                await session.execute(delete(model))
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            account.paper_balance = self.settings.paper_initial_balance
+            account.starting_balance = self.settings.paper_initial_balance
+            account.realized_pnl = Decimal(0)
+            await session.commit()
+        # In-memory batches reference rows that no longer exist.
+        self.engine._buy_batches.clear()
+        return self.settings.paper_initial_balance
 
     async def risk(self, message: Message) -> None:
         if not self._allowed(message):
@@ -1177,19 +1156,35 @@ class TelegramApp:
             section = data.split(":", 1)[1]
             details = {
                 "sizing": self._sizing_help(),
-                "limits": "📏 <b>Лимиты</b>\nДневной лимит выключен. В адаптивном режиме лимиты серии и исхода учитывают комиссии. Максимум серии меняется через /setmax; он хранится в базе и не перезаписывается из .env.",
-                "slippage": "📉 <b>Slippage</b>\nАбсолютное отклонение цены: 5¢ = $0.05. Изменить: /setslippage 5",
-                "risk": "🛡️ <b>Stop-loss / Take-profit</b>\nНастраиваются для конкретного token_id: /risk TOKEN sl=0.2 tp=0.25 trail=0.1",
+                "limits": (
+                    "<b>📏 Лимиты</b>\n\n"
+                    "Лимиты серии и исхода учитывают комиссии.\n"
+                    "Максимум серии хранится в базе и не перезаписывается из .env.\n\n"
+                    "/setmax 30"
+                ),
+                "slippage": (
+                    "<b>📉 Slippage</b>\n\n"
+                    "Абсолютное отклонение цены: 5¢ = $0.05.\n\n"
+                    "/setslippage 5"
+                ),
+                "risk": (
+                    "<b>🛡️ Stop-loss / Take-profit</b>\n\n"
+                    "Задаются для конкретного token_id.\n\n"
+                    "/risk TOKEN sl=0.2 tp=0.25 trail=0.1"
+                ),
             }
             await self._edit_panel(
                 details.get(section, "Раздел не найден"), self._settings_keyboard_v2(), chat_id
             )
-        elif data == "help":
+        elif data == "reset_prompt":
+            await self._reset_prompt(chat_id)
+        elif data == "reset_confirm":
+            balance = await self._reset_database()
             await self._edit_panel(
-                "<b>❓ Помощь</b>\nИспользуй кнопки панели. Команды настройки доступны из меню.",
-                self._back(),
-                chat_id,
+                f"✅ База очищена. Баланс: <b>${balance:.2f}</b>", self._back(), chat_id
             )
+        elif data == "help":
+            await self._edit_panel(self.HELP_TEXT, self._back(), chat_id)
         elif data == "toggle":
             async with SessionLocal() as session:
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
@@ -1205,7 +1200,7 @@ class TelegramApp:
         elif data == "leader_add":
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).set_state(LeaderForm.address)
             await self._edit_panel(
-                "<b>➕ Добавление лидера</b>\nОтправь EVM-адрес кошелька (0x + 40 hex-символов).",
+                "<b>➕ Новый трейдер</b>\nОтправьте адрес кошелька: 0x + 40 hex-символов.",
                 self._back(),
                 chat_id,
             )
@@ -1230,9 +1225,8 @@ class TelegramApp:
             builder = InlineKeyboardBuilder()
             builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
             await self._edit_panel(
-                "<b>💵 Фиксированная сумма</b>\n\n"
-                "Отправьте сумму в долларах. Она станет общим бюджетом одной серии "
-                "покупок этого трейдера, включая комиссии.\n\n"
+                "<b>💵 Фиксированная сумма</b>\n"
+                "Бюджет одной серии покупок, включая комиссию.\n\n"
                 f"Допустимо: ${self.settings.min_copy_notional:.2f}–${account.max_trade_size:.2f}",
                 builder.as_markup(),
                 chat_id,
@@ -1253,7 +1247,7 @@ class TelegramApp:
             )
             builder.button(text="Отмена", callback_data=f"leader_view:{raw_id}:{raw_page}")
             await self._edit_panel(
-                "<b>Удалить трейдера?</b>\nКопирование новых сделок будет остановлено. История и позиции сохранятся.",
+                "<b>Удалить трейдера?</b>\nКопирование остановится. История и позиции сохранятся.",
                 builder.as_markup(),
                 chat_id,
             )

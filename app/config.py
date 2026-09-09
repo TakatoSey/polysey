@@ -49,8 +49,22 @@ class Settings(BaseSettings):
     smart_sizing_stats_refresh_seconds: int = Field(
         default=86400, ge=60, alias="SMART_SIZING_STATS_REFRESH_SECONDS"
     )
+    # How long a market's unresolved state is reused before asking again. This
+    # is the dominant delay in noticing a settlement, not the maintenance loop.
+    resolution_cache_seconds: float = Field(
+        default=5.0, ge=1, le=120, alias="RESOLUTION_CACHE_SECONDS"
+    )
     min_copy_notional: Decimal = Field(default=Decimal("1.10"), alias="MIN_COPY_NOTIONAL")
     max_outcome_exposure: Decimal = Field(default=Decimal("50"), alias="MAX_OUTCOME_EXPOSURE")
+    # Cash kept back from equity so a burst of signals cannot deploy everything.
+    min_cash_reserve_pct: Decimal = Field(
+        default=Decimal("0.25"), ge=0, lt=1, alias="MIN_CASH_RESERVE_PCT"
+    )
+    # How far the exchange minimum may exceed our own base before we skip the
+    # market instead of overspending to reach it.
+    sizing_floor_max_multiple: Decimal = Field(
+        default=Decimal("2"), ge=1, le=10, alias="SIZING_FLOOR_MAX_MULTIPLE"
+    )
     # Human units: 5 cents = $0.05; stored separately from legacy percentage bps.
     default_slippage_cents: Decimal = Field(
         default=Decimal("5"), ge=0, lt=100, alias="DEFAULT_SLIPPAGE_CENTS"

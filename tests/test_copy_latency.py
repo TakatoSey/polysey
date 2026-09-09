@@ -163,7 +163,9 @@ async def test_concurrent_buys_cannot_overspend_and_replay_is_idempotent(rig):
     rig.engine._schedule_copy(1, first)  # duplicate after process restart / REST retry
     await drain(rig.engine)
     async with rig.sessions() as session:
-        assert (await session.get(Account, 1)).paper_balance == 0
+        # The cash reserve holds back 25% of equity, so the second buy has no
+        # room left instead of draining the account to zero.
+        assert (await session.get(Account, 1)).paper_balance == Decimal("1.25")
         orders = list(await session.scalars(select(PaperOrder)))
         assert len(orders) == 2
         assert sorted(o.status for o in orders) == ["filled", "rejected"]

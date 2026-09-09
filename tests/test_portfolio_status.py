@@ -23,9 +23,9 @@ async def test_resolved_position_uses_payout_without_orderbook(payout):
     client.get_resolution.return_value = payout
     quote, status, note = await panel(client)._position_quote(POSITION)
     assert quote == payout
-    assert "ожидает зачисления" in note
+    assert "Выплата" in note
     if payout == Decimal("0.5"):
-        assert "Разделённая" in status
+        assert "Split" in status
     client.get_book.assert_not_called()
 
 
@@ -36,7 +36,7 @@ async def test_resolution_error_does_not_hide_book_quote():
     client.get_book.return_value = SimpleNamespace(bids=[(Decimal("0.4"), Decimal(20))])
     quote, status, _ = await panel(client)._position_quote(POSITION)
     assert quote == Decimal("0.4")
-    assert "Не удалось проверить" in status
+    assert "Unknown" in status
 
 
 @pytest.mark.asyncio
@@ -63,7 +63,7 @@ async def test_empty_bid_uses_last_trade_mark_without_claiming_executable_sell()
     quote, _, note = await panel(client)._position_quote(POSITION)
     assert quote == Decimal("0.01")
     assert "Mark" in note
-    assert "исполнимой" in note
+    assert "последней сделке" in note
 
 
 @pytest.mark.asyncio

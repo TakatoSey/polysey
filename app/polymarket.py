@@ -396,7 +396,7 @@ class PolymarketClient:
     ) -> Decimal | None:
         cache_key = (condition_id, token_id or outcome.casefold())
         cached = self._resolution_cache.get(cache_key)
-        if cached and time.monotonic() - cached[0] < 15:
+        if cached and time.monotonic() - cached[0] < self.settings.resolution_cache_seconds:
             return cached[1]
         market = await self.get_market(condition_id)
         tokens = market.get("tokens") or []
