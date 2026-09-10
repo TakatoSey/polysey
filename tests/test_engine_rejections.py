@@ -136,3 +136,47 @@ def test_buy_notification_contains_outcome_link_amount_and_shares():
     assert "<b>You bought:</b> $1.85 (5.00 shares)" in message
     assert "<b>Entry Price:</b> 37.0¢" in message
     assert "Fee" not in message
+
+
+def test_market_title_carries_the_polymarket_link_in_buy_and_settlement():
+    event = LeaderActivity(
+        event_key="event",
+        timestamp=1,
+        condition_id="condition",
+        token_id="token",
+        side="BUY",
+        size=Decimal(10),
+        price=Decimal("0.5"),
+        title="Bitcoin Up or Down",
+        outcome="Up",
+        slug="btc-updown-15m",
+        event_slug="btc-series",
+    )
+    fill = Fill(
+        shares=Decimal(5),
+        average_price=Decimal("0.5"),
+        notional=Decimal("2.5"),
+        fee=Decimal(0),
+        status="filled",
+    )
+    leader = SimpleNamespace(address="0x" + "a" * 40, label=None)
+
+    buy = CopyEngine.build_buy_notification(leader, event, fill)
+    assert '<a href="https://polymarket.com/event/btc-series/btc-updown-15m">Bitcoin' in buy
+    assert "View on Polymarket" not in buy
+
+    settled = CopyEngine.build_settlement_notification(
+        event.title, "Up", Decimal(5), Decimal(1), Decimal("2.5"), event.slug, event.event_slug
+    )
+    assert '<a href="https://polymarket.com/event/btc-series/btc-updown-15m">Bitcoin' in settled
+    # The link lives in the title now, so PnL closes the block.
+    assert "View on Polymarket" not in settled
+    assert "  └ PnL:" in settled
+
+
+def test_a_market_without_a_stored_slug_stays_plain_text():
+    plain = CopyEngine.build_settlement_notification(
+        "Unknown market", "Yes", Decimal(5), Decimal(1), Decimal(1)
+    )
+    assert "<a href" not in plain
+    assert "Unknown market" in plain
