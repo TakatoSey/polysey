@@ -425,8 +425,13 @@ class CopyEngine:
                             leader=leader.address,
                             error=type(exc).__name__,
                         )
-            except Exception:
-                log.exception("leader_activity_failed", leader=leader.address)
+            except Exception as exc:
+                log.exception(
+                    "leader_activity_failed",
+                    leader=leader.address,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
                 if profile_task and not profile_task.done():
                     profile_task.cancel()
                 return
