@@ -485,11 +485,22 @@ class CopyEngine:
                     )
                 )
                 outstanding = []
+                duplicates = 0
                 for event in new_events:
                     if event.event_key in existing:
+                        duplicates += 1
                         continue
                     outstanding.append(event.timestamp)
                     self._schedule_copy(leader.id, event)
+                if duplicates:
+                    # The same trade reaching us over both RTDS and REST is
+                    # expected; this is the proof it collapses to one copy.
+                    log.info(
+                        "rest_duplicates_skipped",
+                        leader=leader.address,
+                        skipped=duplicates,
+                        of=len(new_events),
+                    )
                 # Never checkpoint past an uncommitted/overflowed event.
                 checkpoint = (
                     min(outstanding) if outstanding else max(e.timestamp for e in new_events)
@@ -696,12 +707,33 @@ class CopyEngine:
             event_key=first.event_key,
             fragments=len(events),
             source=first.source,
-            source_age_seconds=round(max(0, first.received_at - first.timestamp), 3),
-            prepare_ms=round((prepared.ready_at - first.received_monotonic) * 1000, 1),
-            after_prepare_ms=round((time.monotonic() - prepared.ready_at) * 1000, 1),
-            bot_ms=round((time.monotonic() - first.received_monotonic) * 1000, 1),
-            exchange_delay_seconds=prepared.exchange_delay,
+            **self._latency_fields(first, prepared),
         )
+
+    def _latency_fields(self, event, prepared) -> dict:
+        """Our own work, separated from waiting the market requires of us.
+
+        prepare_ms contains the market's own seconds_delay, so on its own it
+        reads as if the bot were slow. The mandated wait is not ours to remove:
+        skipping it would make paper faster than any live bot could be.
+        """
+        now = time.monotonic()
+        prepare_ms = (prepared.ready_at - event.received_monotonic) * 1000
+        bot_ms = (now - event.received_monotonic) * 1000
+        waited_ms = (prepared.exchange_delay + self.settings.copy_latency_seconds) * 1000
+        return {
+            "source_age_seconds": round(max(0, event.received_at - event.timestamp), 3),
+            "prepare_ms": round(prepare_ms, 1),
+            "own_prepare_ms": round(max(0.0, prepare_ms - waited_ms), 1),
+            "after_prepare_ms": round((now - prepared.ready_at) * 1000, 1),
+            "bot_ms": round(bot_ms, 1),
+            "own_bot_ms": round(max(0.0, bot_ms - waited_ms), 1),
+            "exchange_delay_seconds": prepared.exchange_delay,
+            # Docs put a 250ms taker hold on selected crypto/finance up-down
+            # markets, flagged separately from seconds_delay. Logged so the two
+            # can be compared on real markets before either is modelled.
+            "taker_hold_flag": self.client.taker_hold_flag(event.condition_id),
+        }
 
     @staticmethod
     def _valid_trade(event):
@@ -842,11 +874,7 @@ class CopyEngine:
             "copy_latency",
             event_key=event.event_key,
             source=event.source,
-            source_age_seconds=round(max(0, event.received_at - event.timestamp), 3),
-            prepare_ms=round((prepared.ready_at - event.received_monotonic) * 1000, 1),
-            after_prepare_ms=round((time.monotonic() - prepared.ready_at) * 1000, 1),
-            bot_ms=round((time.monotonic() - event.received_monotonic) * 1000, 1),
-            exchange_delay_seconds=prepared.exchange_delay,
+            **self._latency_fields(event, prepared),
         )
 
     async def _deployable_cash(self, session, account) -> Decimal:

@@ -72,6 +72,7 @@ async def rig(tmp_path, monkeypatch):
     client = SimpleNamespace(
         get_market=AsyncMock(side_effect=market),
         get_fee_rate=AsyncMock(return_value=Decimal(0)),
+        taker_hold_flag=lambda condition_id: None,
         get_book=AsyncMock(return_value=book),
         get_activity=AsyncMock(return_value=[]),
         get_resolution=AsyncMock(return_value=None),
@@ -439,3 +440,43 @@ async def test_risk_exit_delay_does_not_lock_balance(rig):
 def test_poll_interval_cannot_busy_loop(value):
     with pytest.raises(ValueError):
         Settings(_env_file=None, POLL_INTERVAL_SECONDS=value)
+
+
+def test_latency_separates_our_work_from_the_wait_the_market_requires(rig):
+    # A market that mandates a one second delay must not read as one second of
+    # our own slowness, or paper looks faster than any live bot could be.
+    now = time.monotonic()
+    event = SimpleNamespace(
+        event_key="event",
+        condition_id="condition",
+        timestamp=100,
+        received_at=100.5,
+        received_monotonic=now - 1.2,
+    )
+    prepared = SimpleNamespace(ready_at=now - 0.1, exchange_delay=1.0)
+
+    fields = rig.engine._latency_fields(event, prepared)
+
+    assert fields["exchange_delay_seconds"] == 1.0
+    assert 1090 < fields["prepare_ms"] < 1110
+    assert 90 < fields["own_prepare_ms"] < 110
+    assert fields["own_bot_ms"] < fields["bot_ms"]
+
+
+def test_an_artificial_delay_is_not_counted_as_our_own_work(rig):
+    rig.engine.settings = replace_setting(rig.engine.settings, copy_latency_seconds=0.5)
+    now = time.monotonic()
+    event = SimpleNamespace(
+        event_key="event",
+        condition_id="condition",
+        timestamp=100,
+        received_at=100.5,
+        received_monotonic=now - 0.6,
+    )
+    prepared = SimpleNamespace(ready_at=now, exchange_delay=0.0)
+
+    assert rig.engine._latency_fields(event, prepared)["own_prepare_ms"] < 110
+
+
+def replace_setting(settings, **changes):
+    return SimpleNamespace(**{**settings.model_dump(), **changes})

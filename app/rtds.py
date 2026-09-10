@@ -16,12 +16,17 @@ from .polymarket import LeaderActivity, copy_event_key
 
 log = structlog.get_logger(__name__)
 
+# A payload for somebody we do not follow is the normal case on a global feed,
+# not a defect. Kept distinct so a real schema change stays visible.
+UNTRACKED = object()
+
 
 class RTDSTradeStream:
     URL = "wss://ws-live-data.polymarket.com"
     PING_SECONDS = 5
     HEALTH_SECONDS = 30
     RECEIVE_TIMEOUT = 15
+    INVALID_SAMPLE = 500
 
     def __init__(self, on_trade, tracked_addresses=None):
         self.on_trade = on_trade
@@ -121,9 +126,21 @@ class RTDSTradeStream:
         received_at, received_monotonic = time.time(), time.monotonic()
         self.counters["frames"] += 1
         for item in self._messages(raw):
+            self.counters["payloads"] += 1
             event = self._parse(item, received_at, received_monotonic, self.tracked_addresses)
+            if event is UNTRACKED:
+                self.counters["untracked"] += 1
+                continue
             if event is None:
-                self.counters["invalid_trades"] += 1
+                self.counters["invalid"] += 1
+                # Sampled: a steady trickle is malformed data, a jump is a
+                # schema change. Keys only, never the payload itself.
+                if self.counters["invalid"] % self.INVALID_SAMPLE == 1:
+                    log.warning(
+                        "rtds_invalid_payload",
+                        seen=self.counters["invalid"],
+                        keys=sorted(item)[:12] if isinstance(item, dict) else type(item).__name__,
+                    )
                 continue
             self.counters["parsed"] += 1
             if self.last_trade_at is None:
@@ -164,7 +181,7 @@ class RTDSTradeStream:
             tx = str(item["transactionHash"]).lower()
             side = str(item["side"]).upper()
             if tracked_addresses is not None and address not in tracked_addresses:
-                return None
+                return UNTRACKED
             timestamp_value = Decimal(str(item["timestamp"]))
             size, price = Decimal(str(item["size"])), Decimal(str(item["price"]))
             if (
