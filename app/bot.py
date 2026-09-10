@@ -22,6 +22,7 @@ from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
+from .links import market_link
 from .models import (
     BuyIntent,
     CopyTrade,
@@ -116,6 +117,7 @@ class TelegramApp:
         self.bot = Bot(settings.telegram_bot_token)
         self.dp = Dispatcher(storage=MemoryStorage())
         self.panel_message_id: int | None = None
+        self._slugs: dict[str, tuple[str, str]] = {}
         self._register()
 
     def _allowed(self, obj: Message | CallbackQuery) -> bool:
@@ -334,7 +336,11 @@ class TelegramApp:
         if not row:
             await self._leaders_panel(page, chat_id)
             return
-        status = "🟢 активен" if row.active else "⚪ на паузе"
+        if not row.initialized:
+            # Until the first poll lands, RTDS events for this leader are dropped.
+            status = "⏳ инициализация"
+        else:
+            status = "🟢 активен" if row.active else "⚪ на паузе"
         label = html.escape(row.label or f"{row.address[:6]}…{row.address[-4:]}")
         sizing_mode = (
             f"фикс. ${row.fixed_trade_size:.2f} на серию"
@@ -388,10 +394,34 @@ class TelegramApp:
         builder.adjust(1)
         await self._edit_panel(text, builder.as_markup(), chat_id)
 
+    def _linked_title(self, row, limit: int = 95) -> str:
+        slug, event_slug = getattr(self, "_slugs", {}).get(row.token_id, ("", ""))
+        return market_link(row.title[:limit], slug, event_slug)
+
+    @staticmethod
+    async def _slug_map(session, token_ids) -> dict[str, tuple[str, str]]:
+        """Latest known market page per token; positions do not store slugs."""
+        if not token_ids:
+            return {}
+        rows = await session.execute(
+            select(
+                SourceObservation.token_id,
+                SourceObservation.slug,
+                SourceObservation.event_slug,
+            )
+            .where(SourceObservation.token_id.in_(token_ids), SourceObservation.slug != "")
+            .order_by(SourceObservation.timestamp.desc())
+        )
+        found: dict[str, tuple[str, str]] = {}
+        for token_id, slug, event_slug in rows:
+            found.setdefault(token_id, (slug, event_slug))
+        return found
+
     async def _portfolio_data_v2(self):
         async with SessionLocal() as session:
             rows = await positions(session)
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            self._slugs = await self._slug_map(session, [row.token_id for row in rows])
             await session.commit()
         return rows, account
 
@@ -484,7 +514,7 @@ class TelegramApp:
                 f"{signed_money(pnl_value)} ({pnl_pct:+.1f}%)" if pnl_pct is not None else "—"
             )
             lines.append(
-                f"\n{index}. <b>{html.escape(row.title[:95])}</b>\n"
+                f"\n{index}. <b>{self._linked_title(row)}</b>\n"
                 f"  ├ Position: {row.shares:.2f} {html.escape(row.outcome)}\n"
                 f"  ├ Avg/Now: {row.average_price * 100:.2f}¢ → {now}\n"
                 f"  ├ Cost/Value: ${row.cost_basis:.2f} → {value_text}\n"
@@ -527,6 +557,8 @@ class TelegramApp:
     async def _position_detail_v2(self, position_id: int) -> str:
         async with SessionLocal() as session:
             row = await session.get(Position, position_id)
+            if row:
+                self._slugs.update(await self._slug_map(session, [row.token_id]))
         if not row:
             return "<b>Позиция закрыта</b>"
         quote, status, note = await self._position_quote(row)
@@ -538,7 +570,7 @@ class TelegramApp:
         pnl_text = f"{signed_money(pnl)} ({pnl_pct:+.1f}%)" if pnl_pct is not None else "—"
         return "\n".join(
             [
-                f"📌 <b>{html.escape(row.title)}</b>",
+                f"📌 <b>{self._linked_title(row, 200)}</b>",
                 "",
                 f"Position: {row.shares:.2f} {html.escape(row.outcome)}",
                 f"Avg/Now: {row.average_price * 100:.2f}¢ → {now}",
@@ -647,7 +679,8 @@ class TelegramApp:
             header = f"\n{when} · <b>{row.side} {labels.get(row.status, row.status)}</b>"
             market = metadata.get(row.token_id)
             if market:
-                header += f"\n{html.escape(market.title[:60])} · {html.escape(market.outcome[:24])}"
+                linked = market_link(market.title[:60], market.slug, market.event_slug)
+                header += f"\n{linked} · {html.escape(market.outcome[:24])}"
             if row.status == "rejected":
                 details = []
                 if trade:

@@ -17,6 +17,7 @@ from sqlalchemy.exc import IntegrityError
 from .accounting import Holding, inventory
 from .config import Settings
 from .db import SessionLocal
+from .links import market_link
 from .models import (
     BuyIntent,
     CopyTrade,
@@ -108,7 +109,7 @@ class CopyEngine:
             "<b>Copy Trade: BUY</b>\n\n"
             f'🟢 Copied from <a href="{profile_url}">'
             f"@{html.escape(trader_name.lstrip('@'))}</a>\n\n"
-            f"📊 <b>Market:</b> {html.escape(event.title)}\n"
+            f"📊 <b>Market:</b> {market_link(event.title, event.slug, event.event_slug)}\n"
             f"🎯 <b>Position:</b> {html.escape(event.outcome)}\n\n"
             f"💰 <b>Leader bought:</b> ${event.size * event.price:.2f} ({event.size:.2f} shares)\n"
             f"📈 <b>Leader Price:</b> {event.price * 100:.1f}¢\n\n"
@@ -117,7 +118,9 @@ class CopyEngine:
         )
 
     @staticmethod
-    def build_sell_notification(leader: Leader, position: Position, fill, pnl: Decimal) -> str:
+    def build_sell_notification(
+        leader: Leader, position: Position, fill, pnl: Decimal, slug: str = "", event_slug: str = ""
+    ) -> str:
         trader_name = leader.label or f"{leader.address[:8]}…{leader.address[-6:]}"
         profile_url = f"https://polymarket.com/profile/{leader.address}"
         icon = "📈" if pnl >= 0 else "📉"
@@ -126,7 +129,7 @@ class CopyEngine:
             "<b>Copy Trade: SELL</b>\n\n"
             f'🔴 Copied from <a href="{profile_url}">'
             f"@{html.escape(trader_name.lstrip('@'))}</a>\n\n"
-            f"📊 <b>Market:</b> {html.escape(position.title)}\n"
+            f"📊 <b>Market:</b> {market_link(position.title, slug, event_slug)}\n"
             f"🎯 <b>Position:</b> {html.escape(position.outcome)}\n\n"
             f"💵 <b>You sold:</b> ${fill.notional:.2f} ({fill.shares:.2f} shares)\n"
             f"🏷️ <b>Exit Price:</b> {fill.average_price * 100:.1f}¢\n"
@@ -150,29 +153,30 @@ class CopyEngine:
         pnl_icon = "📈" if pnl >= 0 else "📉"
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         result = "WON" if payout == 1 else "LOST" if payout == 0 else "SPLIT"
+        rows = [
+            f"Outcome: <b>{html.escape(outcome)} {result}</b>",
+            f"Shares: {shares:.6f}" + (" (cleared)" if payout == 0 else ""),
+        ]
+        if proceeds > 0:
+            rows.append(f"Payout: <b>${proceeds:.2f}</b>")
+        rows.append(f"PnL: {pnl_icon} <b>{pnl_text}</b>")
         lines = [
             "🎉 <b>Positions Auto-Processed!</b>",
             "",
-            f"1. {result_icon} <b>{html.escape(title)}</b>",
-            f"  ├ Outcome: <b>{html.escape(outcome)} {result}</b>",
-            f"  ├ Shares: {shares:.6f}" + (" (cleared)" if payout == 0 else ""),
+            f"1. {result_icon} <b>{market_link(title, slug, event_slug)}</b>",
+            *(
+                f"  {'└' if index == len(rows) - 1 else '├'} {row}"
+                for index, row in enumerate(rows)
+            ),
         ]
-        if proceeds > 0:
-            lines.append(f"  ├ Payout: <b>${proceeds:.2f}</b>")
-        lines.append(f"  ├ PnL: {pnl_icon} <b>{pnl_text}</b>")
-        if slug:
-            safe_slug = html.escape(slug.strip("/"), quote=True)
-            safe_event_slug = html.escape((event_slug or slug).strip("/"), quote=True)
-            lines.append(
-                f'  └ <a href="https://polymarket.com/event/{safe_event_slug}/'
-                f'{safe_slug}">View on Polymarket</a>'
-            )
         if proceeds > 0:
             lines.extend(("", "━━━━━━━━━━━━━━━━━━━━", f"💰 <b>Total Claimed: ${proceeds:.2f}</b>"))
         return "\n".join(lines)
 
     @staticmethod
-    def build_risk_sell_notification(position: Position, fill, pnl: Decimal, trigger: str) -> str:
+    def build_risk_sell_notification(
+        position: Position, fill, pnl: Decimal, trigger: str, slug: str = "", event_slug: str = ""
+    ) -> str:
         pnl_icon = "📈" if pnl >= 0 else "📉"
         pnl_text = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
         rule_name = {
@@ -183,7 +187,7 @@ class CopyEngine:
         return (
             "<b>Position: SELL</b>\n\n"
             f"⚙️ Причина: <b>{html.escape(rule_name)}</b>\n\n"
-            f"📊 Рынок: <b>{html.escape(position.title)}</b>\n"
+            f"📊 Рынок: <b>{market_link(position.title, slug, event_slug)}</b>\n"
             f"🎯 Позиция: <b>{html.escape(position.outcome)}</b>\n\n"
             f"💵 Продано: <b>${fill.notional:.2f}</b> ({fill.shares:.2f} shares)\n"
             f"🏷️ Цена выхода: <b>{fill.average_price * 100:.1f}¢</b>\n"
@@ -421,8 +425,13 @@ class CopyEngine:
                             leader=leader.address,
                             error=type(exc).__name__,
                         )
-            except Exception:
-                log.exception("leader_activity_failed", leader=leader.address)
+            except Exception as exc:
+                log.exception(
+                    "leader_activity_failed",
+                    leader=leader.address,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
                 if profile_task and not profile_task.done():
                     profile_task.cancel()
                 return
@@ -433,18 +442,27 @@ class CopyEngine:
                 if profile:
                     db_leader.label = profile
                 await self._refresh_sizing_profile(session, db_leader, activities)
-                if not activities:
-                    return
                 if not db_leader.initialized:
-                    db_leader.last_timestamp = max(event.timestamp for event in activities) + 1
+                    # An empty activity window is a valid state, not a reason to
+                    # stay uninitialized: RTDS drops events for a leader that
+                    # never initialized, so that silently ignored them forever.
+                    db_leader.last_timestamp = (
+                        max(event.timestamp for event in activities) + 1
+                        if activities
+                        else int(time.time())
+                    )
                     db_leader.initialized = True
                     await session.commit()
                     log.info(
                         "leader_initialized",
                         leader=leader.address,
                         last_timestamp=db_leader.last_timestamp,
+                        activity_seen=len(activities),
                     )
                     self._leader_floors[leader.id] = db_leader.last_timestamp
+                    return
+                if not activities:
+                    log.info("leader_activity_empty", leader=leader.address)
                     return
                 # Keep the session's lower bound stable: late-indexed events must
                 # not disappear just because another token finished sooner.
@@ -865,6 +883,19 @@ class CopyEngine:
             conviction_power=self.settings.sizing_conviction_power,
             odds_weight=self.settings.sizing_odds_weight,
         )
+
+    @staticmethod
+    async def _market_slugs(session, token_id: str) -> tuple[str, str]:
+        """Slugs retained from the source event; positions do not carry them."""
+        row = (
+            await session.execute(
+                select(SourceObservation.slug, SourceObservation.event_slug)
+                .where(SourceObservation.token_id == token_id, SourceObservation.slug != "")
+                .order_by(SourceObservation.timestamp.desc())
+                .limit(1)
+            )
+        ).first()
+        return (row[0], row[1]) if row else ("", "")
 
     def exposure_room(self, exposure: Decimal) -> Decimal:
         return max(Decimal(0), self.settings.max_outcome_exposure - exposure)
@@ -1684,8 +1715,14 @@ class CopyEngine:
                     position.condition_id,
                     account,
                 )
+                slug, event_slug = await self._market_slugs(session, token_id)
                 message = self.build_risk_sell_notification(
-                    position, fill, account.realized_pnl - realized_before, trigger
+                    position,
+                    fill,
+                    account.realized_pnl - realized_before,
+                    trigger,
+                    slug,
+                    event_slug,
                 )
                 rule.enabled = remaining > Decimal("0.00000001")
                 if not rule.enabled:
@@ -2127,9 +2164,15 @@ class CopyEngine:
                     cost_to_release=own.cost * fill.shares / own.shares,
                 )
                 if leader:
+                    slug, event_slug = await self._market_slugs(session, pos.token_id)
                     session.info.setdefault("notifications", []).append(
                         self.build_sell_notification(
-                            leader, pos, fill, account.realized_pnl - realized_before
+                            leader,
+                            pos,
+                            fill,
+                            account.realized_pnl - realized_before,
+                            slug,
+                            event_slug,
                         )
                     )
                 intent.remaining = max(Decimal(0), intent.remaining - fill.shares)
@@ -2189,25 +2232,15 @@ class CopyEngine:
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
                 proceeds = position.shares * payout
                 pnl = proceeds - position.cost_basis
-                link_slugs = (
-                    await session.execute(
-                        select(SourceObservation.slug, SourceObservation.event_slug)
-                        .where(
-                            SourceObservation.token_id == position.token_id,
-                            SourceObservation.slug != "",
-                        )
-                        .order_by(SourceObservation.timestamp.desc())
-                        .limit(1)
-                    )
-                ).first()
+                slug, event_slug = await self._market_slugs(session, position.token_id)
                 message = self.build_settlement_notification(
                     position.title,
                     position.outcome,
                     position.shares,
                     payout,
                     position.cost_basis,
-                    link_slugs[0] if link_slugs else "",
-                    link_slugs[1] if link_slugs else "",
+                    slug,
+                    event_slug,
                 )
                 account.paper_balance += proceeds
                 account.realized_pnl += pnl
