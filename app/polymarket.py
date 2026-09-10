@@ -116,6 +116,9 @@ class PolymarketClient:
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._value_cache: dict[str, tuple[float, Decimal]] = {}
         self._profile_cache: dict[str, tuple[float, str]] = {}
+        # Docs describe a 250ms taker hold on selected crypto/finance
+        # up-down markets, flagged here, separate from seconds_delay.
+        self._taker_hold: dict[str, bool] = {}
         self.book_stream = None
 
     async def close(self) -> None:
@@ -330,6 +333,8 @@ class PolymarketClient:
             info = response.json()
             if not isinstance(info, dict) or info.get("c", "").lower() != condition_id.lower():
                 raise ValueError("fee_market_identity_mismatch")
+            if isinstance(info.get("itode"), bool):
+                self._taker_hold[condition_id] = info["itode"]
             schedule = info.get("fd")
             if not isinstance(schedule, dict) or "r" not in schedule or "e" not in schedule:
                 raise LookupError("fee_schedule_unavailable")
@@ -366,6 +371,10 @@ class PolymarketClient:
         self._fee_cache[condition_id] = rate
         self._fee_cache_time[condition_id] = time.monotonic()
         return rate
+
+    def taker_hold_flag(self, condition_id: str) -> bool | None:
+        """Whether this market applies the short taker hold, None if unseen."""
+        return self._taker_hold.get(condition_id)
 
     @staticmethod
     def _fallback_fee_rate(title: str) -> Decimal:

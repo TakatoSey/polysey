@@ -72,6 +72,7 @@ async def rig(tmp_path, monkeypatch):
     client = SimpleNamespace(
         get_market=AsyncMock(side_effect=market),
         get_fee_rate=AsyncMock(return_value=Decimal(0)),
+        taker_hold_flag=lambda condition_id: None,
         get_book=AsyncMock(return_value=book),
         get_activity=AsyncMock(return_value=[]),
         get_resolution=AsyncMock(return_value=None),
@@ -447,6 +448,7 @@ def test_latency_separates_our_work_from_the_wait_the_market_requires(rig):
     now = time.monotonic()
     event = SimpleNamespace(
         event_key="event",
+        condition_id="condition",
         timestamp=100,
         received_at=100.5,
         received_monotonic=now - 1.2,
@@ -465,7 +467,11 @@ def test_an_artificial_delay_is_not_counted_as_our_own_work(rig):
     rig.engine.settings = replace_setting(rig.engine.settings, copy_latency_seconds=0.5)
     now = time.monotonic()
     event = SimpleNamespace(
-        event_key="event", timestamp=100, received_at=100.5, received_monotonic=now - 0.6
+        event_key="event",
+        condition_id="condition",
+        timestamp=100,
+        received_at=100.5,
+        received_monotonic=now - 0.6,
     )
     prepared = SimpleNamespace(ready_at=now, exchange_delay=0.0)
 

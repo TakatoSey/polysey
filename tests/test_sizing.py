@@ -415,6 +415,7 @@ async def sizing_rig(tmp_path, monkeypatch):
             }
         ),
         get_fee_rate=AsyncMock(return_value=D(0)),
+        taker_hold_flag=lambda condition_id: None,
         get_book=AsyncMock(return_value=book),
         get_activity=AsyncMock(return_value=[]),
         get_resolution=AsyncMock(return_value=None),

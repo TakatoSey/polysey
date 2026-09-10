@@ -729,6 +729,10 @@ class CopyEngine:
             "bot_ms": round(bot_ms, 1),
             "own_bot_ms": round(max(0.0, bot_ms - waited_ms), 1),
             "exchange_delay_seconds": prepared.exchange_delay,
+            # Docs put a 250ms taker hold on selected crypto/finance up-down
+            # markets, flagged separately from seconds_delay. Logged so the two
+            # can be compared on real markets before either is modelled.
+            "taker_hold_flag": self.client.taker_hold_flag(event.condition_id),
         }
 
     @staticmethod
