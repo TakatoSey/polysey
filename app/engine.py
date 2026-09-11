@@ -984,9 +984,14 @@ class CopyEngine:
                 return None, "sizing_entry_closed"
             profile = await session.get(LeaderSizingProfile, leader_id)
             fixed_size = leader.fixed_trade_size
+            fixed_percent = leader.fixed_trade_percent
             if fixed_size is not None and (not fixed_size.is_finite() or fixed_size <= 0):
                 fixed_size = None
-            if fixed_size is None:
+            if fixed_percent is not None and (
+                not fixed_percent.is_finite() or not Decimal(0) < fixed_percent <= Decimal(100)
+            ):
+                fixed_percent = None
+            if fixed_size is None and fixed_percent is None:
                 if (
                     profile is None
                     or profile.reference_notional <= 0
@@ -1002,8 +1007,12 @@ class CopyEngine:
                 max_multiplier = self.settings.smart_sizing_max_multiplier
             else:
                 reference_notional = max(event.size * event.price, Decimal("0.00000001"))
-                base_budget = fixed_size
-                max_budget = min(fixed_size, account.max_trade_size)
+                base_budget = (
+                    fixed_size
+                    if fixed_size is not None
+                    else account.paper_balance * fixed_percent / Decimal(100)
+                )
+                max_budget = min(base_budget, account.max_trade_size)
                 # Zero is an internal persisted marker for fixed-per-series mode.
                 max_multiplier = Decimal(0)
             entry = SizingEntry(
@@ -1184,6 +1193,13 @@ class CopyEngine:
         )
         before_leader_shares = leader_pos.shares if leader_pos else Decimal(0)
         await self.update_leader_position(session, leader.id, event, leader_pos)
+        if leader_pos is None:
+            leader_pos = await session.scalar(
+                select(LeaderPosition).where(
+                    LeaderPosition.leader_id == leader.id,
+                    LeaderPosition.token_id == event.token_id,
+                )
+            )
         account = await get_or_create_account(session, self.settings.paper_initial_balance)
         policy = await get_execution_policy(session, self.settings)
         if event.side == "SELL":
@@ -1194,6 +1210,7 @@ class CopyEngine:
                 copy_trade,
                 account,
                 before_leader_shares,
+                leader_pos.shares if leader_pos else Decimal(0),
                 policy.slippage_price,
                 prepared,
             )
@@ -1252,8 +1269,16 @@ class CopyEngine:
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
             return
         fixed_size = leader.fixed_trade_size
+        fixed_percent = leader.fixed_trade_percent
         leader_fixed = bool(fixed_size is not None and fixed_size.is_finite() and fixed_size > 0)
-        smart_buy = event.side == "BUY" and (self.settings.smart_sizing_enabled or leader_fixed)
+        leader_percent = bool(
+            fixed_percent is not None
+            and fixed_percent.is_finite()
+            and Decimal(0) < fixed_percent <= Decimal(100)
+        )
+        smart_buy = event.side == "BUY" and (
+            self.settings.smart_sizing_enabled or leader_fixed or leader_percent
+        )
         smart_entry = decision = None
         deployable = (
             await self._deployable_cash(session, account) if event.side == "BUY" else Decimal(0)
@@ -1561,7 +1586,7 @@ class CopyEngine:
             position.shares = shares
 
     async def _accept_exit(
-        self, session, leader, event, trade, account, before, distance, prepared
+        self, session, leader, event, trade, account, before, leader_remaining, distance, prepared
     ):
         pos = await get_position(session, event.token_id)
         holdings, warnings = await inventory(session, event.token_id)
@@ -1610,6 +1635,16 @@ class CopyEngine:
         free = max(Decimal(0), own.shares - remaining)
         # Each fragment adds only its share of inventory not ALREADY reserved.
         remaining += free * min(Decimal(1), event.size / before)
+        minimum = prepared.book.min_order_size if prepared and prepared.book else Decimal(0)
+        if leader_remaining <= 0:
+            # The leader is flat: copy the complete exit rather than preserving
+            # a fractional target that can no longer be paired with later sells.
+            remaining = own.shares
+        elif minimum > 0 and 0 < own.shares - remaining < minimum:
+            # CLOB enforces min_order_size per token. Do not sell a little too
+            # much now and strand an unsellable tail; defer that amount until
+            # the next leader sell (or their complete exit).
+            remaining = min(remaining, max(Decimal(0), own.shares - minimum))
         # Close a sub-0.01-share rounding tail only after >=99% is requested.
         if own.shares - remaining < Decimal("0.01") and remaining >= own.shares * Decimal("0.99"):
             remaining = own.shares
@@ -1962,8 +1997,13 @@ class CopyEngine:
             exposure = position.cost_basis if position else Decimal(0)
             smart_entry = decision = None
             fixed_size = leader.fixed_trade_size
+            fixed_percent = leader.fixed_trade_percent
             use_smart_entry = self.settings.smart_sizing_enabled or bool(
                 fixed_size is not None and fixed_size.is_finite() and fixed_size > 0
+            ) or bool(
+                fixed_percent is not None
+                and fixed_percent.is_finite()
+                and Decimal(0) < fixed_percent <= Decimal(100)
             )
             if use_smart_entry:
                 start = entry_bucket(

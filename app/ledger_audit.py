@@ -114,7 +114,9 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
             fields(p, "token_id condition_id title outcome shares cost_basis average_price")
             for p in positions
         ],
-        "leaders": [fields(row, "id address label fixed_trade_size") for row in leaders],
+        "leaders": [
+            fields(row, "id address label fixed_trade_size fixed_trade_percent") for row in leaders
+        ],
         "source_observations": [
             fields(
                 o,

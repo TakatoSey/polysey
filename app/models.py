@@ -50,6 +50,8 @@ class Leader(Base):
     address: Mapped[str] = mapped_column(String(42), unique=True, index=True)
     label: Mapped[str | None] = mapped_column(String(120), nullable=True)
     fixed_trade_size: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
+    # A percentage of our paper cash, frozen when a leader starts an entry series.
+    fixed_trade_percent: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     initialized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_timestamp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

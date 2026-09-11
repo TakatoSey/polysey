@@ -147,10 +147,11 @@ def test_history_export_retains_matching_ids_without_private_configuration():
         {
             "id": 1,
             "address": "0x1",
-            "label": "gningd",
-            "fixed_trade_size": None,
-        }
-    ]
+                "label": "gningd",
+                "fixed_trade_size": None,
+                "fixed_trade_percent": None,
+            }
+        ]
     assert "telegram_token" not in str(result)
 
 

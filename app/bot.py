@@ -93,6 +93,7 @@ SKIP_REASONS = {
 class LeaderForm(StatesGroup):
     address = State()
     fixed_size = State()
+    fixed_percent = State()
 
 
 class TelegramApp:
@@ -211,7 +212,15 @@ class TelegramApp:
             for row in leaders
             if row.active and row.fixed_trade_size is not None
         ]
-        max_next_buy = max([max_next_buy, *fixed_candidates])
+        percent_candidates = [
+            min(
+                account.paper_balance * row.fixed_trade_percent / Decimal(100),
+                account.max_trade_size,
+            )
+            for row in leaders
+            if row.active and row.fixed_trade_percent is not None
+        ]
+        max_next_buy = max([max_next_buy, *fixed_candidates, *percent_candidates])
         cash_warning = (
             f"\n\n⚠️ Бюджет ${max_next_buy:.2f} ниже минимума "
             f"${self.settings.min_copy_notional:.2f} — покупки недоступны."
@@ -225,7 +234,11 @@ class TelegramApp:
                 1
                 for row in leaders
                 if row.active
-                and (row.fixed_trade_size is not None or self._sizing_profile_ready(row.id))
+                and (
+                    row.fixed_trade_size is not None
+                    or row.fixed_trade_percent is not None
+                    or self._sizing_profile_ready(row.id)
+                )
             )
             sizing_status = (
                 f"Режим: адаптивный · {self.settings.copy_balance_pct * 100:.1f}% базы\n"
@@ -251,9 +264,14 @@ class TelegramApp:
             and profile.sample_count >= self.settings.smart_sizing_min_samples
         )
 
-    def _leader_sizing_text(self, leader_id: int, fixed_size: Decimal | None = None) -> str:
+    def _leader_sizing_text(
+        self,
+        leader_id: int,
+        fixed_size: Decimal | None = None,
+        fixed_percent: Decimal | None = None,
+    ) -> str:
         profile = self.engine._leader_sizing_profiles.get(leader_id)
-        if fixed_size is not None:
+        if fixed_size is not None or fixed_percent is not None:
             return (
                 f"Типичная серия: ${profile.reference_notional:.2f} · "
                 f"{profile.sample_count} в выборке\n"
@@ -292,7 +310,13 @@ class TelegramApp:
         for row in current:
             icon = "🟢" if row.active else "⚪"
             name = row.label or f"{row.address[:6]}…{row.address[-4:]}"
-            mode = f" · ${row.fixed_trade_size:.2f} фикс." if row.fixed_trade_size else ""
+            mode = (
+                f" · ${row.fixed_trade_size:.2f} фикс."
+                if row.fixed_trade_size
+                else f" · {row.fixed_trade_percent:g}%"
+                if row.fixed_trade_percent
+                else ""
+            )
             builder.button(
                 text=f"{icon} {name[:22]}{mode}", callback_data=f"leader_view:{row.id}:{page}"
             )
@@ -345,6 +369,8 @@ class TelegramApp:
         sizing_mode = (
             f"фикс. ${row.fixed_trade_size:.2f} на серию"
             if row.fixed_trade_size is not None
+            else f"фикс. {row.fixed_trade_percent:g}% баланса на серию"
+            if row.fixed_trade_percent is not None
             else "адаптивный"
         )
         executed = sum(1 for trade in recent if trade.status == "executed")
@@ -369,7 +395,9 @@ class TelegramApp:
             f"<b>👤 {label}</b>\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\n"
             f"Размер: <b>{sizing_mode}</b>\n"
-            + self._leader_sizing_text(leader_id, row.fixed_trade_size)
+            + self._leader_sizing_text(
+                leader_id, row.fixed_trade_size, row.fixed_trade_percent
+            )
             + f"PNL: <b>{pnl_label}</b> · открыто ${open_cost:.2f}\n"
             f"Сделки: {buys} BUY · {sells} SELL\n"
             f"Последние 20: {executed} скопировано · {rejected} пропущено\n"
@@ -384,7 +412,11 @@ class TelegramApp:
             text="💵 Фиксированная сумма",
             callback_data=f"leader_fixed:{row.id}:{page}",
         )
-        if row.fixed_trade_size is not None:
+        builder.button(
+            text="📊 Процент от баланса",
+            callback_data=f"leader_percent:{row.id}:{page}",
+        )
+        if row.fixed_trade_size is not None or row.fixed_trade_percent is not None:
             builder.button(
                 text="🧠 Вернуть адаптивный размер",
                 callback_data=f"leader_fixed_clear:{row.id}:{page}",
@@ -467,7 +499,7 @@ class TelegramApp:
         except Exception as exc:
             log.warning("portfolio_market_failed", token_id=row.token_id, error=str(exc))
             return False
-        return market.get("closed") is True
+        return isinstance(market, dict) and market.get("closed") is True
 
     async def _portfolio_text_v2(self, page: int = 0) -> str:
         rows, _account = await self._portfolio_data_v2()
@@ -878,6 +910,7 @@ class TelegramApp:
         self.dp.message.register(self.toggle, Command("resume"))
         self.dp.message.register(self.receive_leader, StateFilter(LeaderForm.address))
         self.dp.message.register(self.receive_leader_fixed, StateFilter(LeaderForm.fixed_size))
+        self.dp.message.register(self.receive_leader_percent, StateFilter(LeaderForm.fixed_percent))
         self.dp.callback_query.register(self.callback)
 
     async def start(self, message: Message, state: FSMContext | None = None) -> None:
@@ -995,6 +1028,35 @@ class TelegramApp:
                 )
                 return
             leader.fixed_trade_size = value
+            leader.fixed_trade_percent = None
+            await session.commit()
+        await state.clear()
+        await self._leader_detail(leader_id, page, message.chat.id)
+
+    async def receive_leader_percent(self, message: Message, state: FSMContext) -> None:
+        if not self._allowed(message):
+            return
+        data = await state.get_data()
+        leader_id, page = data.get("leader_id"), data.get("page", 0)
+        await self._delete_input(message)
+        try:
+            value = Decimal((message.text or "").strip().replace(",", "."))
+        except InvalidOperation:
+            value = Decimal(0)
+        async with SessionLocal() as session:
+            leader = await session.get(Leader, leader_id) if leader_id else None
+            if not leader or not value.is_finite() or not Decimal(0) < value <= Decimal(100):
+                builder = InlineKeyboardBuilder()
+                if leader_id:
+                    builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
+                await self._edit_panel(
+                    "Введите процент от 0 до 100, например <code>5</code> для 5% баланса.",
+                    builder.as_markup(),
+                    message.chat.id,
+                )
+                return
+            leader.fixed_trade_percent = value
+            leader.fixed_trade_size = None
             await session.commit()
         await state.clear()
         await self._leader_detail(leader_id, page, message.chat.id)
@@ -1321,6 +1383,7 @@ class TelegramApp:
                 row = await session.get(Leader, leader_id)
                 if row:
                     row.fixed_trade_size = None
+                    row.fixed_trade_percent = None
                 await session.commit()
             await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
             await self._leader_detail(leader_id, page, chat_id)
@@ -1338,6 +1401,23 @@ class TelegramApp:
                 "<b>💵 Фиксированная сумма</b>\n"
                 "Бюджет одной серии покупок, включая комиссию.\n\n"
                 f"Допустимо: ${self.settings.min_copy_notional:.2f}–${account.max_trade_size:.2f}",
+                builder.as_markup(),
+                chat_id,
+            )
+        elif data.startswith("leader_percent:"):
+            _, raw_id, raw_page = data.split(":")
+            leader_id, page = int(raw_id), int(raw_page)
+            context = self.dp.fsm.get_context(self.bot, chat_id, chat_id)
+            await context.set_state(LeaderForm.fixed_percent)
+            await context.update_data(leader_id=leader_id, page=page)
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
+            await self._edit_panel(
+                "<b>📊 Процент от баланса</b>\n"
+                "Бюджет одной серии BUY, включая комиссию. Он фиксируется при первом "
+                "фрагменте серии. Если этой суммы недостаточно для минимального ордера "
+                "рынка, сделка пропускается.\n\n"
+                "Введите от 0 до 100, например <code>5</code> для 5%.",
                 builder.as_markup(),
                 chat_id,
             )

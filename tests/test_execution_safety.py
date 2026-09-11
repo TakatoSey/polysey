@@ -365,6 +365,28 @@ async def test_sell_fragments_accumulate_below_exchange_minimum(rig):
         assert (await session.get(Account, 1)).paper_balance == 100
 
 
+async def test_partial_sells_do_not_strand_a_tail_below_exchange_minimum(rig):
+    await seed_buy(rig)
+    rig.client.get_book.return_value = book(minimum="5", bid="0.59")
+    await sell(rig, "s1", qty="2", price="0.59")
+    rig.client.get_book.return_value = book(minimum="5", bid="0.57")
+    await sell(rig, "s2", qty="4", price="0.57")
+    rig.client.get_book.return_value = book(minimum="5", bid="0.55")
+    await sell(rig, "s3", qty="4", price="0.55")
+    async with rig.sessions() as session:
+        position = await session.scalar(select(Position))
+        intent = await session.get(ExitIntent, (1, "token"))
+        assert position is None, (position.shares, intent.remaining, intent.last_reason)
+        sells = list(
+            await session.scalars(
+                select(PaperOrder)
+                .where(PaperOrder.side == "SELL", PaperOrder.filled_shares > 0)
+                .order_by(PaperOrder.id)
+            )
+        )
+        assert [order.filled_shares for order in sells] == [D("5"), D("5")]
+
+
 async def test_exit_retry_keeps_limit_and_fee_and_other_leader_inventory(rig):
     await seed_buy(rig)
     await seed_buy(rig, "second-owner", leader=2)

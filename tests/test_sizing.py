@@ -565,6 +565,24 @@ async def test_leader_fixed_size_works_without_profile_and_is_total_for_series(s
         )
 
 
+async def test_leader_percent_uses_entry_balance_without_a_profile(sizing_rig):
+    async with sizing_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        leader.fixed_trade_percent = D(5)
+        profile = await session.get(LeaderSizingProfile, 1)
+        await session.delete(profile)
+        await session.commit()
+    await copy(sizing_rig, "percent-one", "2")
+    await copy(sizing_rig, "percent-two", "200")
+    async with sizing_rig.sessions() as session:
+        state = await session.scalar(select(SizingEntry))
+        assert state.max_multiplier == 0
+        assert state.base_budget == 5
+        assert state.max_budget == 5
+        assert state.spent == 5
+        assert (await session.get(Account, 1)).paper_balance == 95
+
+
 async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
     async with sizing_rig.sessions() as session:
         (await session.get(LeaderSizingProfile, 2)).reference_notional = 40

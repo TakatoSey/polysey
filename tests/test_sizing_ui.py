@@ -154,3 +154,38 @@ async def test_fixed_leader_size_is_saved_from_single_message_panel(tmp_path, mo
         app._leader_detail.assert_awaited_once_with(1, 0, 7)
     finally:
         await db.dispose()
+
+
+@pytest.mark.asyncio
+async def test_fixed_leader_percent_replaces_fixed_size(tmp_path, monkeypatch):
+    db = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'percent-ui.db'}")
+    sessions = async_sessionmaker(db, expire_on_commit=False)
+    monkeypatch.setattr("app.bot.SessionLocal", sessions)
+    async with db.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with sessions() as session:
+        session.add(Account(id=1, paper_balance=100, starting_balance=100, max_trade_size=30))
+        session.add(
+            Leader(
+                id=1,
+                address="0x" + "1" * 40,
+                initialized=True,
+                fixed_trade_size=Decimal("7.50"),
+            )
+        )
+        await session.commit()
+    app = panel()
+    app._delete_input = AsyncMock()
+    app._leader_detail = AsyncMock()
+    state = AsyncMock()
+    state.get_data.return_value = {"leader_id": 1, "page": 0}
+    message = SimpleNamespace(text="5", from_user=SimpleNamespace(id=7), chat=SimpleNamespace(id=7))
+    try:
+        await app.receive_leader_percent(message, state)
+        async with sessions() as session:
+            leader = await session.get(Leader, 1)
+            assert leader.fixed_trade_percent == Decimal("5")
+            assert leader.fixed_trade_size is None
+        state.clear.assert_awaited_once()
+    finally:
+        await db.dispose()
