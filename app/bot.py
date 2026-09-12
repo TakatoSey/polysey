@@ -46,6 +46,7 @@ from .repository import (
     orders,
     positions,
 )
+from .sizing import MAX_LEADER_PERCENT, leader_percent
 
 log = structlog.get_logger(__name__)
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
@@ -212,11 +213,10 @@ class TelegramApp:
             for row in leaders
             if row.active and row.fixed_trade_size is not None
         ]
+        # A percent-of-leader budget has no ceiling of its own: what limits the
+        # next buy is our series maximum and the cash actually available.
         percent_candidates = [
-            min(
-                account.paper_balance * row.fixed_trade_percent / Decimal(100),
-                account.max_trade_size,
-            )
+            min(account.max_trade_size, account.paper_balance)
             for row in leaders
             if row.active and row.fixed_trade_percent is not None
         ]
@@ -313,7 +313,7 @@ class TelegramApp:
             mode = (
                 f" · ${row.fixed_trade_size:.2f} фикс."
                 if row.fixed_trade_size
-                else f" · {row.fixed_trade_percent:g}%"
+                else f" · {row.fixed_trade_percent:g}% лидера"
                 if row.fixed_trade_percent
                 else ""
             )
@@ -369,7 +369,7 @@ class TelegramApp:
         sizing_mode = (
             f"фикс. ${row.fixed_trade_size:.2f} на серию"
             if row.fixed_trade_size is not None
-            else f"фикс. {row.fixed_trade_percent:g}% баланса на серию"
+            else f"{row.fixed_trade_percent:g}% от суммы серии лидера"
             if row.fixed_trade_percent is not None
             else "адаптивный"
         )
@@ -411,7 +411,7 @@ class TelegramApp:
             callback_data=f"leader_fixed:{row.id}:{page}",
         )
         builder.button(
-            text="📊 Процент от баланса",
+            text="📊 Процент от суммы лидера",
             callback_data=f"leader_percent:{row.id}:{page}",
         )
         if row.fixed_trade_size is not None or row.fixed_trade_percent is not None:
@@ -1043,12 +1043,13 @@ class TelegramApp:
             value = Decimal(0)
         async with SessionLocal() as session:
             leader = await session.get(Leader, leader_id) if leader_id else None
-            if not leader or not value.is_finite() or not Decimal(0) < value <= Decimal(100):
+            if not leader or leader_percent(value) is None:
                 builder = InlineKeyboardBuilder()
                 if leader_id:
                     builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
                 await self._edit_panel(
-                    "Введите процент от 0 до 100, например <code>5</code> для 5% баланса.",
+                    f"Введите процент от 0 до {MAX_LEADER_PERCENT:g}, например "
+                    "<code>50</code> — половина суммы лидера, <code>200</code> — вдвое больше.",
                     builder.as_markup(),
                     message.chat.id,
                 )
@@ -1411,11 +1412,14 @@ class TelegramApp:
             builder = InlineKeyboardBuilder()
             builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
             await self._edit_panel(
-                "<b>📊 Процент от баланса</b>\n"
-                "Бюджет одной серии BUY, включая комиссию. Он фиксируется при первом "
-                "фрагменте серии. Если этой суммы недостаточно для минимального ордера "
-                "рынка, сделка пропускается.\n\n"
-                "Введите от 0 до 100, например <code>5</code> для 5%.",
+                "<b>📊 Процент от суммы лидера</b>\n"
+                "Бюджет серии BUY считается от того, сколько вложил сам лидер в эту "
+                "серию, включая нашу комиссию: 100% — столько же, 50% — половина, "
+                "200% — вдвое больше. Цель растёт вместе с его докупками.\n"
+                "Если бюджета не хватает на минимальный ордер рынка, сделка "
+                "пропускается. Максимум серии, лимит на исход и резерв кэша "
+                "продолжают действовать.\n\n"
+                f"Введите от 0 до {MAX_LEADER_PERCENT:g}, например <code>50</code>.",
                 builder.as_markup(),
                 chat_id,
             )

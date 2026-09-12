@@ -45,7 +45,13 @@ from .repository import (
     get_position,
     get_risk,
 )
-from .sizing import entry_bucket, entry_budget, sample_entries
+from .sizing import (
+    entry_bucket,
+    entry_budget,
+    leader_fixed_size,
+    leader_percent,
+    sample_entries,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -997,14 +1003,9 @@ class CopyEngine:
             if overlap is not None or old_fill is not None:
                 return None, "sizing_entry_closed"
             profile = await session.get(LeaderSizingProfile, leader_id)
-            fixed_size = leader.fixed_trade_size
-            fixed_percent = leader.fixed_trade_percent
-            if fixed_size is not None and (not fixed_size.is_finite() or fixed_size <= 0):
-                fixed_size = None
-            if fixed_percent is not None and (
-                not fixed_percent.is_finite() or not Decimal(0) < fixed_percent <= Decimal(100)
-            ):
-                fixed_percent = None
+            fixed_size = leader_fixed_size(leader.fixed_trade_size)
+            fixed_percent = leader_percent(leader.fixed_trade_percent)
+            entry_percent = None
             if fixed_size is None and fixed_percent is None:
                 if (
                     profile is None
@@ -1019,15 +1020,20 @@ class CopyEngine:
                 base_budget = account.paper_balance * self.settings.copy_balance_pct
                 max_budget = account.max_trade_size
                 max_multiplier = self.settings.smart_sizing_max_multiplier
-            else:
+            elif fixed_size is not None:
                 reference_notional = max(event.size * event.price, Decimal("0.00000001"))
-                base_budget = (
-                    fixed_size
-                    if fixed_size is not None
-                    else account.paper_balance * fixed_percent / Decimal(100)
-                )
+                base_budget = fixed_size
                 max_budget = min(base_budget, account.max_trade_size)
                 # Zero is an internal persisted marker for fixed-per-series mode.
+                max_multiplier = Decimal(0)
+            else:
+                # A share of the leader's own series. Their notional grows with
+                # every fragment, so only the percentage can be frozen here; the
+                # budget itself is recomputed from it on each fragment.
+                reference_notional = max(event.size * event.price, Decimal("0.00000001"))
+                entry_percent = fixed_percent
+                base_budget = reference_notional * fixed_percent / Decimal(100)
+                max_budget = account.max_trade_size
                 max_multiplier = Decimal(0)
             entry = SizingEntry(
                 leader_id=leader_id,
@@ -1041,6 +1047,7 @@ class CopyEngine:
                 max_multiplier=max_multiplier,
                 leader_notional=Decimal(0),
                 leader_shares=Decimal(0),
+                leader_percent=entry_percent,
                 spent=Decimal(0),
                 closed=False,
             )
@@ -1282,17 +1289,11 @@ class CopyEngine:
             self.record_rejection(session, copy_trade, event, copy_trade.skip_reason)
             log.warning("copy_data_rejected", condition_id=event.condition_id, error=str(exc))
             return
-        fixed_size = leader.fixed_trade_size
-        fixed_percent = leader.fixed_trade_percent
-        leader_fixed = bool(fixed_size is not None and fixed_size.is_finite() and fixed_size > 0)
-        leader_percent = bool(
-            fixed_percent is not None
-            and fixed_percent.is_finite()
-            and Decimal(0) < fixed_percent <= Decimal(100)
+        leader_budget = (
+            leader_fixed_size(leader.fixed_trade_size) is not None
+            or leader_percent(leader.fixed_trade_percent) is not None
         )
-        smart_buy = event.side == "BUY" and (
-            self.settings.smart_sizing_enabled or leader_fixed or leader_percent
-        )
+        smart_buy = event.side == "BUY" and (self.settings.smart_sizing_enabled or leader_budget)
         smart_entry = decision = None
         deployable = (
             await self._deployable_cash(session, account) if event.side == "BUY" else Decimal(0)
@@ -2014,16 +2015,10 @@ class CopyEngine:
             position = await get_position(session, intent.token_id)
             exposure = position.cost_basis if position else Decimal(0)
             smart_entry = decision = None
-            fixed_size = leader.fixed_trade_size
-            fixed_percent = leader.fixed_trade_percent
             use_smart_entry = (
                 self.settings.smart_sizing_enabled
-                or bool(fixed_size is not None and fixed_size.is_finite() and fixed_size > 0)
-                or bool(
-                    fixed_percent is not None
-                    and fixed_percent.is_finite()
-                    and Decimal(0) < fixed_percent <= Decimal(100)
-                )
+                or leader_fixed_size(leader.fixed_trade_size) is not None
+                or leader_percent(leader.fixed_trade_percent) is not None
             )
             if use_smart_entry:
                 start = entry_bucket(

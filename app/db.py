@@ -60,3 +60,9 @@ async def init_db() -> None:
                     "ALTER TABLE sizing_audits ADD COLUMN IF NOT EXISTS odds_factor NUMERIC(20, 10)"
                 )
             )
+            await connection.execute(
+                text(
+                    "ALTER TABLE sizing_entries "
+                    "ADD COLUMN IF NOT EXISTS leader_percent NUMERIC(8, 4)"
+                )
+            )

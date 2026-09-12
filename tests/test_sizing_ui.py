@@ -189,3 +189,38 @@ async def test_fixed_leader_percent_replaces_fixed_size(tmp_path, monkeypatch):
         state.clear.assert_awaited_once()
     finally:
         await db.dispose()
+
+
+@pytest.mark.parametrize(
+    "entered, stored",
+    [("250", Decimal(250)), ("1000", Decimal(1000)), ("0", None), ("1001", None), ("abc", None)],
+)
+@pytest.mark.asyncio
+async def test_leader_percent_accepts_above_one_hundred_and_rejects_out_of_range(
+    tmp_path, monkeypatch, entered, stored
+):
+    db = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'percent-range.db'}")
+    sessions = async_sessionmaker(db, expire_on_commit=False)
+    monkeypatch.setattr("app.bot.SessionLocal", sessions)
+    async with db.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    async with sessions() as session:
+        session.add(Account(id=1, paper_balance=100, starting_balance=100, max_trade_size=30))
+        session.add(Leader(id=1, address="0x" + "2" * 40, initialized=True))
+        await session.commit()
+    app = panel()
+    app._delete_input = AsyncMock()
+    app._leader_detail = AsyncMock()
+    app._edit_panel = AsyncMock()
+    state = AsyncMock()
+    state.get_data.return_value = {"leader_id": 1, "page": 0}
+    message = SimpleNamespace(
+        text=entered, from_user=SimpleNamespace(id=7), chat=SimpleNamespace(id=7)
+    )
+    try:
+        await app.receive_leader_percent(message, state)
+        async with sessions() as session:
+            assert (await session.get(Leader, 1)).fixed_trade_percent == stored
+        assert app._leader_detail.await_count == (1 if stored is not None else 0)
+    finally:
+        await db.dispose()
