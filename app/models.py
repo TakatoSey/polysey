@@ -52,6 +52,9 @@ class Leader(Base):
     fixed_trade_size: Mapped[Decimal | None] = mapped_column(Numeric(20, 8), nullable=True)
     # A percentage of the leader's OWN series notional, not of our cash.
     fixed_trade_percent: Mapped[Decimal | None] = mapped_column(Numeric(8, 4), nullable=True)
+    # Per-leader BUY price range; NULL keeps the 2-98c default for that bound.
+    min_buy_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
+    max_buy_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     initialized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_timestamp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)

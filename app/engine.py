@@ -35,7 +35,7 @@ from .models import (
 )
 from .paper import execute_buy_fak_by_budget, execute_fak
 from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key, receipt_keys
-from .price_limits import MAX_BUY_PRICE, MIN_BUY_PRICE, allowed_buy_price
+from .price_limits import DEFAULT_RANGE, PriceRange, leader_price_range
 from .priority import PriorityLock
 from .repository import (
     apply_fill,
@@ -97,6 +97,7 @@ class CopyEngine:
         self._token_tails: dict[tuple[int, str], asyncio.Task] = {}
         self._leader_floors: dict[int, int] = {}
         self._leader_sizing_profiles: dict[int, LeaderSizingProfile] = {}
+        self._leader_price_ranges: dict[int, PriceRange] = {}
         self._profile_refresh_attempt: dict[int, float] = {}
         self.tracked_addresses: set[str] = set()
 
@@ -369,6 +370,7 @@ class CopyEngine:
             )
             if not leader or not leader.active or not leader.initialized:
                 return "untracked"
+            self._remember_price_range(leader)
             if await session.scalar(
                 select(CopyTrade.id).where(CopyTrade.event_key == event.event_key)
             ):
@@ -447,6 +449,7 @@ class CopyEngine:
                 db_leader = await session.scalar(select(Leader).where(Leader.id == leader.id))
                 if not db_leader or not db_leader.active:
                     return
+                self._remember_price_range(db_leader)
                 if profile:
                     db_leader.label = profile
                 await self._refresh_sizing_profile(session, db_leader, activities)
@@ -582,7 +585,7 @@ class CopyEngine:
         batch_buy = (
             event.side == "BUY"
             and self.settings.smart_sizing_enabled
-            and allowed_buy_price(event.price)
+            and self._price_range(leader_id).allows(event.price)
         )
         if batch_buy:
             batch = self._buy_batches.get(batch_key)
@@ -620,10 +623,24 @@ class CopyEngine:
 
         task.add_done_callback(done)
 
-    def _buy_signal_reason(self, event):
+    def _price_range(self, leader_id: int) -> PriceRange:
+        """This leader's entry range, as read the last time we loaded them.
+
+        Every path that schedules a copy reads the leader row first and
+        refreshes this, so the pre-execution filters see the current range;
+        the decision itself is always re-made from the row in the database.
+        """
+        return self._leader_price_ranges.get(leader_id, DEFAULT_RANGE)
+
+    def _remember_price_range(self, leader) -> PriceRange:
+        price_range = leader_price_range(leader)
+        self._leader_price_ranges[leader.id] = price_range
+        return price_range
+
+    def _buy_signal_reason(self, event, price_range: PriceRange = DEFAULT_RANGE):
         if event.side != "BUY":
             return None
-        if not allowed_buy_price(event.price):
+        if not price_range.allows(event.price):
             return "leader_price_out_of_range"
         if not self._valid_timestamp(event):
             return "invalid_signal_timestamp"
@@ -646,11 +663,15 @@ class CopyEngine:
             except Exception:
                 log.warning("predecessor_failed", token_id=events[0].token_id)
         self._buy_batches.pop(batch_key, None)
-        async with self._execution_slot(events[0], prepared, 10), SessionLocal() as session:
+        async with (
+            self._execution_slot(events[0], prepared, 10, self._price_range(leader_id)),
+            SessionLocal() as session,
+        ):
             leader = await session.get(Leader, leader_id)
             account = await get_or_create_account(session, self.settings.paper_initial_balance)
             if not leader or not leader.active or account.paused:
                 return
+            price_range = self._remember_price_range(leader)
             eligible = []
             received = dict(
                 (
@@ -671,7 +692,7 @@ class CopyEngine:
                         session.add(SourceReceipt(event_key=event.event_key, copy_trade_id=owner))
                         received[event.event_key] = owner
                     continue
-                if self._buy_signal_reason(event) or not self._valid_trade(event):
+                if self._buy_signal_reason(event, price_range) or not self._valid_trade(event):
                     await self.process_event(session, leader, event, prepared)
                 else:
                     eligible.append(event)
@@ -759,7 +780,10 @@ class CopyEngine:
         if event.side == "SELL":
             return await self.prepare_copy(event)
         key = (leader_id, event.token_id)
-        if self._buy_signal_reason(event) or self._sell_watermarks.get(key, -1) >= event.timestamp:
+        if (
+            self._buy_signal_reason(event, self._price_range(leader_id))
+            or self._sell_watermarks.get(key, -1) >= event.timestamp
+        ):
             return PreparedCopy(ready_at=time.monotonic(), error=ValueError("buy_not_current"))
         cancel = asyncio.Event()
         item = (event.timestamp, cancel)
@@ -788,7 +812,7 @@ class CopyEngine:
                 self._buy_preparations.pop(key)
 
     @asynccontextmanager
-    async def _execution_slot(self, event, prepared, priority):
+    async def _execution_slot(self, event, prepared, priority, price_range=DEFAULT_RANGE):
         # Recheck after waiting for the cash lock. Refresh outside it, then
         # reacquire; bounded attempts prevent a busy loop under overload.
         for attempt in range(4):
@@ -797,7 +821,7 @@ class CopyEngine:
                 attempt == 3
                 or prepared.error
                 or prepared.book_error
-                or self._buy_signal_reason(event)
+                or self._buy_signal_reason(event, price_range)
                 or (prepared.book is not None and time.monotonic() - prepared.book_at <= 0.25)
             ):
                 break
@@ -867,7 +891,9 @@ class CopyEngine:
                 await asyncio.shield(predecessor)
             except Exception:
                 log.warning("predecessor_failed", token_id=event.token_id)
-        async with self._execution_slot(event, prepared, 0 if event.side == "SELL" else 10):
+        async with self._execution_slot(
+            event, prepared, 0 if event.side == "SELL" else 10, self._price_range(leader_id)
+        ):
             async with SessionLocal() as session:
                 leader = await session.get(Leader, leader_id)
                 account = await get_or_create_account(session, self.settings.paper_initial_balance)
@@ -898,7 +924,18 @@ class CopyEngine:
         return max(Decimal(0), account.paper_balance - reserve)
 
     def _entry_decision(
-        self, entry, *, ask, event_price, cash, exposure, account, fee_rate, policy, book
+        self,
+        entry,
+        *,
+        ask,
+        event_price,
+        cash,
+        exposure,
+        account,
+        fee_rate,
+        policy,
+        book,
+        price_range=DEFAULT_RANGE,
     ):
         """The one place account, market and policy limits become a budget.
 
@@ -919,6 +956,7 @@ class CopyEngine:
             floor_multiple=self.settings.sizing_floor_max_multiple,
             conviction_power=self.settings.sizing_conviction_power,
             odds_weight=self.settings.sizing_odds_weight,
+            price_range=price_range,
         )
 
     @staticmethod
@@ -1236,7 +1274,8 @@ class CopyEngine:
                 prepared,
             )
             return
-        signal_reason = self._buy_signal_reason(event)
+        price_range = self._remember_price_range(leader)
+        signal_reason = self._buy_signal_reason(event, price_range)
         if self._sell_watermarks.get((leader.id, event.token_id), -1) >= event.timestamp:
             signal_reason = "buy_superseded_by_sell"
         elif await session.scalar(
@@ -1266,8 +1305,8 @@ class CopyEngine:
                 source_timestamp=event.timestamp,
                 received_age_seconds=round(max(0, event.received_at - event.timestamp), 3),
                 leader_price=str(event.price),
-                allowed_min_buy_price=str(MIN_BUY_PRICE),
-                allowed_max_buy_price=str(MAX_BUY_PRICE),
+                allowed_min_buy_price=str(price_range.minimum),
+                allowed_max_buy_price=str(price_range.maximum),
                 age_limit_seconds=(
                     self.settings.max_signal_age_rtds_seconds
                     if event.source == "rtds"
@@ -1373,6 +1412,7 @@ class CopyEngine:
                         fee_rate=fee_rate,
                         policy=policy,
                         book=book,
+                        price_range=price_range,
                     )
                     session.add(
                         SizingAudit(
@@ -1410,12 +1450,15 @@ class CopyEngine:
                         slippage_price=str(policy.slippage_price),
                         min_buy_price=str(
                             max(
-                                MIN_BUY_PRICE,
+                                price_range.minimum,
                                 max(decision.leader_vwap, event.price) - policy.slippage_price,
                             )
                         ),
                         max_buy_price=str(
-                            min(MAX_BUY_PRICE, decision.reference_price + policy.slippage_price)
+                            min(
+                                price_range.maximum,
+                                decision.reference_price + policy.slippage_price,
+                            )
                         ),
                         min_copy_notional=str(self.settings.min_copy_notional),
                         min_order_notional=str(book.min_order_size * ask),
@@ -1439,7 +1482,7 @@ class CopyEngine:
                     )
                 if book.asks:
                     target_shares = buy_budget / book.asks[0][0]
-                final_reason = self._buy_signal_reason(event)
+                final_reason = self._buy_signal_reason(event, price_range)
                 if final_reason:
                     copy_trade.status, copy_trade.skip_reason = "skipped", final_reason
                     self.record_rejection(session, copy_trade, event, final_reason, target_shares)
@@ -1452,6 +1495,7 @@ class CopyEngine:
                     fee_rate,
                     reference_price=decision.reference_price if decision else event.price,
                     slippage_price=policy.slippage_price,
+                    price_range=price_range,
                 )
             else:
                 fill = execute_fak(
@@ -1506,7 +1550,7 @@ class CopyEngine:
                 slippage_price=str(policy.slippage_price),
                 max_buy_price=str(
                     min(
-                        MAX_BUY_PRICE,
+                        price_range.maximum,
                         (decision.reference_price if decision else event.price)
                         + policy.slippage_price,
                     )
@@ -1941,6 +1985,8 @@ class CopyEngine:
                     trade.status, trade.skip_reason = "skipped", intent.last_reason
                 await session.commit()
                 return
+            leader_id = intent.leader_id
+            self._remember_price_range(leader)
             event = LeaderActivity(
                 event_key=f"retry:{intent.copy_trade_id}",
                 timestamp=intent.source_timestamp,
@@ -1960,7 +2006,10 @@ class CopyEngine:
                 received_monotonic=time.monotonic(),
             )
         prepared = await self.prepare_copy(event)
-        async with self._execution_slot(event, prepared, 20), SessionLocal() as session:
+        async with (
+            self._execution_slot(event, prepared, 20, self._price_range(leader_id)),
+            SessionLocal() as session,
+        ):
             intent = await session.get(BuyIntent, intent_id)
             trade = await session.get(CopyTrade, intent_id)
             leader = await session.get(Leader, intent.leader_id) if intent else None
@@ -2011,6 +2060,7 @@ class CopyEngine:
                 await session.commit()
                 return
             book = prepared.book
+            price_range = self._remember_price_range(leader)
             policy = await get_execution_policy(session, self.settings)
             position = await get_position(session, intent.token_id)
             exposure = position.cost_basis if position else Decimal(0)
@@ -2043,6 +2093,7 @@ class CopyEngine:
                     fee_rate=prepared.fee_rate,
                     policy=policy,
                     book=book,
+                    price_range=price_range,
                 )
                 if decision.reason:
                     if decision.reason in self.RETRYABLE_BUY_REASONS:
@@ -2070,7 +2121,12 @@ class CopyEngine:
                 )
                 reference = intent.leader_price
             fill = execute_buy_fak_by_budget(
-                book, budget, prepared.fee_rate, reference, slippage_price=policy.slippage_price
+                book,
+                budget,
+                prepared.fee_rate,
+                reference,
+                slippage_price=policy.slippage_price,
+                price_range=price_range,
             )
             if fill.shares <= 0:
                 reason = fill.reason or "no_fill"

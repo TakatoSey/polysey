@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 
 from .polymarket import Book
-from .price_limits import MAX_BUY_PRICE, allowed_buy_price
+from .price_limits import DEFAULT_RANGE, PriceRange
 
 
 @dataclass(slots=True)
@@ -29,18 +29,19 @@ def execute_buy_fak_by_budget(
     slippage_bps: int | None = None,
     *,
     slippage_price: Decimal | None = None,
+    price_range: PriceRange = DEFAULT_RANGE,
 ) -> Fill:
     if budget <= 0 or reference_price <= 0:
         return Fill(
             Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "non_positive_budget"
         )
-    if not allowed_buy_price(reference_price):
+    if not price_range.allows(reference_price):
         return Fill(
             Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "leader_price_out_of_range"
         )
     if not book.asks:
         return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "no_liquidity")
-    if not allowed_buy_price(book.asks[0][0]):
+    if not price_range.allows(book.asks[0][0]):
         return Fill(
             Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "buy_price_out_of_range"
         )
@@ -51,8 +52,10 @@ def execute_buy_fak_by_budget(
     )
     if slippage_price is not None and book.asks and book.asks[0][0] < reference_price - distance:
         return Fill(Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "entry_price_drop")
-    max_price = min(MAX_BUY_PRICE, reference_price + distance)
-    eligible_asks = [(price, size) for price, size in book.asks if price <= max_price]
+    max_price = min(price_range.maximum, reference_price + distance)
+    eligible_asks = [
+        (price, size) for price, size in book.asks if price_range.minimum <= price <= max_price
+    ]
     if not eligible_asks:
         return Fill(
             Decimal(0),
@@ -108,10 +111,11 @@ def execute_fak(
     slippage_bps: int | None = None,
     *,
     slippage_price: Decimal | None = None,
+    price_range: PriceRange = DEFAULT_RANGE,
 ) -> Fill:
     levels = book.asks if side == "BUY" else book.bids
     if side == "BUY":
-        if reference_price is not None and not allowed_buy_price(reference_price):
+        if reference_price is not None and not price_range.allows(reference_price):
             return Fill(
                 Decimal(0),
                 Decimal(0),
@@ -120,7 +124,7 @@ def execute_fak(
                 "rejected",
                 "leader_price_out_of_range",
             )
-        if levels and not allowed_buy_price(levels[0][0]):
+        if levels and not price_range.allows(levels[0][0]):
             return Fill(
                 Decimal(0), Decimal(0), Decimal(0), Decimal(0), "rejected", "buy_price_out_of_range"
             )
@@ -152,7 +156,7 @@ def execute_fak(
     notional = Decimal(0)
     fee = Decimal(0)
     for price, size in levels:
-        if side == "BUY" and not allowed_buy_price(price):
+        if side == "BUY" and not price_range.allows(price):
             break
         if side == "BUY" and max_price is not None and price > max_price:
             break

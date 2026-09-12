@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from .price_limits import allowed_buy_price
+from .price_limits import DEFAULT_RANGE, PriceRange
 
 ZERO = Decimal(0)
 ONE = Decimal(1)
@@ -136,6 +136,7 @@ def entry_budget(
     floor_multiple: Decimal = Decimal(2),
     conviction_power: Decimal = Decimal(1),
     odds_weight: Decimal = Decimal(1),
+    price_range: PriceRange = DEFAULT_RANGE,
 ) -> BudgetDecision:
     """Cumulative all-in target using size, odds and actual prior cash debits."""
     vwap = entry.leader_notional / entry.leader_shares
@@ -186,11 +187,11 @@ def entry_budget(
     )
     if entry.closed:
         reason = "sizing_entry_closed"
-    elif not allowed_buy_price(event_price) or not allowed_buy_price(vwap):
+    elif not price_range.allows(event_price) or not price_range.allows(vwap):
         reason = "leader_price_out_of_range"
     elif ask <= 0:
         reason = "no_liquidity"
-    elif not allowed_buy_price(ask):
+    elif not price_range.allows(ask):
         reason = "buy_price_out_of_range"
     elif ask > reference + distance:
         reason = "no_liquidity_within_slippage"

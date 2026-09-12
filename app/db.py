@@ -66,3 +66,7 @@ async def init_db() -> None:
                     "ADD COLUMN IF NOT EXISTS leader_percent NUMERIC(8, 4)"
                 )
             )
+            for column in ("min_buy_price", "max_buy_price"):
+                await connection.execute(
+                    text(f"ALTER TABLE leaders ADD COLUMN IF NOT EXISTS {column} NUMERIC(20, 10)")
+                )
