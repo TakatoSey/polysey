@@ -275,3 +275,22 @@ async def test_a_market_level_minimum_is_reported_but_execution_keeps_the_book(c
         assert "market_min_order_mismatch" not in capsys.readouterr().out
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload, estimated",
+    [
+        ({"c": CONDITION, "fd": {"r": "0.02", "e": "1"}}, False),
+        ({"c": CONDITION, "fd": {"r": "bad", "e": "1"}}, True),
+        ({"c": CONDITION}, True),
+    ],
+)
+async def test_fee_rate_records_whether_it_came_from_the_exchange(payload, estimated):
+    client = client_for(lambda _: httpx.Response(200, json=payload))
+    try:
+        assert client.fee_is_estimated(CONDITION) is None  # nothing claimed yet
+        await client.get_fee_rate(CONDITION, "Some market")
+        assert client.fee_is_estimated(CONDITION) is estimated
+    finally:
+        await client.close()

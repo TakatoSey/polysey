@@ -106,7 +106,7 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
             fields(
                 o,
                 "id copy_trade_id token_id side requested_shares filled_shares "
-                "average_fill_price fee status reason created_at",
+                "average_fill_price fee status reason fee_estimated created_at",
             )
             for o in orders
         ],

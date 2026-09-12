@@ -340,3 +340,28 @@ async def test_buy_notification_toggle_flips_the_flag_and_its_own_button(admin_r
 
     async with admin_rig.sessions() as session:
         assert (await session.get(Account, 1)).notify_buys is True
+
+
+async def test_stats_flag_fills_whose_fee_was_only_an_estimate(admin_rig):
+    assert "оценке" not in await admin_rig.app._stats_text()
+    async with admin_rig.sessions() as session:
+        session.add(
+            PaperOrder(
+                id=2,
+                copy_trade_id=1,
+                token_id="token",
+                side="BUY",
+                requested_shares=D(4),
+                filled_shares=D(4),
+                average_fill_price=D("0.5"),
+                fee=D("0.05"),
+                status="filled",
+                fee_estimated=True,
+            )
+        )
+        await session.commit()
+
+    text = await admin_rig.app._stats_text()
+
+    # One of the two fills paid a fee we estimated ourselves.
+    assert "Комиссия по оценке: 1 из 2" in text

@@ -790,6 +790,7 @@ class TelegramApp:
                 lines.append(
                     header
                     + f"\n{row.filled_shares:.2f} shares @ {row.average_fill_price * 100:.1f}¢"
+                    + (" · комиссия по оценке" if row.fee_estimated else "")
                 )
         if total_pages > 1:
             lines.append(f"\nСтраница {page + 1}/{total_pages}")
@@ -806,6 +807,18 @@ class TelegramApp:
                     .group_by(CopyTrade.status, CopyTrade.skip_reason)
                 )
             )
+            fills = list(
+                await session.execute(
+                    select(PaperOrder.fee_estimated, func.count())
+                    .where(
+                        PaperOrder.status.in_(["filled", "partial"]),
+                        PaperOrder.created_at >= since,
+                    )
+                    .group_by(PaperOrder.fee_estimated)
+                )
+            )
+        estimated_fees = sum(count for flag, count in fills if flag)
+        total_fills = sum(count for _flag, count in fills)
         executed = sum(count for status, _, count in rows if status == "executed")
         waiting = sum(count for status, _, count in rows if status in {"detected", "retry_pending"})
         missed = Counter()
@@ -826,6 +839,13 @@ class TelegramApp:
             lines.append("<b>Причины</b>")
             for reason, count in missed.most_common(8):
                 lines.append(f"{count} · {html.escape(str(reason))}")
+        if estimated_fees:
+            # Fee accuracy is not guaranteed on a fallback rate, so PNL from
+            # these fills must not read as exact.
+            lines.append(
+                f"\n⚠️ Комиссия по оценке: {estimated_fees} из {total_fills} исполнений — "
+                "расписание биржи было недоступно, точность PNL по ним не гарантирована."
+            )
         return "\n".join(lines)
 
     async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):

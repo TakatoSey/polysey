@@ -60,6 +60,7 @@ log = structlog.get_logger(__name__)
 class PreparedCopy:
     market: dict | None = None
     fee_rate: Decimal = Decimal(0)
+    fee_estimated: bool = False
     exchange_delay: float = 0.0
     error: Exception | None = None
     ready_at: float = 0.0
@@ -890,6 +891,8 @@ class CopyEngine:
             if not 0 <= delay <= 60:
                 raise ValueError("invalid_market_delay")
             prepared.market, prepared.fee_rate, prepared.exchange_delay = market, fee_rate, delay
+            # Bound to the rate we just took, not to whatever the cache holds later.
+            prepared.fee_estimated = bool(self.client.fee_is_estimated(event.condition_id))
             # The exchange delay starts when the signal is received. Metadata and
             # book requests run during it; this models the fastest valid taker path.
             remaining = delay + self.settings.copy_latency_seconds - (time.monotonic() - started)
@@ -1547,6 +1550,7 @@ class CopyEngine:
             fee=fill.fee,
             status=fill.status,
             reason=fill.reason,
+            fee_estimated=prepared.fee_estimated,
         )
         session.add(order)
         if fill.shares <= 0:
@@ -1925,6 +1929,7 @@ class CopyEngine:
                         fee=fill.fee,
                         status=fill.status,
                         reason=trigger,
+                        fee_estimated=prepared.fee_estimated,
                     )
                 )
                 await session.commit()
@@ -2184,6 +2189,7 @@ class CopyEngine:
                     fee=fill.fee,
                     status=fill.status,
                     reason="deferred_price_retry",
+                    fee_estimated=prepared.fee_estimated,
                 )
             )
             if smart_entry:
@@ -2357,6 +2363,7 @@ class CopyEngine:
                         fee=fill.fee,
                         status=fill.status,
                         reason="exit_intent",
+                        fee_estimated=prepared.fee_estimated,
                     )
                 )
                 trade = await session.get(CopyTrade, intent.copy_trade_id)

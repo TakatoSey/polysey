@@ -111,6 +111,8 @@ class PaperOrder(Base):
     fee: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=0)
     status: Mapped[str] = mapped_column(String(24), default="submitted")
     reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    # The fee came from our fallback estimate, not the exchange schedule.
+    fee_estimated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

@@ -121,6 +121,9 @@ class PolymarketClient:
         self.http = httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0))
         self._fee_cache: dict[str, Decimal] = {}
         self._fee_cache_time: dict[str, float] = {}
+        # True where the rate is our own estimate because the exchange schedule
+        # was unavailable, so a fill's fee is not the exchange's number.
+        self._fee_estimated: dict[str, bool] = {}
         self._resolution_cache: dict[tuple[str, str], tuple[float, Decimal | None]] = {}
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
         self._value_cache: dict[str, tuple[float, Decimal]] = {}
@@ -409,11 +412,12 @@ class PolymarketClient:
             # execution merely because a new category uses a different value.
             if not exponent.is_finite() or exponent <= 0:
                 raise LookupError("invalid_fee_exponent")
+            estimated = False
         except ValueError as exc:
             # A response for a different market is not safe to use.
             if str(exc) == "fee_market_identity_mismatch":
                 raise
-            rate = self._fallback_fee_rate(title)
+            rate, estimated = self._fallback_fee_rate(title), True
             log.warning(
                 "invalid_fee_data_using_fallback",
                 condition_id=condition_id,
@@ -421,7 +425,7 @@ class PolymarketClient:
                 error=str(exc),
             )
         except Exception as exc:
-            rate = self._fallback_fee_rate(title)
+            rate, estimated = self._fallback_fee_rate(title), True
             log.warning(
                 "fee_data_unavailable_using_fallback",
                 condition_id=condition_id,
@@ -431,7 +435,12 @@ class PolymarketClient:
         # A zero rate explicitly returned by the exchange is valid.
         self._fee_cache[condition_id] = rate
         self._fee_cache_time[condition_id] = time.monotonic()
+        self._fee_estimated[condition_id] = estimated
         return rate
+
+    def fee_is_estimated(self, condition_id: str) -> bool | None:
+        """Whether this market's last fee rate was our fallback, None if unseen."""
+        return self._fee_estimated.get(condition_id)
 
     def taker_hold_flag(self, condition_id: str) -> bool | None:
         """Whether this market applies the short taker hold, None if unseen."""
