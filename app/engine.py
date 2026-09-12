@@ -68,6 +68,7 @@ class CopyEngine:
         "no_liquidity",
         "entry_price_drop",
         "buy_price_out_of_range",
+        "market_not_accepting_orders",
     }
 
     def __init__(self, settings: Settings, client: PolymarketClient):
@@ -270,7 +271,8 @@ class CopyEngine:
         session, copy_trade: CopyTrade, event: LeaderActivity, reason: str
     ) -> None:
         """Keep a missed price entry eligible without replaying its sizing/inventory effects."""
-        if event.side != "BUY" or reason not in CopyEngine.RETRYABLE_BUY_REASONS:
+        retry_reason = reason.removeprefix("market_data:")
+        if event.side != "BUY" or retry_reason not in CopyEngine.RETRYABLE_BUY_REASONS:
             return
         copy_trade.status = "retry_pending"
         copy_trade.skip_reason = reason
@@ -288,7 +290,7 @@ class CopyEngine:
                 slug=event.slug,
                 event_slug=event.event_slug,
                 next_attempt=Decimal(str(time.time() + 0.5)),
-                last_reason=reason[:240],
+                last_reason=retry_reason[:240],
             )
         )
 
@@ -829,6 +831,7 @@ class CopyEngine:
                         raise result
             if not any(str(t.get("token_id")) == event.token_id for t in market.get("tokens", [])):
                 raise ValueError("trade_token_mismatch")
+            prepared.market = market
             if market.get("closed") is not False or market.get("accepting_orders") is not True:
                 raise ValueError("market_not_accepting_orders")
             delay = float(market["seconds_delay"])
@@ -932,6 +935,17 @@ class CopyEngine:
         leader_id = leader.id
         seconds = self.settings.smart_sizing_burst_seconds
         start = entry_bucket(event.timestamp, seconds)
+        prior_sell = await session.scalar(
+            select(func.max(CopyTrade.timestamp)).where(
+                CopyTrade.leader_id == leader_id,
+                CopyTrade.token_id == event.token_id,
+                CopyTrade.side == "SELL",
+                CopyTrade.timestamp >= start,
+                CopyTrade.timestamp <= event.timestamp,
+            )
+        )
+        if prior_sell is not None:
+            start += seconds
         # A SELL is a barrier even if we had no position to sell. A later bucket
         # also prevents late REST events from reviving a superseded entry.
         barrier = await session.scalar(
@@ -1981,8 +1995,12 @@ class CopyEngine:
                     "trade_token_mismatch",
                     "invalid_market_delay",
                 }:
-                    intent.active, intent.last_reason = False, detail
-                    trade.status, trade.skip_reason = "skipped", detail
+                    market_closed = bool(prepared.market and prepared.market.get("closed") is True)
+                    if detail == "market_not_accepting_orders" and not market_closed:
+                        self._delay_buy_intent(intent, detail)
+                    else:
+                        intent.active, intent.last_reason = False, detail
+                        trade.status, trade.skip_reason = "skipped", detail
                 else:
                     self._delay_buy_intent(intent, "market_data_unavailable")
                 await session.commit()
@@ -1998,12 +2016,14 @@ class CopyEngine:
             smart_entry = decision = None
             fixed_size = leader.fixed_trade_size
             fixed_percent = leader.fixed_trade_percent
-            use_smart_entry = self.settings.smart_sizing_enabled or bool(
-                fixed_size is not None and fixed_size.is_finite() and fixed_size > 0
-            ) or bool(
-                fixed_percent is not None
-                and fixed_percent.is_finite()
-                and Decimal(0) < fixed_percent <= Decimal(100)
+            use_smart_entry = (
+                self.settings.smart_sizing_enabled
+                or bool(fixed_size is not None and fixed_size.is_finite() and fixed_size > 0)
+                or bool(
+                    fixed_percent is not None
+                    and fixed_percent.is_finite()
+                    and Decimal(0) < fixed_percent <= Decimal(100)
+                )
             )
             if use_smart_entry:
                 start = entry_bucket(
