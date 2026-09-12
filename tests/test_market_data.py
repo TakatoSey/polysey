@@ -217,3 +217,80 @@ async def test_sports_fee_network_fallback_matches_documented_rate():
         assert await client.get_fee_rate(CONDITION, "Will Barrow AFC win?") == Decimal("0.03")
     finally:
         await client.close()
+
+
+def book_payload(token_id="11", **overrides):
+    return {
+        "asset_id": token_id,
+        "bids": [{"price": "0.49", "size": "100"}],
+        "asks": [{"price": "0.51", "size": "100"}],
+        "tick_size": "0.01",
+        "min_order_size": "5",
+        **overrides,
+    }
+
+
+@pytest.mark.asyncio
+async def test_order_limits_are_remembered_per_token_not_assumed():
+    minimums = {"11": "5", "22": "100"}
+
+    def handler(request):
+        token = request.url.params["token_id"]
+        return httpx.Response(
+            200, json=book_payload(token, min_order_size=minimums[token], tick_size="0.001")
+        )
+
+    client = client_for(handler)
+    try:
+        assert client.market_limits("11") is None  # never guessed before a read
+        for token in minimums:
+            await client.get_book(token)
+        assert client.market_limits("11").min_order_size == Decimal(5)
+        assert client.market_limits("22").min_order_size == Decimal(100)
+        assert client.market_limits("11").tick_size == Decimal("0.001")
+        assert client.market_limits("11").seen_at > 0
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_a_market_level_minimum_is_reported_but_execution_keeps_the_book(capsys):
+    def handler(request):
+        if request.url.path == "/book":
+            return httpx.Response(200, json=book_payload(min_order_size="5"))
+        return httpx.Response(200, json=market(closed=False, minimum_order_size=15))
+
+    client = client_for(handler)
+    try:
+        book = await client.get_book("11")
+        await client.get_market(CONDITION)
+        reported = capsys.readouterr().out
+        assert "market_min_order_mismatch" in reported
+        assert "market_min_order_size=15" in reported and "book_min_order_size=5" in reported
+        # The book stays the number orders are checked against.
+        assert book.min_order_size == Decimal(5)
+        assert client.market_limits("11").min_order_size == Decimal(5)
+        await client.get_market(CONDITION)
+        # Reported once for the market, not on every copied trade.
+        assert "market_min_order_mismatch" not in capsys.readouterr().out
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload, estimated",
+    [
+        ({"c": CONDITION, "fd": {"r": "0.02", "e": "1"}}, False),
+        ({"c": CONDITION, "fd": {"r": "bad", "e": "1"}}, True),
+        ({"c": CONDITION}, True),
+    ],
+)
+async def test_fee_rate_records_whether_it_came_from_the_exchange(payload, estimated):
+    client = client_for(lambda _: httpx.Response(200, json=payload))
+    try:
+        assert client.fee_is_estimated(CONDITION) is None  # nothing claimed yet
+        await client.get_fee_rate(CONDITION, "Some market")
+        assert client.fee_is_estimated(CONDITION) is estimated
+    finally:
+        await client.close()

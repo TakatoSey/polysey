@@ -1,10 +1,15 @@
+import re
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.bot import TelegramApp
+from app.db import Base
+from app.models import Account, PaperOrder, Position
 
 
 def panel(client):
@@ -143,3 +148,121 @@ async def test_portfolio_screen_shows_price_value_pnl_percent_and_win_payout():
     assert "PnL: +$2.24 (+33.9%)" in text
     assert "To Win: $14.25" in text
     assert "Total PnL: +$2.24 (+33.9%)" in text
+
+
+def buttons(keyboard):
+    return [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data.startswith("position:")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_portfolio_is_ordered_by_last_buy_and_its_buttons_follow_the_list(
+    tmp_path, monkeypatch
+):
+    db = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'portfolio-order.db'}")
+    sessions = async_sessionmaker(db, expire_on_commit=False)
+    monkeypatch.setattr("app.bot.SessionLocal", sessions)
+    async with db.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    opened = datetime(2026, 1, 1, tzinfo=UTC)
+    # Bought in the order a, b, c, d, e, f; f is the most recent.
+    order_of_purchase = ["a", "b", "c", "d", "e", "f"]
+    async with sessions() as session:
+        session.add(Account(id=1, paper_balance=Decimal(100), starting_balance=Decimal(100)))
+        for index, token in enumerate(order_of_purchase):
+            session.add(
+                Position(
+                    id=index + 1,
+                    token_id=token,
+                    condition_id=f"market-{token}",
+                    title=f"Market {token}",
+                    outcome="Yes",
+                    shares=Decimal(10),
+                    average_price=Decimal("0.50"),
+                    cost_basis=Decimal(5),
+                    # Opening order is deliberately the reverse of buying order:
+                    # the list must follow the buys, not the row age.
+                    opened_at=opened + timedelta(minutes=len(order_of_purchase) - index),
+                )
+            )
+            session.add(
+                PaperOrder(
+                    token_id=token,
+                    side="BUY",
+                    requested_shares=Decimal(10),
+                    filled_shares=Decimal(10),
+                    average_fill_price=Decimal("0.50"),
+                    status="filled",
+                    created_at=opened + timedelta(minutes=index),
+                )
+            )
+        # Neither a later sell nor a rejected buy is a purchase.
+        session.add(
+            PaperOrder(
+                token_id="a",
+                side="SELL",
+                requested_shares=Decimal(1),
+                filled_shares=Decimal(1),
+                average_fill_price=Decimal("0.60"),
+                status="filled",
+                created_at=opened + timedelta(hours=5),
+            )
+        )
+        session.add(
+            PaperOrder(
+                token_id="a",
+                side="BUY",
+                requested_shares=Decimal(1),
+                filled_shares=Decimal(0),
+                average_fill_price=Decimal(0),
+                status="rejected",
+                created_at=opened + timedelta(hours=5),
+            )
+        )
+        await session.commit()
+    app = panel(AsyncMock())
+    app.settings = SimpleNamespace(paper_initial_balance=Decimal(100))
+    app._position_quote = AsyncMock(return_value=(Decimal("0.60"), "🟢 Open", "bid"))
+    identifier = {token: index + 1 for index, token in enumerate(order_of_purchase)}
+    newest_first = list(reversed(order_of_purchase))
+    try:
+        text, keyboard = await app._portfolio_screen(0)
+        listed = re.findall(r"\d+\. <b>Market (\w)</b>", text)
+        assert listed == newest_first[:5]
+        assert buttons(keyboard) == [f"position:{identifier[token]}:0" for token in listed]
+
+        text, keyboard = await app._portfolio_screen(1)
+        listed = re.findall(r"\d+\. <b>Market (\w)</b>", text)
+        assert listed == newest_first[5:]
+        assert buttons(keyboard) == [f"position:{identifier[token]}:1" for token in listed]
+    finally:
+        await db.dispose()
+
+
+def test_min_order_note_reports_only_an_observed_market_minimum():
+    from app.polymarket import MarketLimits
+
+    limits = {"known": MarketLimits(Decimal(5), Decimal("0.01"), 1.0)}
+    app = panel(SimpleNamespace(market_limits=limits.get))
+
+    assert app._min_order_note("known") == "5 shares"
+    assert app._min_order_note("known", Decimal("0.60")) == "5 shares ≈ $3.00"
+    # A market we have not read a book for is left unsaid, never guessed.
+    assert app._min_order_note("unseen") == ""
+    assert app._min_order_note("known", None) == "5 shares"
+
+
+def test_min_order_note_stays_silent_on_unusable_values():
+    from app.polymarket import MarketLimits
+
+    for minimum in (Decimal(0), Decimal("NaN"), None, "5"):
+        app = panel(
+            SimpleNamespace(
+                market_limits=lambda _t, m=minimum: MarketLimits(m, Decimal("0.01"), 1.0)
+            )
+        )
+        assert app._min_order_note("token") == ""

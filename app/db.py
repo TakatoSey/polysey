@@ -66,6 +66,24 @@ async def init_db() -> None:
                     "ADD COLUMN IF NOT EXISTS leader_percent NUMERIC(8, 4)"
                 )
             )
+            await connection.execute(
+                text(
+                    "ALTER TABLE leaders "
+                    "ADD COLUMN IF NOT EXISTS removed BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE accounts "
+                    "ADD COLUMN IF NOT EXISTS notify_buys BOOLEAN NOT NULL DEFAULT true"
+                )
+            )
+            await connection.execute(
+                text(
+                    "ALTER TABLE paper_orders "
+                    "ADD COLUMN IF NOT EXISTS fee_estimated BOOLEAN NOT NULL DEFAULT false"
+                )
+            )
             for column in ("min_buy_price", "max_buy_price"):
                 await connection.execute(
                     text(f"ALTER TABLE leaders ADD COLUMN IF NOT EXISTS {column} NUMERIC(20, 10)")

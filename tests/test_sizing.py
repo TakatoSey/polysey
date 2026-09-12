@@ -478,6 +478,7 @@ async def sizing_rig(tmp_path, monkeypatch):
         ),
         get_fee_rate=AsyncMock(return_value=D(0)),
         taker_hold_flag=lambda condition_id: None,
+        fee_is_estimated=lambda condition_id: False,
         get_book=AsyncMock(return_value=book),
         get_activity=AsyncMock(return_value=[]),
         get_resolution=AsyncMock(return_value=None),
@@ -664,6 +665,29 @@ async def test_leader_percent_may_exceed_the_leader_and_stops_at_the_series_maxi
         )
         # Twice the leader would be $80; our own series maximum still holds.
         assert abs(state.spent - 30) < TOLERANCE
+
+
+@pytest.mark.parametrize("notify", [True, False])
+async def test_muting_buy_notifications_does_not_change_what_is_copied(sizing_rig, notify):
+    async with sizing_rig.sessions() as session:
+        (await session.get(Account, 1)).notify_buys = notify
+        await session.commit()
+    await copy(sizing_rig, "notify-or-not", "20")
+    async with sizing_rig.sessions() as session:
+        # The fill itself is unaffected by whether the chat hears about it.
+        assert abs((await session.get(Account, 1)).paper_balance - 95) < TOLERANCE
+        assert (await session.scalar(select(PaperOrder))).filled_shares > 0
+    assert sizing_rig.engine.notifications.empty() is not notify
+
+
+@pytest.mark.parametrize("estimated", [True, False])
+async def test_a_fill_records_whether_its_fee_was_only_an_estimate(sizing_rig, estimated):
+    sizing_rig.client.fee_is_estimated = lambda condition_id: estimated
+    await copy(sizing_rig, "fee-origin", "20")
+    async with sizing_rig.sessions() as session:
+        order = await session.scalar(select(PaperOrder))
+        assert order.filled_shares > 0
+        assert order.fee_estimated is estimated
 
 
 async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):

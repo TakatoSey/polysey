@@ -38,12 +38,15 @@ def analyze_history(history):
     holdings, warnings = replay(rows)
     cash_flows = defaultdict(lambda: {"buy_cost": ZERO, "sell_net": ZERO, "payout": ZERO})
     fills, fees, adverse_cost, favorable_saving = [], ZERO, ZERO, ZERO
+    estimated_fee_fills = 0
     for order, owner in rows:
         if order.status not in {"filled", "partial", "settled"} or order.filled_shares <= 0:
             continue
         amount = order.filled_shares * order.average_fill_price
         flow = cash_flows[order.token_id]
         fees += order.fee
+        # Older exports predate the flag; absence is not a claim of accuracy.
+        estimated_fee_fills += bool(getattr(order, "fee_estimated", False))
         if order.side == "BUY":
             flow["buy_cost"] += amount + order.fee
             trade = trades.get(order.copy_trade_id)
@@ -106,6 +109,8 @@ def analyze_history(history):
         ),
         "realized_pnl": sum((h.realized for h in holdings.values()), ZERO),
         "fees": fees,
+        # Fills whose fee is our fallback estimate, not the exchange's rate.
+        "estimated_fee_fills": estimated_fee_fills,
         "buy_price_disadvantage_dollars": adverse_cost,
         "buy_price_improvement_dollars": favorable_saving,
         "outside_current_range_buys": [f for f in fills if f["outside_current_buy_range"]],

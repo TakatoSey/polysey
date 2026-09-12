@@ -38,6 +38,8 @@ class Account(Base):
         Numeric(8, 6), default=Decimal("0.05"), nullable=False
     )
     paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Push on a copied BUY. Sells, payouts and risk exits always notify.
+    notify_buys: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now
@@ -56,6 +58,8 @@ class Leader(Base):
     min_buy_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     max_buy_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Deleted from the panel while their copied trades still reference them.
+    removed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     initialized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_timestamp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -107,6 +111,8 @@ class PaperOrder(Base):
     fee: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=0)
     status: Mapped[str] = mapped_column(String(24), default="submitted")
     reason: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    # The fee came from our fallback estimate, not the exchange schedule.
+    fee_estimated: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 

@@ -22,6 +22,7 @@ from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
+from .formatting import percent, plain
 from .links import market_link
 from .models import (
     BuyIntent,
@@ -29,6 +30,7 @@ from .models import (
     ExitIntent,
     Leader,
     LeaderPosition,
+    LeaderSizingProfile,
     PaperOrder,
     Position,
     RiskRule,
@@ -46,6 +48,7 @@ from .repository import (
     get_or_create_account,
     orders,
     positions,
+    remove_leader,
 )
 from .sizing import MAX_LEADER_PERCENT, leader_percent
 
@@ -316,7 +319,7 @@ class TelegramApp:
             mode = (
                 f" · ${row.fixed_trade_size:.2f} фикс."
                 if row.fixed_trade_size
-                else f" · {row.fixed_trade_percent:g}% лидера"
+                else f" · {percent(row.fixed_trade_percent)}% лидера"
                 if row.fixed_trade_percent
                 else ""
             )
@@ -372,7 +375,7 @@ class TelegramApp:
         sizing_mode = (
             f"фикс. ${row.fixed_trade_size:.2f} на серию"
             if row.fixed_trade_size is not None
-            else f"{row.fixed_trade_percent:g}% от суммы серии лидера"
+            else f"{percent(row.fixed_trade_percent)}% от суммы серии лидера"
             if row.fixed_trade_percent is not None
             else "адаптивный"
         )
@@ -503,6 +506,22 @@ class TelegramApp:
             return last, status, "Mark по последней сделке"
         return book.bids[0][0], status, "Оценка по лучшему bid"
 
+    def _min_order_note(self, token_id: str, quote: Decimal | None = None) -> str:
+        """The exchange minimum we actually observed for this token, if any.
+
+        It differs per market and is what blocks a small entry or strands a
+        tail on exit, so it belongs on screen rather than only in the logs.
+        Never invented: without an observed value the line is omitted.
+        """
+        limits = self.engine.client.market_limits(token_id)
+        shares = getattr(limits, "min_order_size", None)
+        if not isinstance(shares, Decimal) or not shares.is_finite() or shares <= 0:
+            return ""
+        note = f"{plain(shares)} shares"
+        if isinstance(quote, Decimal) and quote.is_finite() and quote > 0:
+            note += f" ≈ ${shares * quote:.2f}"
+        return note
+
     async def _market_closed(self, row) -> bool:
         try:
             market = await self.engine.client.get_market(row.condition_id)
@@ -511,8 +530,14 @@ class TelegramApp:
             return False
         return isinstance(market, dict) and market.get("closed") is True
 
-    async def _portfolio_text_v2(self, page: int = 0) -> str:
+    async def _portfolio_screen(self, page: int = 0):
+        """Text and keyboard from ONE read, so item 3 and button 3 agree."""
         rows, _account = await self._portfolio_data_v2()
+        return await self._portfolio_text_v2(page, rows), self._portfolio_keyboard_v2(rows, page)
+
+    async def _portfolio_text_v2(self, page: int = 0, rows=None) -> str:
+        if rows is None:
+            rows, _account = await self._portfolio_data_v2()
         per_page = 5
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         page = max(0, min(page, total_pages - 1))
@@ -620,6 +645,11 @@ class TelegramApp:
                 f"PnL: {pnl_text}",
                 f"To Win: ${row.shares:.2f}",
                 f"Status: {status}",
+                *(
+                    [f"Минимум ордера: {minimum}"]
+                    if (minimum := self._min_order_note(row.token_id, quote))
+                    else []
+                ),
                 "",
                 f"<i>{note} · {datetime.now(UTC):%H:%M} UTC</i>",
             ]
@@ -700,10 +730,12 @@ class TelegramApp:
         if pending:
             lines.append("\n<b>⏳ Незавершённые выходы</b>")
             for intent, name, title in pending:
+                minimum = self._min_order_note(intent.token_id)
                 lines.append(
                     f"{html.escape(name or 'Лидер')} · "
                     f"{html.escape((title or intent.token_id)[:65])}"
-                    f"\n{intent.remaining:.2f} shares · мин. {intent.min_price * 100:.1f}¢"
+                    f"\n{intent.remaining:.2f} shares · мин. цена {intent.min_price * 100:.1f}¢"
+                    + (f" · лот от {minimum}" if minimum else "")
                 )
             if not self.settings.exit_retry_enabled:
                 lines.append("Автоповторы выключены")
@@ -758,6 +790,7 @@ class TelegramApp:
                 lines.append(
                     header
                     + f"\n{row.filled_shares:.2f} shares @ {row.average_fill_price * 100:.1f}¢"
+                    + (" · комиссия по оценке" if row.fee_estimated else "")
                 )
         if total_pages > 1:
             lines.append(f"\nСтраница {page + 1}/{total_pages}")
@@ -774,6 +807,18 @@ class TelegramApp:
                     .group_by(CopyTrade.status, CopyTrade.skip_reason)
                 )
             )
+            fills = list(
+                await session.execute(
+                    select(PaperOrder.fee_estimated, func.count())
+                    .where(
+                        PaperOrder.status.in_(["filled", "partial"]),
+                        PaperOrder.created_at >= since,
+                    )
+                    .group_by(PaperOrder.fee_estimated)
+                )
+            )
+        estimated_fees = sum(count for flag, count in fills if flag)
+        total_fills = sum(count for _flag, count in fills)
         executed = sum(count for status, _, count in rows if status == "executed")
         waiting = sum(count for status, _, count in rows if status in {"detected", "retry_pending"})
         missed = Counter()
@@ -794,6 +839,13 @@ class TelegramApp:
             lines.append("<b>Причины</b>")
             for reason, count in missed.most_common(8):
                 lines.append(f"{count} · {html.escape(str(reason))}")
+        if estimated_fees:
+            # Fee accuracy is not guaranteed on a fallback rate, so PNL from
+            # these fills must not read as exact.
+            lines.append(
+                f"\n⚠️ Комиссия по оценке: {estimated_fees} из {total_fills} исполнений — "
+                "расписание биржи было недоступно, точность PNL по ним не гарантирована."
+            )
         return "\n".join(lines)
 
     async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):
@@ -836,7 +888,8 @@ class TelegramApp:
             f"Минимум BUY: <b>${self.settings.min_copy_notional:.2f}</b>\n"
             f"Лимит на исход: <b>${self.settings.max_outcome_exposure:.2f}</b>\n"
             f"Резерв кэша: <b>{self.settings.min_cash_reserve_pct * 100:.0f}%</b> капитала\n"
-            f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>"
+            f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>\n"
+            f"Уведомления о покупках: <b>{'включены' if account.notify_buys else 'выключены'}</b>"
         )
 
     def _sizing_summary(self, account) -> str:
@@ -854,7 +907,7 @@ class TelegramApp:
             "<b>Размер · адаптивный</b>\n"
             f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · "
             f"сейчас ${base:.2f}\n"
-            f"Масштаб: до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
+            f"Масштаб: до {plain(self.settings.smart_sizing_max_multiplier)}× базы\n"
             f"Максимум серии: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
             f"Окно серии: {self.settings.smart_sizing_burst_seconds} с\n"
             "/setsize не влияет на адаптивный режим · /setmax 30"
@@ -871,8 +924,8 @@ class TelegramApp:
             "<b>💵 Расчёт входа</b>\n\n"
             f"База — {self.settings.copy_balance_pct * 100:.1f}% свободных денег на старте серии.\n"
             f"Масштаб — (серия трейдера / его типичная серия) в степени "
-            f"{self.settings.sizing_conviction_power:g}, до "
-            f"{self.settings.smart_sizing_max_multiplier:g}×. Вход вдвое крупнее обычного "
+            f"{plain(self.settings.sizing_conviction_power)}, до "
+            f"{plain(self.settings.smart_sizing_max_multiplier)}×. Вход вдвое крупнее обычного "
             "весит больше, чем вдвое.\n"
             "Цена — если наша хуже средней цены трейдера, бюджет уменьшается. "
             "Лучшая цена бюджет не увеличивает.\n"
@@ -889,16 +942,28 @@ class TelegramApp:
             "Slippage, свободные деньги и лимит на исход действуют всегда."
         )
 
-    def _settings_keyboard_v2(self):
+    def _settings_keyboard_v2(self, notify_buys: bool = True):
         builder = InlineKeyboardBuilder()
         builder.button(text="💵 Размер сделки", callback_data="settings:sizing")
         builder.button(text="📏 Лимиты", callback_data="settings:limits")
         builder.button(text="📉 Slippage", callback_data="settings:slippage")
         builder.button(text="🛡️ Stop-loss / TP", callback_data="settings:risk")
+        builder.button(
+            text="🔕 Не уведомлять о покупках" if notify_buys else "🔔 Уведомлять о покупках",
+            callback_data="notify_buys_toggle",
+        )
         builder.button(text="🧪 Сброс базы", callback_data="reset_prompt")
         builder.button(text="⬅️ На главную", callback_data="home")
-        builder.adjust(2, 2, 1, 1)
+        builder.adjust(2, 2, 1, 1, 1)
         return builder.as_markup()
+
+    async def _settings_screen(self):
+        """Text and keyboard from one read, so the button matches the state."""
+        async with SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            notify_buys = account.notify_buys
+            await session.commit()
+        return await self._settings_text_v2(), self._settings_keyboard_v2(notify_buys)
 
     def _register(self) -> None:
         self.dp.message.register(self.start, Command("start"))
@@ -949,10 +1014,8 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        rows, _ = await self._portfolio_data_v2()
-        await self._edit_panel(
-            await self._portfolio_text_v2(0), self._portfolio_keyboard_v2(rows, 0), message.chat.id
-        )
+        text, keyboard = await self._portfolio_screen(0)
+        await self._edit_panel(text, keyboard, message.chat.id)
 
     async def leaders(self, message: Message) -> None:
         if not self._allowed(message):
@@ -974,9 +1037,8 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(
-            await self._settings_text_v2(), self._settings_keyboard_v2(), message.chat.id
-        )
+        text, keyboard = await self._settings_screen()
+        await self._edit_panel(text, keyboard, message.chat.id)
 
     async def addleader(self, message: Message, state: FSMContext) -> None:
         if not self._allowed(message):
@@ -1061,7 +1123,7 @@ class TelegramApp:
                 if leader_id:
                     builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
                 await self._edit_panel(
-                    f"Введите процент от 0 до {MAX_LEADER_PERCENT:g}, например "
+                    f"Введите процент от 0 до {plain(MAX_LEADER_PERCENT)}, например "
                     "<code>50</code> — половина суммы лидера, <code>200</code> — вдвое больше.",
                     builder.as_markup(),
                     message.chat.id,
@@ -1143,9 +1205,12 @@ class TelegramApp:
             return
         async with SessionLocal() as session:
             row = await session.scalar(select(Leader).where(Leader.address == parts[1].lower()))
+            leader_id = row.id if row else None
             if row:
-                row.active = False
+                await remove_leader(session, row)
             await session.commit()
+        if leader_id is not None:
+            self.engine.forget_leader(leader_id)
         await self._leaders_panel(chat_id=message.chat.id)
 
     async def _set_decimal_setting(
@@ -1248,9 +1313,12 @@ class TelegramApp:
         builder.button(text="Отмена", callback_data="home")
         await self._edit_panel(
             "<b>Сбросить базу?</b>\n"
-            "Удалятся сделки, ордера, позиции, серии и незавершённые выходы.\n"
+            "Удалится всё торговое: сделки, ордера, позиции, серии, незавершённые "
+            "выходы, правила риска и собранная статистика трейдеров.\n"
             f"Баланс станет ${self.settings.paper_initial_balance:.2f}.\n\n"
-            "Трейдеры и их статистика останутся. Отменить нельзя.",
+            "Останутся сами трейдеры со своими настройками — размер, процент и "
+            "диапазон цены. Статистика наберётся заново при следующем опросе. "
+            "Отменить нельзя.",
             builder.as_markup(),
             chat_id,
         )
@@ -1266,6 +1334,7 @@ class TelegramApp:
                 BuyIntent,
                 ExitIntent,
                 LeaderPosition,
+                LeaderSizingProfile,
                 RiskRule,
                 PaperOrder,
                 Position,
@@ -1277,8 +1346,9 @@ class TelegramApp:
             account.starting_balance = self.settings.paper_initial_balance
             account.realized_pnl = Decimal(0)
             await session.commit()
-        # In-memory batches reference rows that no longer exist.
-        self.engine._buy_batches.clear()
+        # Sell barriers, poll checkpoints and cached profiles reference rows
+        # that no longer exist.
+        self.engine.reset_runtime_state()
         return self.settings.paper_initial_balance
 
     async def risk(self, message: Message) -> None:
@@ -1355,12 +1425,8 @@ class TelegramApp:
             await self._home(chat_id)
         elif data == "portfolio" or data.startswith("portfolio:"):
             page = int(data.split(":")[1]) if ":" in data else 0
-            rows, _ = await self._portfolio_data_v2()
-            await self._edit_panel(
-                await self._portfolio_text_v2(page),
-                self._portfolio_keyboard_v2(rows, page),
-                chat_id,
-            )
+            text, keyboard = await self._portfolio_screen(page)
+            await self._edit_panel(text, keyboard, chat_id)
         elif data == "orders" or data.startswith("orders:"):
             parts = data.split(":")
             page = int(parts[1]) if len(parts) > 1 and parts[1] else 0
@@ -1381,9 +1447,15 @@ class TelegramApp:
                 await self._position_detail_v2(int(raw_id)), builder.as_markup(), chat_id
             )
         elif data == "settings":
-            await self._edit_panel(
-                await self._settings_text_v2(), self._settings_keyboard_v2(), chat_id
-            )
+            text, keyboard = await self._settings_screen()
+            await self._edit_panel(text, keyboard, chat_id)
+        elif data == "notify_buys_toggle":
+            async with SessionLocal() as session:
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
+                account.notify_buys = not account.notify_buys
+                await session.commit()
+            text, keyboard = await self._settings_screen()
+            await self._edit_panel(text, keyboard, chat_id)
         elif data.startswith("settings:"):
             section = data.split(":", 1)[1]
             details = {
@@ -1405,9 +1477,8 @@ class TelegramApp:
                     "/risk TOKEN sl=0.2 tp=0.25 trail=0.1"
                 ),
             }
-            await self._edit_panel(
-                details.get(section, "Раздел не найден"), self._settings_keyboard_v2(), chat_id
-            )
+            _text, keyboard = await self._settings_screen()
+            await self._edit_panel(details.get(section, "Раздел не найден"), keyboard, chat_id)
         elif data == "stats":
             await self._edit_panel(await self._stats_text(), self._back(), chat_id)
         elif data == "reset_prompt":
@@ -1513,7 +1584,7 @@ class TelegramApp:
                 "Если бюджета не хватает на минимальный ордер рынка, сделка "
                 "пропускается. Максимум серии, лимит на исход и резерв кэша "
                 "продолжают действовать.\n\n"
-                f"Введите от 0 до {MAX_LEADER_PERCENT:g}, например <code>50</code>.",
+                f"Введите от 0 до {plain(MAX_LEADER_PERCENT)}, например <code>50</code>.",
                 builder.as_markup(),
                 chat_id,
             )
@@ -1522,8 +1593,9 @@ class TelegramApp:
             async with SessionLocal() as session:
                 row = await session.get(Leader, int(raw_id))
                 if row:
-                    row.active = False
+                    await remove_leader(session, row)
                 await session.commit()
+            self.engine.forget_leader(int(raw_id))
             await self._leaders_panel(int(raw_page), chat_id)
         elif data.startswith("leader_remove:"):
             _, raw_id, raw_page = data.split(":")
@@ -1533,7 +1605,10 @@ class TelegramApp:
             )
             builder.button(text="Отмена", callback_data=f"leader_view:{raw_id}:{raw_page}")
             await self._edit_panel(
-                "<b>Удалить трейдера?</b>\nКопирование остановится. История и позиции сохранятся.",
+                "<b>Удалить трейдера?</b>\n"
+                "Он исчезнет из списка, копирование остановится.\n"
+                "Если по нему уже есть сделки, его ордера, PNL и открытые позиции "
+                "останутся в учёте — иначе история стала бы ничьей.",
                 builder.as_markup(),
                 chat_id,
             )

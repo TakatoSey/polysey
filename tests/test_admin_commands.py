@@ -8,17 +8,20 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 import app.bot as bot_module
 from app.bot import TelegramApp
+from app.config import Settings
 from app.db import Base
+from app.engine import CopyEngine
 from app.models import (
     Account,
     CopyTrade,
     Leader,
+    LeaderPosition,
     LeaderSizingProfile,
     PaperOrder,
     Position,
     SizingEntry,
 )
-from app.priority import PriorityLock
+from app.repository import get_leaders, remove_leader
 
 D = Decimal
 
@@ -101,8 +104,25 @@ async def admin_rig(tmp_path, monkeypatch):
         paper_initial_balance=D(100),
         telegram_allowed_user_id=7,
         default_slippage_cents=D(5),
+        # Read by the settings screen this rig also exercises.
+        smart_sizing_enabled=True,
+        copy_balance_pct=D("0.05"),
+        leader_order_scale=D("0.1"),
+        smart_sizing_max_multiplier=D(3),
+        smart_sizing_burst_seconds=2,
+        smart_sizing_min_samples=3,
+        min_copy_notional=D("1.10"),
+        max_outcome_exposure=D(50),
+        min_cash_reserve_pct=D("0.25"),
     )
-    app.engine = SimpleNamespace(_ledger_lock=PriorityLock(), _buy_batches={"stale": object()})
+    engine = CopyEngine(Settings(_env_file=None), SimpleNamespace())
+    # State a wiped database can no longer explain, as a live bot would hold it.
+    engine._buy_batches["stale"] = object()
+    engine._sell_watermarks[(1, "token")] = 99
+    engine._leader_floors[1] = 99
+    engine._leader_sizing_profiles[1] = object()
+    engine._profile_refresh_attempt[1] = 0.0
+    app.engine = engine
     app._edit_panel = AsyncMock()
     app._delete_input = AsyncMock()
     yield SimpleNamespace(app=app, sessions=sessions)
@@ -137,7 +157,12 @@ async def test_deposit_rejects_bad_amounts_without_touching_the_account(admin_ri
         assert (await session.get(Account, 1)).paper_balance == D(40)
 
 
-async def test_reset_clears_trading_state_and_restores_the_starting_balance(admin_rig):
+async def test_reset_clears_everything_traded_and_keeps_only_the_leaders(admin_rig):
+    async with admin_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        leader.fixed_trade_percent, leader.min_buy_price = D(50), D("0.10")
+        await session.commit()
+
     balance = await admin_rig.app._reset_database()
 
     assert balance == D(100)
@@ -146,13 +171,79 @@ async def test_reset_clears_trading_state_and_restores_the_starting_balance(admi
         assert account.paper_balance == D(100)
         assert account.starting_balance == D(100)
         assert account.realized_pnl == 0
-        for model in (CopyTrade, PaperOrder, Position, SizingEntry):
+        for model in (CopyTrade, PaperOrder, Position, SizingEntry, LeaderSizingProfile):
             assert list(await session.scalars(select(model))) == []
-        # A fresh test still tracks the same leaders and their public statistics.
+        # The leaders themselves stay, with the settings chosen for them.
         leader = await session.get(Leader, 1)
-        assert leader is not None and leader.last_timestamp == 99
-        assert (await session.get(LeaderSizingProfile, 1)).sample_count == 9
-    assert admin_rig.app.engine._buy_batches == {}
+        assert leader is not None
+        assert (leader.fixed_trade_percent, leader.min_buy_price) == (D(50), D("0.10"))
+    # A sell barrier or poll checkpoint left in memory would keep skipping
+    # copies against trades the database no longer holds.
+    engine = admin_rig.app.engine
+    assert engine._buy_batches == {}
+    assert engine._sell_watermarks == {}
+    assert engine._leader_floors == {}
+    assert engine._leader_sizing_profiles == {}
+    assert engine._profile_refresh_attempt == {}
+
+
+async def test_deleting_a_leader_without_history_really_deletes_the_row(admin_rig):
+    async with admin_rig.sessions() as session:
+        session.add(Leader(id=2, address="0x" + "b" * 40, initialized=True))
+        session.add(
+            LeaderSizingProfile(
+                leader_id=2,
+                reference_notional=D(20),
+                sample_count=5,
+                sample_start=1,
+                sample_end=2,
+            )
+        )
+        session.add(LeaderPosition(leader_id=2, token_id="token", shares=D(0)))
+        await session.commit()
+    engine = admin_rig.app.engine
+    engine._leader_sizing_profiles[2] = object()
+    engine._sell_watermarks[(2, "token")] = 99
+
+    await admin_rig.app._dispatch("leader_remove_confirm:2:0", 7)
+
+    async with admin_rig.sessions() as session:
+        assert await session.get(Leader, 2) is None
+        assert await session.get(LeaderSizingProfile, 2) is None
+        assert list(await session.scalars(select(LeaderPosition))) == []
+    # Only the deleted leader is forgotten; the other one keeps its state.
+    assert 2 not in engine._leader_sizing_profiles
+    assert list(engine._sell_watermarks) == [(1, "token")]
+    assert 1 in engine._leader_sizing_profiles
+
+
+async def test_deleting_a_traded_leader_hides_them_without_orphaning_history(admin_rig):
+    await admin_rig.app._dispatch("leader_remove_confirm:1:0", 7)
+
+    async with admin_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        # The row has to stay: orders, released cost and PNL are attributed to it.
+        assert leader is not None
+        assert (leader.active, leader.removed) == (False, True)
+        assert await get_leaders(session) == []
+        assert (await session.scalar(select(CopyTrade))).leader_id == 1
+    # Barriers for a leader we stopped following are dropped with them.
+    assert admin_rig.app.engine._sell_watermarks == {}
+    assert admin_rig.app.engine._leader_floors == {}
+
+
+async def test_adding_a_deleted_address_again_brings_the_same_leader_back(admin_rig):
+    async with admin_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        await remove_leader(session, leader)
+        await session.commit()
+
+    await admin_rig.app._save_leader("0x" + "a" * 40, 7)
+
+    async with admin_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        assert (leader.active, leader.removed) == (True, False)
+        assert [row.id for row in await get_leaders(session)] == [1]
 
 
 async def test_stats_screen_reports_copy_rate_and_ranks_skip_reasons(admin_rig):
@@ -229,3 +320,48 @@ async def test_reset_asks_before_wiping_and_only_the_owner_may_ask(admin_rig):
     admin_rig.app._edit_panel.assert_not_awaited()
     async with admin_rig.sessions() as session:
         assert list(await session.scalars(select(CopyTrade))) != []
+
+
+async def test_buy_notification_toggle_flips_the_flag_and_its_own_button(admin_rig):
+    async def labels():
+        _text, keyboard = await admin_rig.app._settings_screen()
+        return [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "🔕 Не уведомлять о покупках" in await labels()
+
+    await admin_rig.app._dispatch("notify_buys_toggle", 7)
+
+    async with admin_rig.sessions() as session:
+        assert (await session.get(Account, 1)).notify_buys is False
+    assert "🔔 Уведомлять о покупках" in await labels()
+    assert "выключены" in await admin_rig.app._settings_text_v2()
+
+    await admin_rig.app._dispatch("notify_buys_toggle", 7)
+
+    async with admin_rig.sessions() as session:
+        assert (await session.get(Account, 1)).notify_buys is True
+
+
+async def test_stats_flag_fills_whose_fee_was_only_an_estimate(admin_rig):
+    assert "оценке" not in await admin_rig.app._stats_text()
+    async with admin_rig.sessions() as session:
+        session.add(
+            PaperOrder(
+                id=2,
+                copy_trade_id=1,
+                token_id="token",
+                side="BUY",
+                requested_shares=D(4),
+                filled_shares=D(4),
+                average_fill_price=D("0.5"),
+                fee=D("0.05"),
+                status="filled",
+                fee_estimated=True,
+            )
+        )
+        await session.commit()
+
+    text = await admin_rig.app._stats_text()
+
+    # One of the two fills paid a fee we estimated ourselves.
+    assert "Комиссия по оценке: 1 из 2" in text

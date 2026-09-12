@@ -60,6 +60,7 @@ log = structlog.get_logger(__name__)
 class PreparedCopy:
     market: dict | None = None
     fee_rate: Decimal = Decimal(0)
+    fee_estimated: bool = False
     exchange_delay: float = 0.0
     error: Exception | None = None
     ready_at: float = 0.0
@@ -623,6 +624,28 @@ class CopyEngine:
 
         task.add_done_callback(done)
 
+    def forget_leader(self, leader_id: int) -> None:
+        """Drop memo state for a leader we no longer follow."""
+        self._leader_sizing_profiles.pop(leader_id, None)
+        self._profile_refresh_attempt.pop(leader_id, None)
+        self._leader_price_ranges.pop(leader_id, None)
+        self._leader_floors.pop(leader_id, None)
+        for key in [key for key in self._sell_watermarks if key[0] == leader_id]:
+            self._sell_watermarks.pop(key, None)
+
+    def reset_runtime_state(self) -> None:
+        """Forget what a wiped database can no longer explain.
+
+        Sell barriers and poll checkpoints live in memory. Kept across a reset
+        they keep skipping copies as "leader already sold" against trades the
+        database no longer contains, with nothing left to explain the skip.
+        """
+        self._buy_batches.clear()
+        self._sell_watermarks.clear()
+        self._leader_floors.clear()
+        self._leader_sizing_profiles.clear()
+        self._profile_refresh_attempt.clear()
+
     def _price_range(self, leader_id: int) -> PriceRange:
         """This leader's entry range, as read the last time we loaded them.
 
@@ -868,6 +891,8 @@ class CopyEngine:
             if not 0 <= delay <= 60:
                 raise ValueError("invalid_market_delay")
             prepared.market, prepared.fee_rate, prepared.exchange_delay = market, fee_rate, delay
+            # Bound to the rate we just took, not to whatever the cache holds later.
+            prepared.fee_estimated = bool(self.client.fee_is_estimated(event.condition_id))
             # The exchange delay starts when the signal is received. Metadata and
             # book requests run during it; this models the fastest valid taker path.
             remaining = delay + self.settings.copy_latency_seconds - (time.monotonic() - started)
@@ -1461,7 +1486,9 @@ class CopyEngine:
                             )
                         ),
                         min_copy_notional=str(self.settings.min_copy_notional),
+                        min_order_shares=str(book.min_order_size),
                         min_order_notional=str(book.min_order_size * ask),
+                        tick_size=str(book.tick_size),
                         cash_available=str(account.paper_balance),
                         cash_deployable=str(deployable),
                         exposure_room=str(self.exposure_room(exposure)),
@@ -1523,6 +1550,7 @@ class CopyEngine:
             fee=fill.fee,
             status=fill.status,
             reason=fill.reason,
+            fee_estimated=prepared.fee_estimated,
         )
         session.add(order)
         if fill.shares <= 0:
@@ -1545,6 +1573,7 @@ class CopyEngine:
                 leader_price=str(event.price),
                 best_book_price=str(best_price) if best_price is not None else None,
                 requested_shares=str(target_shares),
+                min_order_shares=str(book.min_order_size),
                 reference_price=str(decision.reference_price if decision else event.price),
                 best_ask=str(book.asks[0][0]) if event.side == "BUY" and book.asks else None,
                 slippage_price=str(policy.slippage_price),
@@ -1591,8 +1620,9 @@ class CopyEngine:
             fee=str(fill.fee),
         )
         # Keep the chat quiet: only successful BUY copies are user-facing
-        # notifications. Rejections remain visible in the order history.
-        if event.side == "BUY":
+        # notifications, and the user can mute those too. Rejections remain
+        # visible in the order history either way.
+        if event.side == "BUY" and account.notify_buys:
             message = self.build_buy_notification(leader, event, fill)
             if decision:
                 message += (
@@ -1899,6 +1929,7 @@ class CopyEngine:
                         fee=fill.fee,
                         status=fill.status,
                         reason=trigger,
+                        fee_estimated=prepared.fee_estimated,
                     )
                 )
                 await session.commit()
@@ -2158,6 +2189,7 @@ class CopyEngine:
                     fee=fill.fee,
                     status=fill.status,
                     reason="deferred_price_retry",
+                    fee_estimated=prepared.fee_estimated,
                 )
             )
             if smart_entry:
@@ -2165,10 +2197,13 @@ class CopyEngine:
             intent.active, intent.last_reason = False, "filled"
             trade.status, trade.skip_reason = "executed", None
             await session.commit()
-            message = self.build_buy_notification(leader, event, fill)
-        await self.notify(
-            message + "\n\n<i>Цена стала допустимой после первоначального пропуска.</i>"
-        )
+            message = (
+                self.build_buy_notification(leader, event, fill) if account.notify_buys else None
+            )
+        if message:
+            await self.notify(
+                message + "\n\n<i>Цена стала допустимой после первоначального пропуска.</i>"
+            )
 
     async def retry_exits_once(self) -> None:
         """Only explicit, still-open intents. Never replay old rejected orders."""
@@ -2328,6 +2363,7 @@ class CopyEngine:
                         fee=fill.fee,
                         status=fill.status,
                         reason="exit_intent",
+                        fee_estimated=prepared.fee_estimated,
                     )
                 )
                 trade = await session.get(CopyTrade, intent.copy_trade_id)

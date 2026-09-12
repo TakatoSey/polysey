@@ -8,6 +8,8 @@ that leader's own copies.
 from dataclasses import dataclass
 from decimal import Decimal
 
+from .formatting import cents
+
 ZERO = Decimal(0)
 ONE = Decimal(1)
 MIN_BUY_PRICE = Decimal("0.02")
@@ -28,7 +30,7 @@ class PriceRange:
 
     @property
     def label(self) -> str:
-        return f"{self.minimum * 100:g}–{self.maximum * 100:g}¢"
+        return f"{cents(self.minimum)}–{cents(self.maximum)}¢"
 
 
 DEFAULT_RANGE = PriceRange()
