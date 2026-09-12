@@ -506,6 +506,22 @@ class TelegramApp:
             return last, status, "Mark по последней сделке"
         return book.bids[0][0], status, "Оценка по лучшему bid"
 
+    def _min_order_note(self, token_id: str, quote: Decimal | None = None) -> str:
+        """The exchange minimum we actually observed for this token, if any.
+
+        It differs per market and is what blocks a small entry or strands a
+        tail on exit, so it belongs on screen rather than only in the logs.
+        Never invented: without an observed value the line is omitted.
+        """
+        limits = self.engine.client.market_limits(token_id)
+        shares = getattr(limits, "min_order_size", None)
+        if not isinstance(shares, Decimal) or not shares.is_finite() or shares <= 0:
+            return ""
+        note = f"{plain(shares)} shares"
+        if isinstance(quote, Decimal) and quote.is_finite() and quote > 0:
+            note += f" ≈ ${shares * quote:.2f}"
+        return note
+
     async def _market_closed(self, row) -> bool:
         try:
             market = await self.engine.client.get_market(row.condition_id)
@@ -629,6 +645,11 @@ class TelegramApp:
                 f"PnL: {pnl_text}",
                 f"To Win: ${row.shares:.2f}",
                 f"Status: {status}",
+                *(
+                    [f"Минимум ордера: {minimum}"]
+                    if (minimum := self._min_order_note(row.token_id, quote))
+                    else []
+                ),
                 "",
                 f"<i>{note} · {datetime.now(UTC):%H:%M} UTC</i>",
             ]
@@ -709,10 +730,12 @@ class TelegramApp:
         if pending:
             lines.append("\n<b>⏳ Незавершённые выходы</b>")
             for intent, name, title in pending:
+                minimum = self._min_order_note(intent.token_id)
                 lines.append(
                     f"{html.escape(name or 'Лидер')} · "
                     f"{html.escape((title or intent.token_id)[:65])}"
-                    f"\n{intent.remaining:.2f} shares · мин. {intent.min_price * 100:.1f}¢"
+                    f"\n{intent.remaining:.2f} shares · мин. цена {intent.min_price * 100:.1f}¢"
+                    + (f" · лот от {minimum}" if minimum else "")
                 )
             if not self.settings.exit_retry_enabled:
                 lines.append("Автоповторы выключены")

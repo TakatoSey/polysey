@@ -1483,7 +1483,9 @@ class CopyEngine:
                             )
                         ),
                         min_copy_notional=str(self.settings.min_copy_notional),
+                        min_order_shares=str(book.min_order_size),
                         min_order_notional=str(book.min_order_size * ask),
+                        tick_size=str(book.tick_size),
                         cash_available=str(account.paper_balance),
                         cash_deployable=str(deployable),
                         exposure_room=str(self.exposure_room(exposure)),
@@ -1567,6 +1569,7 @@ class CopyEngine:
                 leader_price=str(event.price),
                 best_book_price=str(best_price) if best_price is not None else None,
                 requested_shares=str(target_shares),
+                min_order_shares=str(book.min_order_size),
                 reference_price=str(decision.reference_price if decision else event.price),
                 best_ask=str(book.asks[0][0]) if event.side == "BUY" and book.asks else None,
                 slippage_price=str(policy.slippage_price),

@@ -98,6 +98,15 @@ def receipt_keys(event: LeaderActivity, address: str) -> set[str]:
 
 
 @dataclass(slots=True)
+class MarketLimits:
+    """What the exchange last told us this token's orders must satisfy."""
+
+    min_order_size: Decimal
+    tick_size: Decimal
+    seen_at: float
+
+
+@dataclass(slots=True)
 class Book:
     bids: list[tuple[Decimal, Decimal]]
     asks: list[tuple[Decimal, Decimal]]
@@ -119,6 +128,11 @@ class PolymarketClient:
         # Docs describe a 250ms taker hold on selected crypto/finance
         # up-down markets, flagged here, separate from seconds_delay.
         self._taker_hold: dict[str, bool] = {}
+        # Order constraints differ per market, so they are remembered per token
+        # rather than assumed. Execution still reads them off the fresh book;
+        # this is what the panel and the logs report between fetches.
+        self._market_limits: dict[str, MarketLimits] = {}
+        self._min_size_mismatch: set[str] = set()
         self.book_stream = None
 
     async def close(self) -> None:
@@ -281,9 +295,16 @@ class PolymarketClient:
             for p, s in book.bids + book.asks
         ):
             raise ValueError("invalid_book_level")
+        self._market_limits[token_id] = MarketLimits(
+            book.min_order_size, book.tick_size, time.monotonic()
+        )
         if self.book_stream:
             await self.book_stream.update_meta(token_id, book)
         return book
+
+    def market_limits(self, token_id: str) -> MarketLimits | None:
+        """Last observed order constraints for this token, None if unseen."""
+        return self._market_limits.get(token_id)
 
     async def get_last_trade_price(self, token_id: str) -> Decimal | None:
         """Return CLOB last-trade mark; this is not an executable bid."""
@@ -315,7 +336,47 @@ class PolymarketClient:
             or market.get("condition_id", "").lower() != condition_id.lower()
         ):
             raise ValueError("market_identity_mismatch")
+        self._compare_market_minimum(market, condition_id)
         return market
+
+    def _compare_market_minimum(self, market: dict, condition_id: str) -> None:
+        """Report a market-level minimum that disagrees with the book's.
+
+        Execution keeps using the book: it is the field the CLOB book endpoint
+        documents, and the unit of a market-level minimum is not something to
+        assume. Logging the disagreement once shows whether the two ever differ
+        on real markets before either is acted on.
+        """
+        if condition_id in self._min_size_mismatch:
+            return
+        declared = next(
+            (
+                market[key]
+                for key in ("minimum_order_size", "min_order_size")
+                if market.get(key) is not None
+            ),
+            None,
+        )
+        if declared is None:
+            return
+        try:
+            declared = Decimal(str(declared))
+        except (ArithmeticError, TypeError, ValueError):
+            return
+        for token in market.get("tokens") or []:
+            limits = self._market_limits.get(str(token.get("token_id")))
+            if limits is None or limits.min_order_size == declared:
+                continue
+            self._min_size_mismatch.add(condition_id)
+            log.warning(
+                "market_min_order_mismatch",
+                condition_id=condition_id,
+                token_id=str(token.get("token_id")),
+                book_min_order_size=str(limits.min_order_size),
+                market_min_order_size=str(declared),
+                used="book",
+            )
+            return
 
     async def get_fee_rate(self, condition_id: str, title: str = "") -> Decimal:
         return await self._shared_request(

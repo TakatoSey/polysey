@@ -241,3 +241,28 @@ async def test_portfolio_is_ordered_by_last_buy_and_its_buttons_follow_the_list(
         assert buttons(keyboard) == [f"position:{identifier[token]}:1" for token in listed]
     finally:
         await db.dispose()
+
+
+def test_min_order_note_reports_only_an_observed_market_minimum():
+    from app.polymarket import MarketLimits
+
+    limits = {"known": MarketLimits(Decimal(5), Decimal("0.01"), 1.0)}
+    app = panel(SimpleNamespace(market_limits=limits.get))
+
+    assert app._min_order_note("known") == "5 shares"
+    assert app._min_order_note("known", Decimal("0.60")) == "5 shares ≈ $3.00"
+    # A market we have not read a book for is left unsaid, never guessed.
+    assert app._min_order_note("unseen") == ""
+    assert app._min_order_note("known", None) == "5 shares"
+
+
+def test_min_order_note_stays_silent_on_unusable_values():
+    from app.polymarket import MarketLimits
+
+    for minimum in (Decimal(0), Decimal("NaN"), None, "5"):
+        app = panel(
+            SimpleNamespace(
+                market_limits=lambda _t, m=minimum: MarketLimits(m, Decimal("0.01"), 1.0)
+            )
+        )
+        assert app._min_order_note("token") == ""
