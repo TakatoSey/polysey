@@ -115,7 +115,11 @@ def export_history(trades, orders, positions, leaders, observations=(), sizing_a
             for p in positions
         ],
         "leaders": [
-            fields(row, "id address label fixed_trade_size fixed_trade_percent") for row in leaders
+            fields(
+                row,
+                "id address label fixed_trade_size fixed_trade_percent min_buy_price max_buy_price",
+            )
+            for row in leaders
         ],
         "source_observations": [
             fields(

@@ -301,6 +301,68 @@ def test_fixed_series_marker_ignores_odds_and_leader_relative_size():
     assert result.order_budget == 7
 
 
+def test_leader_percent_targets_a_share_of_the_leader_own_series():
+    # 50% of what the leader put in, not of our balance, and odds/conviction
+    # weights do not move a leader-relative budget.
+    result = decision(
+        entry(
+            leader_notional=D(40),
+            leader_shares=D(80),
+            reference_notional=D(100),
+            base_budget=D(1),
+            max_budget=D(30),
+            max_multiplier=D(0),
+            leader_percent=D(50),
+        ),
+        conviction_power=D("1.5"),
+        odds_weight=D(1),
+    )
+    assert result.odds_factor == 1
+    assert result.target_budget == 20
+    assert result.order_budget == 20
+
+
+def test_leader_percent_grows_with_the_leader_series_and_subtracts_prior_spend():
+    state = entry(
+        leader_notional=D(40),
+        leader_shares=D(80),
+        max_budget=D(30),
+        max_multiplier=D(0),
+        leader_percent=D(50),
+        spent=D(20),
+    )
+    assert decision(state).order_budget == 0
+    state.leader_notional = D(60)
+    state.leader_shares = D(120)
+    assert decision(state).target_budget == 30
+    assert decision(state).order_budget == 10
+
+
+def test_leader_percent_above_one_hundred_is_still_capped_by_the_series_maximum():
+    result = decision(
+        entry(
+            leader_notional=D(10),
+            leader_shares=D(20),
+            max_budget=D(30),
+            max_multiplier=D(0),
+            leader_percent=D(200),
+        ),
+        current_max=D(30),
+    )
+    assert result.target_budget == 20
+    capped = decision(
+        entry(
+            leader_notional=D(100),
+            leader_shares=D(200),
+            max_budget=D(30),
+            max_multiplier=D(0),
+            leader_percent=D(200),
+        ),
+        current_max=D(30),
+    )
+    assert capped.target_budget == 30
+
+
 def test_conviction_power_widens_the_gap_between_a_big_and_a_small_entry():
     weights = {"conviction_power": D("1.5"), "odds_weight": D("0.5")}
     big, small = entry(leader_notional=D(40)), entry(leader_notional=D(10))
@@ -565,7 +627,7 @@ async def test_leader_fixed_size_works_without_profile_and_is_total_for_series(s
         )
 
 
-async def test_leader_percent_uses_entry_balance_without_a_profile(sizing_rig):
+async def test_leader_percent_follows_the_leader_series_without_a_profile(sizing_rig):
     async with sizing_rig.sessions() as session:
         leader = await session.get(Leader, 1)
         leader.fixed_trade_percent = D(5)
@@ -577,10 +639,31 @@ async def test_leader_percent_uses_entry_balance_without_a_profile(sizing_rig):
     async with sizing_rig.sessions() as session:
         state = await session.scalar(select(SizingEntry))
         assert state.max_multiplier == 0
-        assert state.base_budget == 5
-        assert state.max_budget == 5
-        assert state.spent == 5
-        assert (await session.get(Account, 1)).paper_balance == 95
+        assert state.leader_percent == 5
+        # 5% of the leader's own $202 series, not of our $100 balance. The first
+        # $2 fragment alone was below the market minimum and spent nothing.
+        assert state.leader_notional == 202
+        assert abs(state.spent - D("10.10")) < TOLERANCE
+        assert abs((await session.get(Account, 1)).paper_balance - D("89.90")) < TOLERANCE
+
+
+async def test_leader_percent_may_exceed_the_leader_and_stops_at_the_series_maximum(sizing_rig):
+    async with sizing_rig.sessions() as session:
+        leader = await session.get(Leader, 1)
+        leader.fixed_trade_percent = D(200)
+        (await session.get(Account, 1)).max_trade_size = 30
+        await session.commit()
+    await copy(sizing_rig, "double-small", "10")
+    async with sizing_rig.sessions() as session:
+        state = await session.scalar(select(SizingEntry))
+        assert abs(state.spent - 20) < TOLERANCE
+    await copy(sizing_rig, "double-large", "40", token="other-token")
+    async with sizing_rig.sessions() as session:
+        state = await session.scalar(
+            select(SizingEntry).where(SizingEntry.token_id == "other-token")
+        )
+        # Twice the leader would be $80; our own series maximum still holds.
+        assert abs(state.spent - 30) < TOLERANCE
 
 
 async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):

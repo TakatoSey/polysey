@@ -112,7 +112,10 @@ def analyze_history(history):
         "source_to_record_max_seconds": max(recorded_delays, default=None),
         "markets": sorted(by_token, key=lambda row: row["realized_pnl"]),
         "warnings": warnings,
-        "note": "All retained history, not necessarily today. BUY signals may be batched. "
+        # outside_current_buy_range compares against the default range; a leader
+        # with a range of their own is flagged by it without being wrong.
+        "note": "Price-range flags use the default 2-98c, not per-leader ranges. "
+        "All retained history, not necessarily today. BUY signals may be batched. "
         "Source-to-record delay includes publication, detection, queue and processing, "
         "not VPS latency alone. Price comparisons use the same filled shares; they are "
         "not an achievable counterfactual PNL. "

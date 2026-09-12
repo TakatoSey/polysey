@@ -38,6 +38,7 @@ from .models import (
     SourceReceipt,
     utc_now,
 )
+from .price_limits import DEFAULT_RANGE, MAX_BUY_PRICE, MIN_BUY_PRICE, leader_price_range
 from .repository import (
     add_leader,
     get_execution_policy,
@@ -46,6 +47,7 @@ from .repository import (
     orders,
     positions,
 )
+from .sizing import MAX_LEADER_PERCENT, leader_percent
 
 log = structlog.get_logger(__name__)
 ADDRESS_RE = re.compile(r"0x[a-fA-F0-9]{40}")
@@ -56,8 +58,9 @@ def signed_money(value: Decimal) -> str:
 
 
 SIZING_REASONS = {
-    "leader_price_out_of_range": "цена лидера вне 2–98¢",
-    "buy_price_out_of_range": "цена в стакане вне 2–98¢",
+    # The range is per leader now, so these must not name one set of bounds.
+    "leader_price_out_of_range": "цена лидера вне диапазона трейдера",
+    "buy_price_out_of_range": "цена в стакане вне диапазона трейдера",
     "sizing_profile_unavailable": "сбор статистики трейдера",
     "sizing_entry_closed": "серия закрыта",
     "sizing_below_minimum": "минимум рынка выше нашего размера",
@@ -94,6 +97,7 @@ class LeaderForm(StatesGroup):
     address = State()
     fixed_size = State()
     fixed_percent = State()
+    price_range = State()
 
 
 class TelegramApp:
@@ -212,11 +216,10 @@ class TelegramApp:
             for row in leaders
             if row.active and row.fixed_trade_size is not None
         ]
+        # A percent-of-leader budget has no ceiling of its own: what limits the
+        # next buy is our series maximum and the cash actually available.
         percent_candidates = [
-            min(
-                account.paper_balance * row.fixed_trade_percent / Decimal(100),
-                account.max_trade_size,
-            )
+            min(account.max_trade_size, account.paper_balance)
             for row in leaders
             if row.active and row.fixed_trade_percent is not None
         ]
@@ -313,7 +316,7 @@ class TelegramApp:
             mode = (
                 f" · ${row.fixed_trade_size:.2f} фикс."
                 if row.fixed_trade_size
-                else f" · {row.fixed_trade_percent:g}%"
+                else f" · {row.fixed_trade_percent:g}% лидера"
                 if row.fixed_trade_percent
                 else ""
             )
@@ -369,7 +372,7 @@ class TelegramApp:
         sizing_mode = (
             f"фикс. ${row.fixed_trade_size:.2f} на серию"
             if row.fixed_trade_size is not None
-            else f"фикс. {row.fixed_trade_percent:g}% баланса на серию"
+            else f"{row.fixed_trade_percent:g}% от суммы серии лидера"
             if row.fixed_trade_percent is not None
             else "адаптивный"
         )
@@ -391,13 +394,14 @@ class TelegramApp:
         buys = sum(o.side == "BUY" for o in all_orders)
         sells = sum(o.side == "SELL" for o in all_orders)
         pnl_label = "нужна сверка истории" if warnings else signed_money(realized_pnl)
+        price_range = leader_price_range(row)
+        range_text = price_range.label + ("" if price_range.overridden else " (по умолчанию)")
         text = (
             f"<b>👤 {label}</b>\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\n"
             f"Размер: <b>{sizing_mode}</b>\n"
-            + self._leader_sizing_text(
-                leader_id, row.fixed_trade_size, row.fixed_trade_percent
-            )
+            f"Цена BUY: <b>{range_text}</b>\n"
+            + self._leader_sizing_text(leader_id, row.fixed_trade_size, row.fixed_trade_percent)
             + f"PNL: <b>{pnl_label}</b> · открыто ${open_cost:.2f}\n"
             f"Сделки: {buys} BUY · {sells} SELL\n"
             f"Последние 20: {executed} скопировано · {rejected} пропущено\n"
@@ -413,13 +417,19 @@ class TelegramApp:
             callback_data=f"leader_fixed:{row.id}:{page}",
         )
         builder.button(
-            text="📊 Процент от баланса",
+            text="📊 Процент от суммы лидера",
             callback_data=f"leader_percent:{row.id}:{page}",
         )
         if row.fixed_trade_size is not None or row.fixed_trade_percent is not None:
             builder.button(
                 text="🧠 Вернуть адаптивный размер",
                 callback_data=f"leader_fixed_clear:{row.id}:{page}",
+            )
+        builder.button(text="🎯 Диапазон цены BUY", callback_data=f"leader_range:{row.id}:{page}")
+        if price_range.overridden:
+            builder.button(
+                text=f"↩️ Вернуть {DEFAULT_RANGE.label}",
+                callback_data=f"leader_range_clear:{row.id}:{page}",
             )
         builder.button(text="🗑 Удалить", callback_data=f"leader_remove:{row.id}:{page}")
         builder.button(text="⬅️ К списку", callback_data=f"leaders:{page}")
@@ -822,7 +832,7 @@ class TelegramApp:
         return (
             "<b>⚙️ Настройки</b>\n\n" + self._sizing_summary(account) + "\n\n"
             "<b>Исполнение</b>\n"
-            "Цена BUY: <b>2–98¢</b>\n"
+            f"Цена BUY: <b>{DEFAULT_RANGE.label}</b> · у трейдера может быть свой\n"
             f"Минимум BUY: <b>${self.settings.min_copy_notional:.2f}</b>\n"
             f"Лимит на исход: <b>${self.settings.max_outcome_exposure:.2f}</b>\n"
             f"Резерв кэша: <b>{self.settings.min_cash_reserve_pct * 100:.0f}%</b> капитала\n"
@@ -911,6 +921,7 @@ class TelegramApp:
         self.dp.message.register(self.receive_leader, StateFilter(LeaderForm.address))
         self.dp.message.register(self.receive_leader_fixed, StateFilter(LeaderForm.fixed_size))
         self.dp.message.register(self.receive_leader_percent, StateFilter(LeaderForm.fixed_percent))
+        self.dp.message.register(self.receive_leader_range, StateFilter(LeaderForm.price_range))
         self.dp.callback_query.register(self.callback)
 
     async def start(self, message: Message, state: FSMContext | None = None) -> None:
@@ -1045,18 +1056,70 @@ class TelegramApp:
             value = Decimal(0)
         async with SessionLocal() as session:
             leader = await session.get(Leader, leader_id) if leader_id else None
-            if not leader or not value.is_finite() or not Decimal(0) < value <= Decimal(100):
+            if not leader or leader_percent(value) is None:
                 builder = InlineKeyboardBuilder()
                 if leader_id:
                     builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
                 await self._edit_panel(
-                    "Введите процент от 0 до 100, например <code>5</code> для 5% баланса.",
+                    f"Введите процент от 0 до {MAX_LEADER_PERCENT:g}, например "
+                    "<code>50</code> — половина суммы лидера, <code>200</code> — вдвое больше.",
                     builder.as_markup(),
                     message.chat.id,
                 )
                 return
             leader.fixed_trade_percent = value
             leader.fixed_trade_size = None
+            await session.commit()
+        await state.clear()
+        await self._leader_detail(leader_id, page, message.chat.id)
+
+    @staticmethod
+    def parse_price_range(text: str) -> tuple[Decimal, Decimal] | None:
+        """Two prices in cents: "0 100", "2-98", "0,5 99,5". None if unusable."""
+        found = re.findall(r"\d+(?:[.,]\d+)?", text or "")
+        if len(found) != 2:
+            return None
+        try:
+            values = [Decimal(item.replace(",", ".")) / 100 for item in found]
+        except InvalidOperation:
+            return None
+        low, high = values
+        if not low.is_finite() or not high.is_finite():
+            return None
+        # 0-100c inclusive; the range must be a range, and a cent has at most
+        # two decimals of its own so a typo cannot store an unreachable bound.
+        if not Decimal(0) <= low < high <= Decimal(1):
+            return None
+        if any(value != value.quantize(Decimal("0.0001")) for value in values):
+            return None
+        return low, high
+
+    async def receive_leader_range(self, message: Message, state: FSMContext) -> None:
+        if not self._allowed(message):
+            return
+        data = await state.get_data()
+        leader_id, page = data.get("leader_id"), data.get("page", 0)
+        await self._delete_input(message)
+        bounds = self.parse_price_range(message.text or "")
+        async with SessionLocal() as session:
+            leader = await session.get(Leader, leader_id) if leader_id else None
+            if not leader or bounds is None:
+                builder = InlineKeyboardBuilder()
+                if leader_id:
+                    builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
+                await self._edit_panel(
+                    "Введите два значения в центах: нижнее и верхнее, "
+                    "например <code>0 100</code> или <code>2-98</code>.",
+                    builder.as_markup(),
+                    message.chat.id,
+                )
+                return
+            low, high = bounds
+            default = (low, high) == (MIN_BUY_PRICE, MAX_BUY_PRICE)
+            # Storing NULL keeps the leader on the default range even if that
+            # default later changes, which is what "по умолчанию" should mean.
+            leader.min_buy_price = None if default else low
+            leader.max_buy_price = None if default else high
             await session.commit()
         await state.clear()
         await self._leader_detail(leader_id, page, message.chat.id)
@@ -1376,6 +1439,36 @@ class TelegramApp:
                 self._back(),
                 chat_id,
             )
+        elif data.startswith("leader_range_clear:"):
+            _, raw_id, raw_page = data.split(":")
+            leader_id, page = int(raw_id), int(raw_page)
+            async with SessionLocal() as session:
+                row = await session.get(Leader, leader_id)
+                if row:
+                    row.min_buy_price = row.max_buy_price = None
+                await session.commit()
+            await self.dp.fsm.get_context(self.bot, chat_id, chat_id).clear()
+            await self._leader_detail(leader_id, page, chat_id)
+        elif data.startswith("leader_range:"):
+            _, raw_id, raw_page = data.split(":")
+            leader_id, page = int(raw_id), int(raw_page)
+            context = self.dp.fsm.get_context(self.bot, chat_id, chat_id)
+            await context.set_state(LeaderForm.price_range)
+            await context.update_data(leader_id=leader_id, page=page)
+            builder = InlineKeyboardBuilder()
+            builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
+            await self._edit_panel(
+                "<b>🎯 Диапазон цены BUY</b>\n"
+                "Вход этого трейдера копируется только в этом коридоре цены "
+                f"(по умолчанию {DEFAULT_RANGE.label}). Продажи, стопы и выплаты "
+                "он не ограничивает.\n"
+                "<code>0 100</code> снимает ограничение: границы 0 и 1 всё равно "
+                "недостижимы — ни источник, ни стакан таких цен не дают.\n\n"
+                "Введите два значения в центах, например <code>0 100</code> "
+                f"или <code>{DEFAULT_RANGE.label.replace('¢', '')}</code>.",
+                builder.as_markup(),
+                chat_id,
+            )
         elif data.startswith("leader_fixed_clear:"):
             _, raw_id, raw_page = data.split(":")
             leader_id, page = int(raw_id), int(raw_page)
@@ -1413,11 +1506,14 @@ class TelegramApp:
             builder = InlineKeyboardBuilder()
             builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
             await self._edit_panel(
-                "<b>📊 Процент от баланса</b>\n"
-                "Бюджет одной серии BUY, включая комиссию. Он фиксируется при первом "
-                "фрагменте серии. Если этой суммы недостаточно для минимального ордера "
-                "рынка, сделка пропускается.\n\n"
-                "Введите от 0 до 100, например <code>5</code> для 5%.",
+                "<b>📊 Процент от суммы лидера</b>\n"
+                "Бюджет серии BUY считается от того, сколько вложил сам лидер в эту "
+                "серию, включая нашу комиссию: 100% — столько же, 50% — половина, "
+                "200% — вдвое больше. Цель растёт вместе с его докупками.\n"
+                "Если бюджета не хватает на минимальный ордер рынка, сделка "
+                "пропускается. Максимум серии, лимит на исход и резерв кэша "
+                "продолжают действовать.\n\n"
+                f"Введите от 0 до {MAX_LEADER_PERCENT:g}, например <code>50</code>.",
                 builder.as_markup(),
                 chat_id,
             )

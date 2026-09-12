@@ -3,10 +3,28 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
-from .price_limits import allowed_buy_price
+from .price_limits import DEFAULT_RANGE, PriceRange
 
 ZERO = Decimal(0)
 ONE = Decimal(1)
+HUNDRED = Decimal(100)
+# A leader-relative budget may deliberately exceed what the leader put in; the
+# account's own series, outcome and cash limits still apply on top of it.
+MAX_LEADER_PERCENT = Decimal(1000)
+
+
+def leader_fixed_size(value: Decimal | None) -> Decimal | None:
+    """A validated fixed all-in series budget in dollars, or None."""
+    if value is None or not value.is_finite() or value <= ZERO:
+        return None
+    return value
+
+
+def leader_percent(value: Decimal | None) -> Decimal | None:
+    """A validated share of the leader's own series notional, or None."""
+    if value is None or not value.is_finite() or not ZERO < value <= MAX_LEADER_PERCENT:
+        return None
+    return value
 
 
 def entry_bucket(timestamp: int, seconds: int) -> int:
@@ -118,6 +136,7 @@ def entry_budget(
     floor_multiple: Decimal = Decimal(2),
     conviction_power: Decimal = Decimal(1),
     odds_weight: Decimal = Decimal(1),
+    price_range: PriceRange = DEFAULT_RANGE,
 ) -> BudgetDecision:
     """Cumulative all-in target using size, odds and actual prior cash debits."""
     vwap = entry.leader_notional / entry.leader_shares
@@ -126,8 +145,14 @@ def entry_budget(
     odds_factor = odds_factor_for(vwap, odds_weight)
     reserve = ONE + max(ZERO, fee_rate) * (ONE - ask)
     cap = min(entry.max_budget, current_max)
-    fixed = entry.max_multiplier == ZERO
-    if fixed:
+    percent = leader_percent(getattr(entry, "leader_percent", None))
+    if percent is not None:
+        # A share of what the leader themselves committed to this series, so a
+        # bigger entry of theirs is a bigger entry of ours. It follows their
+        # notional as fragments arrive and is never frozen at the first one.
+        target = min(cap, entry.leader_notional * percent / HUNDRED)
+        odds_factor = ONE
+    elif entry.max_multiplier == ZERO:
         target = cap
         odds_factor = ONE
     else:
@@ -162,11 +187,11 @@ def entry_budget(
     )
     if entry.closed:
         reason = "sizing_entry_closed"
-    elif not allowed_buy_price(event_price) or not allowed_buy_price(vwap):
+    elif not price_range.allows(event_price) or not price_range.allows(vwap):
         reason = "leader_price_out_of_range"
     elif ask <= 0:
         reason = "no_liquidity"
-    elif not allowed_buy_price(ask):
+    elif not price_range.allows(ask):
         reason = "buy_price_out_of_range"
     elif ask > reference + distance:
         reason = "no_liquidity_within_slippage"
