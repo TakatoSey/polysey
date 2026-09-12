@@ -22,6 +22,7 @@ from .accounting import inventory
 from .config import Settings
 from .db import SessionLocal
 from .engine import CopyEngine
+from .formatting import percent, plain
 from .links import market_link
 from .models import (
     BuyIntent,
@@ -316,7 +317,7 @@ class TelegramApp:
             mode = (
                 f" · ${row.fixed_trade_size:.2f} фикс."
                 if row.fixed_trade_size
-                else f" · {row.fixed_trade_percent:g}% лидера"
+                else f" · {percent(row.fixed_trade_percent)}% лидера"
                 if row.fixed_trade_percent
                 else ""
             )
@@ -372,7 +373,7 @@ class TelegramApp:
         sizing_mode = (
             f"фикс. ${row.fixed_trade_size:.2f} на серию"
             if row.fixed_trade_size is not None
-            else f"{row.fixed_trade_percent:g}% от суммы серии лидера"
+            else f"{percent(row.fixed_trade_percent)}% от суммы серии лидера"
             if row.fixed_trade_percent is not None
             else "адаптивный"
         )
@@ -860,7 +861,7 @@ class TelegramApp:
             "<b>Размер · адаптивный</b>\n"
             f"База: <b>{self.settings.copy_balance_pct * 100:.1f}% свободных денег</b> · "
             f"сейчас ${base:.2f}\n"
-            f"Масштаб: до {self.settings.smart_sizing_max_multiplier:g}× базы\n"
+            f"Масштаб: до {plain(self.settings.smart_sizing_max_multiplier)}× базы\n"
             f"Максимум серии: <b>${account.max_trade_size:.2f}, включая комиссию</b>\n"
             f"Окно серии: {self.settings.smart_sizing_burst_seconds} с\n"
             "/setsize не влияет на адаптивный режим · /setmax 30"
@@ -877,8 +878,8 @@ class TelegramApp:
             "<b>💵 Расчёт входа</b>\n\n"
             f"База — {self.settings.copy_balance_pct * 100:.1f}% свободных денег на старте серии.\n"
             f"Масштаб — (серия трейдера / его типичная серия) в степени "
-            f"{self.settings.sizing_conviction_power:g}, до "
-            f"{self.settings.smart_sizing_max_multiplier:g}×. Вход вдвое крупнее обычного "
+            f"{plain(self.settings.sizing_conviction_power)}, до "
+            f"{plain(self.settings.smart_sizing_max_multiplier)}×. Вход вдвое крупнее обычного "
             "весит больше, чем вдвое.\n"
             "Цена — если наша хуже средней цены трейдера, бюджет уменьшается. "
             "Лучшая цена бюджет не увеличивает.\n"
@@ -1065,7 +1066,7 @@ class TelegramApp:
                 if leader_id:
                     builder.button(text="⬅️ Назад", callback_data=f"leader_view:{leader_id}:{page}")
                 await self._edit_panel(
-                    f"Введите процент от 0 до {MAX_LEADER_PERCENT:g}, например "
+                    f"Введите процент от 0 до {plain(MAX_LEADER_PERCENT)}, например "
                     "<code>50</code> — половина суммы лидера, <code>200</code> — вдвое больше.",
                     builder.as_markup(),
                     message.chat.id,
@@ -1513,7 +1514,7 @@ class TelegramApp:
                 "Если бюджета не хватает на минимальный ордер рынка, сделка "
                 "пропускается. Максимум серии, лимит на исход и резерв кэша "
                 "продолжают действовать.\n\n"
-                f"Введите от 0 до {MAX_LEADER_PERCENT:g}, например <code>50</code>.",
+                f"Введите от 0 до {plain(MAX_LEADER_PERCENT)}, например <code>50</code>.",
                 builder.as_markup(),
                 chat_id,
             )
