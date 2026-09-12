@@ -51,7 +51,9 @@ async def init_db() -> None:
                 text("ALTER TABLE leaders ADD COLUMN IF NOT EXISTS fixed_trade_size NUMERIC(20, 8)")
             )
             await connection.execute(
-                text("ALTER TABLE leaders ADD COLUMN IF NOT EXISTS fixed_trade_percent NUMERIC(8, 4)")
+                text(
+                    "ALTER TABLE leaders ADD COLUMN IF NOT EXISTS fixed_trade_percent NUMERIC(8, 4)"
+                )
             )
             await connection.execute(
                 text(

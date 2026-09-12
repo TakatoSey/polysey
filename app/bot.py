@@ -395,9 +395,7 @@ class TelegramApp:
             f"<b>👤 {label}</b>\n<code>{row.address}</code>\n\n"
             f"Статус: <b>{status}</b>\n"
             f"Размер: <b>{sizing_mode}</b>\n"
-            + self._leader_sizing_text(
-                leader_id, row.fixed_trade_size, row.fixed_trade_percent
-            )
+            + self._leader_sizing_text(leader_id, row.fixed_trade_size, row.fixed_trade_percent)
             + f"PNL: <b>{pnl_label}</b> · открыто ${open_cost:.2f}\n"
             f"Сделки: {buys} BUY · {sells} SELL\n"
             f"Последние 20: {executed} скопировано · {rejected} пропущено\n"
