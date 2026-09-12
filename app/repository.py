@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
@@ -10,6 +10,8 @@ from .models import (
     CopyTrade,
     ExecutionPolicy,
     Leader,
+    LeaderPosition,
+    LeaderSizingProfile,
     PaperOrder,
     Position,
     RiskRule,
@@ -93,7 +95,37 @@ async def finish_exit_signals(session, token_id, *, leader_id=None, reason):
 
 
 async def get_leaders(session: AsyncSession) -> list[Leader]:
-    return list((await session.scalars(select(Leader).order_by(Leader.created_at))).all())
+    """The panel's list: a deleted leader is gone from it for good."""
+    return list(
+        (
+            await session.scalars(
+                select(Leader).where(Leader.removed.is_(False)).order_by(Leader.created_at)
+            )
+        ).all()
+    )
+
+
+async def remove_leader(session: AsyncSession, leader: Leader) -> bool:
+    """Delete the leader, or hide them when history still points at them.
+
+    Returns True when the row itself is gone. A leader whose copies exist
+    cannot be deleted: their orders, released cost and per-leader PNL are
+    attributed by leader id, and dropping that turns settled history into
+    unattributable sells. Such a leader leaves the list and stops being
+    polled instead, which is what "deleted" has to mean for them.
+    """
+    leader.active = False
+    traded = await session.scalar(
+        select(CopyTrade.id).where(CopyTrade.leader_id == leader.id).limit(1)
+    )
+    if traded:
+        leader.removed = True
+        return False
+    # Nothing copied: only derived rows can exist, and they hold no money.
+    for model in (LeaderSizingProfile, LeaderPosition):
+        await session.execute(delete(model).where(model.leader_id == leader.id))
+    await session.delete(leader)
+    return True
 
 
 async def get_leader(session: AsyncSession, address: str) -> Leader | None:
@@ -103,7 +135,8 @@ async def get_leader(session: AsyncSession, address: str) -> Leader | None:
 async def add_leader(session: AsyncSession, address: str, label: str | None = None) -> Leader:
     leader = await get_leader(session, address)
     if leader:
-        leader.active = True
+        # Adding an address back undoes a deletion rather than duplicating it.
+        leader.active, leader.removed = True, False
         return leader
     leader = Leader(address=address.lower(), label=label)
     session.add(leader)

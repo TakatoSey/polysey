@@ -623,6 +623,28 @@ class CopyEngine:
 
         task.add_done_callback(done)
 
+    def forget_leader(self, leader_id: int) -> None:
+        """Drop memo state for a leader we no longer follow."""
+        self._leader_sizing_profiles.pop(leader_id, None)
+        self._profile_refresh_attempt.pop(leader_id, None)
+        self._leader_price_ranges.pop(leader_id, None)
+        self._leader_floors.pop(leader_id, None)
+        for key in [key for key in self._sell_watermarks if key[0] == leader_id]:
+            self._sell_watermarks.pop(key, None)
+
+    def reset_runtime_state(self) -> None:
+        """Forget what a wiped database can no longer explain.
+
+        Sell barriers and poll checkpoints live in memory. Kept across a reset
+        they keep skipping copies as "leader already sold" against trades the
+        database no longer contains, with nothing left to explain the skip.
+        """
+        self._buy_batches.clear()
+        self._sell_watermarks.clear()
+        self._leader_floors.clear()
+        self._leader_sizing_profiles.clear()
+        self._profile_refresh_attempt.clear()
+
     def _price_range(self, leader_id: int) -> PriceRange:
         """This leader's entry range, as read the last time we loaded them.
 

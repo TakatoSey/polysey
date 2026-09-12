@@ -56,6 +56,8 @@ class Leader(Base):
     min_buy_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     max_buy_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10), nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    # Deleted from the panel while their copied trades still reference them.
+    removed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     initialized: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_timestamp: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

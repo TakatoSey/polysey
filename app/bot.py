@@ -30,6 +30,7 @@ from .models import (
     ExitIntent,
     Leader,
     LeaderPosition,
+    LeaderSizingProfile,
     PaperOrder,
     Position,
     RiskRule,
@@ -47,6 +48,7 @@ from .repository import (
     get_or_create_account,
     orders,
     positions,
+    remove_leader,
 )
 from .sizing import MAX_LEADER_PERCENT, leader_percent
 
@@ -1148,9 +1150,12 @@ class TelegramApp:
             return
         async with SessionLocal() as session:
             row = await session.scalar(select(Leader).where(Leader.address == parts[1].lower()))
+            leader_id = row.id if row else None
             if row:
-                row.active = False
+                await remove_leader(session, row)
             await session.commit()
+        if leader_id is not None:
+            self.engine.forget_leader(leader_id)
         await self._leaders_panel(chat_id=message.chat.id)
 
     async def _set_decimal_setting(
@@ -1253,9 +1258,12 @@ class TelegramApp:
         builder.button(text="Отмена", callback_data="home")
         await self._edit_panel(
             "<b>Сбросить базу?</b>\n"
-            "Удалятся сделки, ордера, позиции, серии и незавершённые выходы.\n"
+            "Удалится всё торговое: сделки, ордера, позиции, серии, незавершённые "
+            "выходы, правила риска и собранная статистика трейдеров.\n"
             f"Баланс станет ${self.settings.paper_initial_balance:.2f}.\n\n"
-            "Трейдеры и их статистика останутся. Отменить нельзя.",
+            "Останутся сами трейдеры со своими настройками — размер, процент и "
+            "диапазон цены. Статистика наберётся заново при следующем опросе. "
+            "Отменить нельзя.",
             builder.as_markup(),
             chat_id,
         )
@@ -1271,6 +1279,7 @@ class TelegramApp:
                 BuyIntent,
                 ExitIntent,
                 LeaderPosition,
+                LeaderSizingProfile,
                 RiskRule,
                 PaperOrder,
                 Position,
@@ -1282,8 +1291,9 @@ class TelegramApp:
             account.starting_balance = self.settings.paper_initial_balance
             account.realized_pnl = Decimal(0)
             await session.commit()
-        # In-memory batches reference rows that no longer exist.
-        self.engine._buy_batches.clear()
+        # Sell barriers, poll checkpoints and cached profiles reference rows
+        # that no longer exist.
+        self.engine.reset_runtime_state()
         return self.settings.paper_initial_balance
 
     async def risk(self, message: Message) -> None:
@@ -1523,8 +1533,9 @@ class TelegramApp:
             async with SessionLocal() as session:
                 row = await session.get(Leader, int(raw_id))
                 if row:
-                    row.active = False
+                    await remove_leader(session, row)
                 await session.commit()
+            self.engine.forget_leader(int(raw_id))
             await self._leaders_panel(int(raw_page), chat_id)
         elif data.startswith("leader_remove:"):
             _, raw_id, raw_page = data.split(":")
@@ -1534,7 +1545,10 @@ class TelegramApp:
             )
             builder.button(text="Отмена", callback_data=f"leader_view:{raw_id}:{raw_page}")
             await self._edit_panel(
-                "<b>Удалить трейдера?</b>\nКопирование остановится. История и позиции сохранятся.",
+                "<b>Удалить трейдера?</b>\n"
+                "Он исчезнет из списка, копирование остановится.\n"
+                "Если по нему уже есть сделки, его ордера, PNL и открытые позиции "
+                "останутся в учёте — иначе история стала бы ничьей.",
                 builder.as_markup(),
                 chat_id,
             )
