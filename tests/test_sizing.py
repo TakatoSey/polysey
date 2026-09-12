@@ -666,6 +666,19 @@ async def test_leader_percent_may_exceed_the_leader_and_stops_at_the_series_maxi
         assert abs(state.spent - 30) < TOLERANCE
 
 
+@pytest.mark.parametrize("notify", [True, False])
+async def test_muting_buy_notifications_does_not_change_what_is_copied(sizing_rig, notify):
+    async with sizing_rig.sessions() as session:
+        (await session.get(Account, 1)).notify_buys = notify
+        await session.commit()
+    await copy(sizing_rig, "notify-or-not", "20")
+    async with sizing_rig.sessions() as session:
+        # The fill itself is unaffected by whether the chat hears about it.
+        assert abs((await session.get(Account, 1)).paper_balance - 95) < TOLERANCE
+        assert (await session.scalar(select(PaperOrder))).filled_shares > 0
+    assert sizing_rig.engine.notifications.empty() is not notify
+
+
 async def test_leader_profiles_and_entry_budgets_are_independent(sizing_rig):
     async with sizing_rig.sessions() as session:
         (await session.get(LeaderSizingProfile, 2)).reference_notional = 40

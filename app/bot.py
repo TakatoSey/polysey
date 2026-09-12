@@ -845,7 +845,8 @@ class TelegramApp:
             f"Минимум BUY: <b>${self.settings.min_copy_notional:.2f}</b>\n"
             f"Лимит на исход: <b>${self.settings.max_outcome_exposure:.2f}</b>\n"
             f"Резерв кэша: <b>{self.settings.min_cash_reserve_pct * 100:.0f}%</b> капитала\n"
-            f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>"
+            f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>\n"
+            f"Уведомления о покупках: <b>{'включены' if account.notify_buys else 'выключены'}</b>"
         )
 
     def _sizing_summary(self, account) -> str:
@@ -898,16 +899,28 @@ class TelegramApp:
             "Slippage, свободные деньги и лимит на исход действуют всегда."
         )
 
-    def _settings_keyboard_v2(self):
+    def _settings_keyboard_v2(self, notify_buys: bool = True):
         builder = InlineKeyboardBuilder()
         builder.button(text="💵 Размер сделки", callback_data="settings:sizing")
         builder.button(text="📏 Лимиты", callback_data="settings:limits")
         builder.button(text="📉 Slippage", callback_data="settings:slippage")
         builder.button(text="🛡️ Stop-loss / TP", callback_data="settings:risk")
+        builder.button(
+            text="🔕 Не уведомлять о покупках" if notify_buys else "🔔 Уведомлять о покупках",
+            callback_data="notify_buys_toggle",
+        )
         builder.button(text="🧪 Сброс базы", callback_data="reset_prompt")
         builder.button(text="⬅️ На главную", callback_data="home")
-        builder.adjust(2, 2, 1, 1)
+        builder.adjust(2, 2, 1, 1, 1)
         return builder.as_markup()
+
+    async def _settings_screen(self):
+        """Text and keyboard from one read, so the button matches the state."""
+        async with SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            notify_buys = account.notify_buys
+            await session.commit()
+        return await self._settings_text_v2(), self._settings_keyboard_v2(notify_buys)
 
     def _register(self) -> None:
         self.dp.message.register(self.start, Command("start"))
@@ -981,9 +994,8 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(
-            await self._settings_text_v2(), self._settings_keyboard_v2(), message.chat.id
-        )
+        text, keyboard = await self._settings_screen()
+        await self._edit_panel(text, keyboard, message.chat.id)
 
     async def addleader(self, message: Message, state: FSMContext) -> None:
         if not self._allowed(message):
@@ -1392,9 +1404,15 @@ class TelegramApp:
                 await self._position_detail_v2(int(raw_id)), builder.as_markup(), chat_id
             )
         elif data == "settings":
-            await self._edit_panel(
-                await self._settings_text_v2(), self._settings_keyboard_v2(), chat_id
-            )
+            text, keyboard = await self._settings_screen()
+            await self._edit_panel(text, keyboard, chat_id)
+        elif data == "notify_buys_toggle":
+            async with SessionLocal() as session:
+                account = await get_or_create_account(session, self.settings.paper_initial_balance)
+                account.notify_buys = not account.notify_buys
+                await session.commit()
+            text, keyboard = await self._settings_screen()
+            await self._edit_panel(text, keyboard, chat_id)
         elif data.startswith("settings:"):
             section = data.split(":", 1)[1]
             details = {
@@ -1416,9 +1434,8 @@ class TelegramApp:
                     "/risk TOKEN sl=0.2 tp=0.25 trail=0.1"
                 ),
             }
-            await self._edit_panel(
-                details.get(section, "Раздел не найден"), self._settings_keyboard_v2(), chat_id
-            )
+            _text, keyboard = await self._settings_screen()
+            await self._edit_panel(details.get(section, "Раздел не найден"), keyboard, chat_id)
         elif data == "stats":
             await self._edit_panel(await self._stats_text(), self._back(), chat_id)
         elif data == "reset_prompt":

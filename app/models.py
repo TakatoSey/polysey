@@ -38,6 +38,8 @@ class Account(Base):
         Numeric(8, 6), default=Decimal("0.05"), nullable=False
     )
     paused: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    # Push on a copied BUY. Sells, payouts and risk exits always notify.
+    notify_buys: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now

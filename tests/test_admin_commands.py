@@ -104,6 +104,16 @@ async def admin_rig(tmp_path, monkeypatch):
         paper_initial_balance=D(100),
         telegram_allowed_user_id=7,
         default_slippage_cents=D(5),
+        # Read by the settings screen this rig also exercises.
+        smart_sizing_enabled=True,
+        copy_balance_pct=D("0.05"),
+        leader_order_scale=D("0.1"),
+        smart_sizing_max_multiplier=D(3),
+        smart_sizing_burst_seconds=2,
+        smart_sizing_min_samples=3,
+        min_copy_notional=D("1.10"),
+        max_outcome_exposure=D(50),
+        min_cash_reserve_pct=D("0.25"),
     )
     engine = CopyEngine(Settings(_env_file=None), SimpleNamespace())
     # State a wiped database can no longer explain, as a live bot would hold it.
@@ -310,3 +320,23 @@ async def test_reset_asks_before_wiping_and_only_the_owner_may_ask(admin_rig):
     admin_rig.app._edit_panel.assert_not_awaited()
     async with admin_rig.sessions() as session:
         assert list(await session.scalars(select(CopyTrade))) != []
+
+
+async def test_buy_notification_toggle_flips_the_flag_and_its_own_button(admin_rig):
+    async def labels():
+        _text, keyboard = await admin_rig.app._settings_screen()
+        return [button.text for row in keyboard.inline_keyboard for button in row]
+
+    assert "🔕 Не уведомлять о покупках" in await labels()
+
+    await admin_rig.app._dispatch("notify_buys_toggle", 7)
+
+    async with admin_rig.sessions() as session:
+        assert (await session.get(Account, 1)).notify_buys is False
+    assert "🔔 Уведомлять о покупках" in await labels()
+    assert "выключены" in await admin_rig.app._settings_text_v2()
+
+    await admin_rig.app._dispatch("notify_buys_toggle", 7)
+
+    async with admin_rig.sessions() as session:
+        assert (await session.get(Account, 1)).notify_buys is True

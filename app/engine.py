@@ -1613,8 +1613,9 @@ class CopyEngine:
             fee=str(fill.fee),
         )
         # Keep the chat quiet: only successful BUY copies are user-facing
-        # notifications. Rejections remain visible in the order history.
-        if event.side == "BUY":
+        # notifications, and the user can mute those too. Rejections remain
+        # visible in the order history either way.
+        if event.side == "BUY" and account.notify_buys:
             message = self.build_buy_notification(leader, event, fill)
             if decision:
                 message += (
@@ -2187,10 +2188,13 @@ class CopyEngine:
             intent.active, intent.last_reason = False, "filled"
             trade.status, trade.skip_reason = "executed", None
             await session.commit()
-            message = self.build_buy_notification(leader, event, fill)
-        await self.notify(
-            message + "\n\n<i>Цена стала допустимой после первоначального пропуска.</i>"
-        )
+            message = (
+                self.build_buy_notification(leader, event, fill) if account.notify_buys else None
+            )
+        if message:
+            await self.notify(
+                message + "\n\n<i>Цена стала допустимой после первоначального пропуска.</i>"
+            )
 
     async def retry_exits_once(self) -> None:
         """Only explicit, still-open intents. Never replay old rejected orders."""
