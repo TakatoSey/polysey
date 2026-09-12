@@ -511,8 +511,14 @@ class TelegramApp:
             return False
         return isinstance(market, dict) and market.get("closed") is True
 
-    async def _portfolio_text_v2(self, page: int = 0) -> str:
+    async def _portfolio_screen(self, page: int = 0):
+        """Text and keyboard from ONE read, so item 3 and button 3 agree."""
         rows, _account = await self._portfolio_data_v2()
+        return await self._portfolio_text_v2(page, rows), self._portfolio_keyboard_v2(rows, page)
+
+    async def _portfolio_text_v2(self, page: int = 0, rows=None) -> str:
+        if rows is None:
+            rows, _account = await self._portfolio_data_v2()
         per_page = 5
         total_pages = max(1, (len(rows) + per_page - 1) // per_page)
         page = max(0, min(page, total_pages - 1))
@@ -949,10 +955,8 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        rows, _ = await self._portfolio_data_v2()
-        await self._edit_panel(
-            await self._portfolio_text_v2(0), self._portfolio_keyboard_v2(rows, 0), message.chat.id
-        )
+        text, keyboard = await self._portfolio_screen(0)
+        await self._edit_panel(text, keyboard, message.chat.id)
 
     async def leaders(self, message: Message) -> None:
         if not self._allowed(message):
@@ -1355,12 +1359,8 @@ class TelegramApp:
             await self._home(chat_id)
         elif data == "portfolio" or data.startswith("portfolio:"):
             page = int(data.split(":")[1]) if ":" in data else 0
-            rows, _ = await self._portfolio_data_v2()
-            await self._edit_panel(
-                await self._portfolio_text_v2(page),
-                self._portfolio_keyboard_v2(rows, page),
-                chat_id,
-            )
+            text, keyboard = await self._portfolio_screen(page)
+            await self._edit_panel(text, keyboard, chat_id)
         elif data == "orders" or data.startswith("orders:"):
             parts = data.split(":")
             page = int(parts[1]) if len(parts) > 1 and parts[1] else 0

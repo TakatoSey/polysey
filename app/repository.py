@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .models import (
@@ -181,7 +181,36 @@ async def apply_fill(
 
 
 async def positions(session: AsyncSession) -> list[Position]:
-    return list((await session.scalars(select(Position).where(Position.shares > 0))).all())
+    """Open positions, most recently bought first.
+
+    Without an explicit order the database is free to return the same rows in
+    a different order on the next query, which made a numbered list and its
+    buttons disagree. A position with no recorded buy left (older history)
+    falls back to when it was opened.
+    """
+    last_buy = (
+        select(func.max(PaperOrder.created_at))
+        .where(
+            PaperOrder.token_id == Position.token_id,
+            PaperOrder.side == "BUY",
+            PaperOrder.status.in_(["filled", "partial"]),
+            PaperOrder.filled_shares > 0,
+        )
+        .correlate(Position)
+        .scalar_subquery()
+    )
+    return list(
+        (
+            await session.scalars(
+                select(Position)
+                .where(Position.shares > 0)
+                .order_by(
+                    func.coalesce(last_buy, Position.opened_at).desc(),
+                    Position.id.desc(),
+                )
+            )
+        ).all()
+    )
 
 
 async def orders(session: AsyncSession) -> list[PaperOrder]:
