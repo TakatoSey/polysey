@@ -759,3 +759,26 @@ async def test_the_preflight_reports_what_is_missing_without_signing(monkeypatch
     assert any("allowance" in problem for problem in report["blocking_problems"])
     assert report["market"]["tick_size"] == "0.01"
     assert clob.posted == []
+
+
+async def test_the_preflight_asks_the_exchange_about_every_signature_type(monkeypatch):
+    """Which arrangement holds the money is the question a guess gets wrong."""
+    clob = FakeClob()
+    answers = {0: {"balance": "0", "allowance": "0"}, 1: {"balance": "7500000"}, 2: {}}
+    asked = []
+
+    def balance(params):
+        asked.append(params.signature_type)
+        return answers.get(params.signature_type, {})
+
+    clob.get_balance_allowance = balance
+    monkeypatch.setattr("app.live.build_client", lambda settings: clob)
+    trader = LiveTrader(live_settings())
+    await trader.start()
+
+    found = await trader.collateral_by_signature_type()
+
+    assert sorted(a for a in asked if a in (0, 1, 2)) == [0, 1, 2]
+    assert "balance 0" in found[0]
+    # The type whose balance is real is the one to configure.
+    assert "balance 7.5" in found[1]

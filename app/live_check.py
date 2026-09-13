@@ -60,9 +60,15 @@ async def check(token_id: str | None) -> int:
         neg_risk_exchange_contract=await asyncio.to_thread(client.get_exchange_address, True),
         server_ok=await asyncio.to_thread(client.get_ok),
     )
+    # Which arrangement actually holds the money, according to the exchange.
+    report["balance_by_signature_type"] = await trader.collateral_by_signature_type()
     verdict = []
     if account.cash <= 0:
-        verdict.append("no USDC in the funding wallet: nothing can be bought")
+        verdict.append(
+            "no USDC for this key and signature type. Compare "
+            "balance_by_signature_type above: the entry showing your real "
+            "balance is the POLYMARKET_SIGNATURE_TYPE to configure."
+        )
     if account.allowance <= 0:
         verdict.append(
             "the exchange has no allowance over the collateral: orders would be "

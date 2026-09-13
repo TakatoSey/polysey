@@ -196,6 +196,32 @@ class LiveTrader:
         balance, _allowance = await self._collateral()
         return balance
 
+    async def collateral_by_signature_type(self) -> dict[int, str]:
+        """What the exchange reports for this key under each wallet arrangement.
+
+        Which signature type applies depends on how the Polymarket account was
+        created, and a delegated session key makes that harder to tell from the
+        outside. Asking all three and reporting what came back turns a guess
+        into an answer; nothing here signs or sends anything.
+        """
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+
+        client = self._require()
+        found: dict[int, str] = {}
+        for signature_type in (0, 1, 2):
+            params = BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL, signature_type=signature_type
+            )
+            try:
+                raw = await asyncio.to_thread(client.get_balance_allowance, params)
+            except Exception as exc:
+                found[signature_type] = f"error: {type(exc).__name__}"
+                continue
+            found[signature_type] = (
+                f"balance {self._usdc(raw, 'balance')}, allowance {self._usdc(raw, 'allowance')}"
+            )
+        return found
+
     async def token_shares(self, token_id: str) -> Decimal:
         """Shares of one outcome according to the exchange."""
         from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
