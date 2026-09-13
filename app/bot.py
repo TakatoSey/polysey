@@ -12,14 +12,17 @@ import structlog
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramConflictError,
     TelegramNetworkError,
     TelegramRetryAfter,
     TelegramServerError,
+    TelegramUnauthorizedError,
 )
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import GetUpdates
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import delete, func, select
@@ -1762,6 +1765,36 @@ class TelegramApp:
         while True:
             first = await self.engine.notifications.get()
             await self._send_notification(self._drain_notifications(first))
+
+    async def verify_identity(self) -> str:
+        """Name this bot, and refuse to share its token with another process.
+
+        aiogram retries a polling conflict forever instead of failing, so two
+        processes on one token quietly steal each other's updates and the panel
+        answers at random. A live bot must have its own token from @BotFather;
+        this is where that is enforced rather than trusted.
+        """
+        try:
+            me = await self.bot.get_me()
+        except TelegramUnauthorizedError as exc:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is not a valid bot token") from exc
+        try:
+            # A peek at the update queue: the API answers 409 while another
+            # process is long-polling this same token.
+            await self.bot(GetUpdates(offset=-1, limit=1, timeout=0))
+        except TelegramConflictError as exc:
+            raise RuntimeError(
+                f"another process is already polling @{me.username}. Each bot "
+                "instance needs its own token: create a separate bot in "
+                "@BotFather for live trading (see docs/live-trading.md)."
+            ) from exc
+        log.info(
+            "telegram_bot_identity",
+            username=me.username,
+            bot_id=me.id,
+            mode=self._mode_badge(),
+        )
+        return me.username or str(me.id)
 
     async def run(self) -> None:
         await self.dp.start_polling(self.bot)

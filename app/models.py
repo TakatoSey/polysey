@@ -187,6 +187,21 @@ class SourceReceipt(Base):
     copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"), index=True)
 
 
+class InstanceClaim(Base):
+    """Which bot this database belongs to: paper or live, and whose wallet.
+
+    A paper ledger holds invented money and simulated positions. Opening it
+    with a live bot would size real orders against that fiction, so the claim
+    is checked before anything else runs.
+    """
+
+    __tablename__ = "instance_claim"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    trading_mode: Mapped[str] = mapped_column(String(10))
+    funder: Mapped[str] = mapped_column(String(42), default="")
+    claimed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class DailyRisk(Base):
     """Realized PNL at the start of a UTC day, for the live daily loss stop."""
 
