@@ -164,12 +164,16 @@ async def apply_fill(
     account: Account,
     *,
     cost_to_release: Decimal | None = None,
+    executed_elsewhere: bool = False,
 ) -> None:
     position = await get_position(session, token_id)
     if side == "BUY":
         total_cost = fill.notional + fill.fee
-        if account.paper_balance < total_cost:
+        if account.paper_balance < total_cost and not executed_elsewhere:
             raise ValueError("insufficient_balance")
+        # A live order the exchange already filled has spent real money. The
+        # ledger has to record it even if its own cash figure lagged behind;
+        # the next exchange read replaces that figure anyway.
         account.paper_balance -= total_cost
         if not position:
             position = Position(
