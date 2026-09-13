@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import signal
+from decimal import Decimal
 
 import structlog
 
@@ -103,14 +104,29 @@ async def run_bot(settings) -> None:
             claimed_at=str(claim.claimed_at),
         )
         # Initialize defaults before either the Telegram or trading loops start.
-        # Existing account limits are intentionally preserved.
-        await get_or_create_account(session, settings.paper_initial_balance, settings=settings)
+        # Existing account limits are intentionally preserved. In live mode the
+        # ledger starts empty rather than at PAPER_INITIAL_BALANCE: the real
+        # figure arrives from the exchange, and a placeholder would otherwise be
+        # a number an entry could be sized against.
+        await get_or_create_account(
+            session,
+            Decimal(0) if settings.live else settings.paper_initial_balance,
+            settings=settings,
+        )
         await initialize_execution(session, settings)
-        if settings.default_leader_address:
+        if settings.default_leader_address and not settings.live:
             # Seed the configured leader once; do not silently re-enable one
             # the user intentionally disabled from the Telegram panel.
             if not await get_leader(session, settings.default_leader_address):
                 await add_leader(session, settings.default_leader_address)
+        elif settings.default_leader_address:
+            # Never start copying someone with real money because an example
+            # address was left in .env. Adding a leader stays a deliberate act.
+            log.warning(
+                "default_leader_not_seeded_in_live",
+                address=settings.default_leader_address,
+                hint="add the leaders you want from the Telegram panel",
+            )
         await session.commit()
     client = PolymarketClient(settings)
     await client.start()

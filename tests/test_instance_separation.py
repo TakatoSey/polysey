@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.bot import TelegramApp
@@ -186,3 +187,51 @@ async def test_an_invalid_token_is_named_as_such():
 
     with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
         await app.verify_identity()
+
+
+# ------------------------------------------------- what live must not inherit
+
+
+async def test_live_starts_with_an_empty_ledger_and_no_seeded_leader(tmp_path, monkeypatch):
+    """A paper .env copied for live carries a balance and an example leader.
+
+    Neither may take effect: the balance would be a number an entry could be
+    sized against before the exchange answers, and the leader would be copied
+    with real money because a line was left in a file.
+    """
+    import app.__main__ as entrypoint
+
+    db = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'live-start.db'}")
+    maker = async_sessionmaker(db, expire_on_commit=False)
+    async with db.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    monkeypatch.setattr(entrypoint, "SessionLocal", maker)
+    monkeypatch.setattr(entrypoint, "init_db", AsyncMock())
+    settings = Settings(
+        _env_file=None,
+        TRADING_MODE="live",
+        LIVE_CONFIRM="I_UNDERSTAND_REAL_MONEY",
+        POLYMARKET_PRIVATE_KEY="0x" + "ab" * 32,
+        POLYMARKET_FUNDER=WALLET,
+        PAPER_INITIAL_BALANCE="100",
+        DEFAULT_LEADER_ADDRESS="0x" + "9" * 40,
+    )
+    # Stop right after the startup block: nothing here needs a live exchange.
+    monkeypatch.setattr(entrypoint, "start_live", AsyncMock(side_effect=RuntimeError("stop here")))
+    monkeypatch.setattr(
+        entrypoint,
+        "PolymarketClient",
+        lambda settings: SimpleNamespace(start=AsyncMock(), close=AsyncMock(), http=None),
+    )
+
+    with pytest.raises(RuntimeError, match="stop here"):
+        await entrypoint.run_bot(settings)
+
+    async with maker() as session:
+        from app.models import Account
+
+        account = await session.get(Account, 1)
+        assert account.paper_balance == D(0)
+        assert account.starting_balance == D(0)
+        assert list(await session.scalars(select(Leader.address))) == []
+    await db.dispose()
