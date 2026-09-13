@@ -187,6 +187,15 @@ class SourceReceipt(Base):
     copy_trade_id: Mapped[int] = mapped_column(ForeignKey("copy_trades.id"), index=True)
 
 
+class DailyRisk(Base):
+    """Realized PNL at the start of a UTC day, for the live daily loss stop."""
+
+    __tablename__ = "daily_risk"
+    day: Mapped[str] = mapped_column(String(10), primary_key=True)
+    realized_at_start: Mapped[Decimal] = mapped_column(Numeric(20, 8), default=0)
+    stopped: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
 class RuntimeMigration(Base):
     __tablename__ = "runtime_migrations"
     name: Mapped[str] = mapped_column(String(80), primary_key=True)

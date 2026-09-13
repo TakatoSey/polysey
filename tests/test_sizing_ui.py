@@ -15,6 +15,9 @@ def panel(*, smart=True, profiles=None):
     app = object.__new__(TelegramApp)
     app.settings = SimpleNamespace(
         smart_sizing_enabled=smart,
+        # The panel shows the trading mode on every screen.
+        live=False,
+        live_dry_run=False,
         copy_balance_pct=Decimal("0.05"),
         leader_order_scale=Decimal("0.1"),
         smart_sizing_max_multiplier=Decimal(3),

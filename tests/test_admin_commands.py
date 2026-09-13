@@ -106,6 +106,9 @@ async def admin_rig(tmp_path, monkeypatch):
         default_slippage_cents=D(5),
         # Read by the settings screen this rig also exercises.
         smart_sizing_enabled=True,
+        # The panel shows the trading mode on every screen.
+        live=False,
+        live_dry_run=False,
         copy_balance_pct=D("0.05"),
         leader_order_scale=D("0.1"),
         smart_sizing_max_multiplier=D(3),
