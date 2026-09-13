@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import re
 from collections import Counter
@@ -1692,3 +1693,8 @@ class TelegramApp:
 
     async def run(self) -> None:
         await self.dp.start_polling(self.bot)
+
+    async def close(self) -> None:
+        """Release the Telegram HTTP session on shutdown."""
+        with contextlib.suppress(Exception):
+            await self.bot.session.close()
