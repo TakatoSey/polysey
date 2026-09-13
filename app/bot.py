@@ -9,7 +9,12 @@ from decimal import Decimal, InvalidOperation
 
 import structlog
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -1622,9 +1627,35 @@ class TelegramApp:
                 await session.commit()
             await self._leaders_panel(page, chat_id)
 
-    async def notify_loop(self) -> None:
-        while True:
-            message = await self.engine.notifications.get()
+    MESSAGE_LIMIT = 3500  # Telegram caps a message at 4096 characters.
+    SEND_ATTEMPTS = 4
+
+    def _drain_notifications(self, first: str) -> str:
+        """Send one message per burst instead of one per copied trade.
+
+        Telegram rate-limits per chat, so a burst of copies is exactly when a
+        notification gets refused and lost. Joining what is already queued
+        keeps the content and makes far fewer requests.
+        """
+        batch = [first]
+        length = len(first)
+        while not self.engine.notifications.empty():
+            queued = self.engine.notifications.get_nowait()
+            if length + len(queued) + 16 > self.MESSAGE_LIMIT:
+                # Does not fit: hand it back rather than truncate a trade.
+                self.engine.notifications.put_nowait(queued)
+                break
+            batch.append(queued)
+            length += len(queued) + 16
+        return "\n\n➖➖➖\n\n".join(batch)
+
+    async def _send_notification(self, message: str) -> bool:
+        """Deliver a trade notification, honouring Telegram's own backoff.
+
+        A dropped one cannot be reconstructed from anywhere: the order history
+        holds the trade, not the message.
+        """
+        for attempt in range(self.SEND_ATTEMPTS):
             try:
                 await self.bot.send_message(
                     self.settings.telegram_allowed_user_id,
@@ -1632,8 +1663,32 @@ class TelegramApp:
                     parse_mode="HTML",
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
+                return True
+            except TelegramRetryAfter as exc:
+                # Telegram states the wait; anything shorter is refused again.
+                wait = min(float(exc.retry_after) + 0.5, 60.0)
+                log.warning("telegram_rate_limited", retry_after=wait, attempt=attempt + 1)
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                wait = min(2.0**attempt, 15.0)
+                log.warning(
+                    "telegram_send_retrying",
+                    error=type(exc).__name__,
+                    retry_seconds=wait,
+                    attempt=attempt + 1,
+                )
             except Exception:
+                # A malformed or rejected message will not become valid later.
                 log.exception("telegram_notification_failed")
+                return False
+            if attempt + 1 < self.SEND_ATTEMPTS:
+                await asyncio.sleep(wait)
+        log.error("telegram_notification_dropped", characters=len(message))
+        return False
+
+    async def notify_loop(self) -> None:
+        while True:
+            first = await self.engine.notifications.get()
+            await self._send_notification(self._drain_notifications(first))
 
     async def run(self) -> None:
         await self.dp.start_polling(self.bot)
