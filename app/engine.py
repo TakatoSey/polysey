@@ -100,6 +100,9 @@ class CopyEngine:
         self._leader_sizing_profiles: dict[int, LeaderSizingProfile] = {}
         self._leader_price_ranges: dict[int, PriceRange] = {}
         self._profile_refresh_attempt: dict[int, float] = {}
+        # Only for a leader whose own activity request failed: (next_try, failures).
+        self._leader_poll_retry: dict[int, tuple[float, int]] = {}
+        self._logged_poll_rate: int | None = None
         self.tracked_addresses: set[str] = set()
 
     async def notify(self, message: str) -> None:
@@ -395,9 +398,25 @@ class CopyEngine:
             )
             self.tracked_addresses.clear()
             self.tracked_addresses.update(leader.address.lower() for leader in leaders)
+        if len(leaders) != self._logged_poll_rate:
+            # Every active leader is one activity request per interval. Compare
+            # this with the documented API limits rather than guessing one here.
+            self._logged_poll_rate = len(leaders)
+            log.info(
+                "activity_poll_rate",
+                leaders=len(leaders),
+                interval_seconds=self.settings.poll_interval_seconds,
+                requests_per_second=round(
+                    len(leaders) / max(self.settings.poll_interval_seconds, 0.001), 2
+                ),
+            )
 
         tasks = []
         for leader in leaders:
+            # A healthy leader keeps the configured cadence exactly; only one
+            # that just failed waits, and only for its own activity request.
+            if self._poll_paused_for(leader.id):
+                continue
             task = self._leader_polls.get(leader.id)
             if task is None:
                 task = asyncio.create_task(self._poll_leader(leader))
@@ -437,15 +456,21 @@ class CopyEngine:
                             error=type(exc).__name__,
                         )
             except Exception as exc:
-                log.exception(
+                wait = self._note_poll_failure(leader.id, exc)
+                log.warning(
                     "leader_activity_failed",
                     leader=leader.address,
                     error=str(exc),
                     error_type=type(exc).__name__,
+                    status=getattr(getattr(exc, "response", None), "status_code", None),
+                    retry_seconds=wait,
+                    consecutive_failures=self._leader_poll_retry[leader.id][1],
                 )
                 if profile_task and not profile_task.done():
                     profile_task.cancel()
                 return
+            # One good response clears the backoff: no lingering slowdown.
+            self._leader_poll_retry.pop(leader.id, None)
             async with SessionLocal() as session:
                 db_leader = await session.scalar(select(Leader).where(Leader.id == leader.id))
                 if not db_leader or not db_leader.active:
@@ -630,6 +655,7 @@ class CopyEngine:
         self._profile_refresh_attempt.pop(leader_id, None)
         self._leader_price_ranges.pop(leader_id, None)
         self._leader_floors.pop(leader_id, None)
+        self._leader_poll_retry.pop(leader_id, None)
         for key in [key for key in self._sell_watermarks if key[0] == leader_id]:
             self._sell_watermarks.pop(key, None)
 
@@ -659,6 +685,40 @@ class CopyEngine:
         price_range = leader_price_range(leader)
         self._leader_price_ranges[leader.id] = price_range
         return price_range
+
+    @staticmethod
+    def _poll_retry_after(exc, failures: int) -> float:
+        """How long to leave THIS leader's activity poll alone after a failure.
+
+        Hammering an endpoint that just answered 429 is what keeps it 429. The
+        wait applies to one leader's own detection poll only: other leaders,
+        the RTDS stream and every execution request (book, market, fee) are
+        untouched, so a rate-limited leader cannot slow down a copy or widen
+        the price we execute at.
+        """
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status == 429:
+            stated = (getattr(response, "headers", None) or {}).get("retry-after")
+            try:
+                # Honour the server's own number when it sends one.
+                if stated is not None:
+                    return max(0.5, min(float(stated), 30.0))
+            except (TypeError, ValueError):
+                pass
+            return min(5.0 * failures, 30.0)
+        return min(0.5 * 2**failures, 15.0)
+
+    def _note_poll_failure(self, leader_id: int, exc) -> float:
+        failures = self._leader_poll_retry.get(leader_id, (0.0, 0))[1] + 1
+        wait = self._poll_retry_after(exc, failures)
+        self._leader_poll_retry[leader_id] = (time.monotonic() + wait, failures)
+        return wait
+
+    def _poll_paused_for(self, leader_id: int) -> float:
+        """Seconds left on this leader's backoff, 0 when it may poll now."""
+        next_try = self._leader_poll_retry.get(leader_id, (0.0, 0))[0]
+        return max(0.0, next_try - time.monotonic())
 
     def _buy_signal_reason(self, event, price_range: PriceRange = DEFAULT_RANGE):
         if event.side != "BUY":
