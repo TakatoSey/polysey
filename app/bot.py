@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import re
 from collections import Counter
@@ -9,7 +10,12 @@ from decimal import Decimal, InvalidOperation
 
 import structlog
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -46,7 +52,7 @@ from .repository import (
     get_execution_policy,
     get_leaders,
     get_or_create_account,
-    orders,
+    orders_page,
     positions,
     remove_leader,
 )
@@ -655,8 +661,20 @@ class TelegramApp:
             ]
         )
 
-    async def _orders_text_v2(self, page: int = 0, status_filter: str = "all") -> str:
+    async def _orders_screen(self, page: int = 0, status_filter: str = "all"):
+        """Text and keyboard from one read, over the whole history."""
         async with SessionLocal() as session:
+            history = await orders_page(session, status_filter=status_filter, page=page)
+        return (
+            await self._orders_text_v2(history.page, status_filter, history),
+            self._orders_keyboard_v2(history.page, status_filter, history.pages),
+        )
+
+    async def _orders_text_v2(self, page: int = 0, status_filter: str = "all", history=None) -> str:
+        async with SessionLocal() as session:
+            if history is None:
+                history = await orders_page(session, status_filter=status_filter, page=page)
+            page, total_pages, rows = history.page, history.pages, history.rows
             pending = list(
                 (
                     await session.execute(
@@ -668,7 +686,6 @@ class TelegramApp:
                     )
                 ).all()
             )
-            rows: list[PaperOrder] = await orders(session)
             # One bounded lookup; source metadata survives settlement/deletion.
             metadata = {}
             token_ids = {row.token_id for row in rows}
@@ -708,16 +725,7 @@ class TelegramApp:
                 else []
             )
         trades_by_id = {trade.id: trade for trade in trades}
-        mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
-        filtered = [
-            r
-            for r in rows
-            if status_filter == "all" or r.status in mapping.get(status_filter, set())
-        ]
-        per_page = 8
-        total_pages = max(1, (len(filtered) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        current = filtered[page * per_page : (page + 1) * per_page]
+        current = rows
         labels = {
             "filled": "исполнен",
             "partial": "частично",
@@ -793,7 +801,7 @@ class TelegramApp:
                     + (" · комиссия по оценке" if row.fee_estimated else "")
                 )
         if total_pages > 1:
-            lines.append(f"\nСтраница {page + 1}/{total_pages}")
+            lines.append(f"\nСтраница {page + 1}/{total_pages} · всего {history.total}")
         return "\n".join(lines)
 
     async def _stats_text(self, hours: int = 24) -> str:
@@ -848,16 +856,7 @@ class TelegramApp:
             )
         return "\n".join(lines)
 
-    async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):
-        async with SessionLocal() as session:
-            rows = await orders(session)
-        mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
-        filtered_count = sum(
-            1
-            for r in rows
-            if status_filter == "all" or r.status in mapping.get(status_filter, set())
-        )
-        total_pages = max(1, (filtered_count + 7) // 8)
+    def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all", total_pages: int = 1):
         builder = InlineKeyboardBuilder()
         for label, key in [
             ("Все", "all"),
@@ -1027,11 +1026,8 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(
-            await self._orders_text_v2(0, "all"),
-            await self._orders_keyboard_v2(0, "all"),
-            message.chat.id,
-        )
+        text, keyboard = await self._orders_screen(0, "all")
+        await self._edit_panel(text, keyboard, message.chat.id)
 
     async def settings_cmd(self, message: Message) -> None:
         if not self._allowed(message):
@@ -1431,11 +1427,8 @@ class TelegramApp:
             parts = data.split(":")
             page = int(parts[1]) if len(parts) > 1 and parts[1] else 0
             status_filter = parts[2] if len(parts) > 2 else "all"
-            await self._edit_panel(
-                await self._orders_text_v2(page, status_filter),
-                await self._orders_keyboard_v2(page, status_filter),
-                chat_id,
-            )
+            text, keyboard = await self._orders_screen(page, status_filter)
+            await self._edit_panel(text, keyboard, chat_id)
         elif data.startswith("position:"):
             _, raw_id, raw_page = data.split(":")
             builder = InlineKeyboardBuilder()
@@ -1622,9 +1615,35 @@ class TelegramApp:
                 await session.commit()
             await self._leaders_panel(page, chat_id)
 
-    async def notify_loop(self) -> None:
-        while True:
-            message = await self.engine.notifications.get()
+    MESSAGE_LIMIT = 3500  # Telegram caps a message at 4096 characters.
+    SEND_ATTEMPTS = 4
+
+    def _drain_notifications(self, first: str) -> str:
+        """Send one message per burst instead of one per copied trade.
+
+        Telegram rate-limits per chat, so a burst of copies is exactly when a
+        notification gets refused and lost. Joining what is already queued
+        keeps the content and makes far fewer requests.
+        """
+        batch = [first]
+        length = len(first)
+        while not self.engine.notifications.empty():
+            queued = self.engine.notifications.get_nowait()
+            if length + len(queued) + 16 > self.MESSAGE_LIMIT:
+                # Does not fit: hand it back rather than truncate a trade.
+                self.engine.notifications.put_nowait(queued)
+                break
+            batch.append(queued)
+            length += len(queued) + 16
+        return "\n\n➖➖➖\n\n".join(batch)
+
+    async def _send_notification(self, message: str) -> bool:
+        """Deliver a trade notification, honouring Telegram's own backoff.
+
+        A dropped one cannot be reconstructed from anywhere: the order history
+        holds the trade, not the message.
+        """
+        for attempt in range(self.SEND_ATTEMPTS):
             try:
                 await self.bot.send_message(
                     self.settings.telegram_allowed_user_id,
@@ -1632,8 +1651,37 @@ class TelegramApp:
                     parse_mode="HTML",
                     link_preview_options=LinkPreviewOptions(is_disabled=True),
                 )
+                return True
+            except TelegramRetryAfter as exc:
+                # Telegram states the wait; anything shorter is refused again.
+                wait = min(float(exc.retry_after) + 0.5, 60.0)
+                log.warning("telegram_rate_limited", retry_after=wait, attempt=attempt + 1)
+            except (TelegramNetworkError, TelegramServerError) as exc:
+                wait = min(2.0**attempt, 15.0)
+                log.warning(
+                    "telegram_send_retrying",
+                    error=type(exc).__name__,
+                    retry_seconds=wait,
+                    attempt=attempt + 1,
+                )
             except Exception:
+                # A malformed or rejected message will not become valid later.
                 log.exception("telegram_notification_failed")
+                return False
+            if attempt + 1 < self.SEND_ATTEMPTS:
+                await asyncio.sleep(wait)
+        log.error("telegram_notification_dropped", characters=len(message))
+        return False
+
+    async def notify_loop(self) -> None:
+        while True:
+            first = await self.engine.notifications.get()
+            await self._send_notification(self._drain_notifications(first))
 
     async def run(self) -> None:
         await self.dp.start_polling(self.bot)
+
+    async def close(self) -> None:
+        """Release the Telegram HTTP session on shutdown."""
+        with contextlib.suppress(Exception):
+            await self.bot.session.close()

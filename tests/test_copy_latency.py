@@ -481,3 +481,73 @@ def test_an_artificial_delay_is_not_counted_as_our_own_work(rig):
 
 def replace_setting(settings, **changes):
     return SimpleNamespace(**{**settings.model_dump(), **changes})
+
+
+class RateLimited(Exception):
+    """Shaped like an httpx error: the engine must not depend on the library."""
+
+    def __init__(self, retry_after=None):
+        super().__init__("429 Too Many Requests")
+        headers = {"retry-after": retry_after} if retry_after is not None else {}
+        self.response = SimpleNamespace(status_code=429, headers=headers)
+
+
+@pytest.mark.parametrize(
+    "error, failures, expected",
+    [
+        (RateLimited("7"), 1, 7.0),
+        (RateLimited("0"), 1, 0.5),  # never a busy loop
+        (RateLimited("999"), 1, 30.0),  # nor an unbounded stall
+        (RateLimited("soon"), 1, 5.0),
+        (RateLimited(), 2, 10.0),
+        (RuntimeError("connection reset"), 1, 1.0),
+        (RuntimeError("connection reset"), 3, 4.0),
+        (RuntimeError("connection reset"), 9, 15.0),
+    ],
+)
+def test_poll_backoff_prefers_the_servers_own_number(error, failures, expected):
+    assert CopyEngine._poll_retry_after(error, failures) == expected
+
+
+async def test_a_rate_limited_leader_waits_while_the_others_keep_their_cadence(rig):
+    first, second = "0x" + "1" * 40, "0x" + "2" * 40
+    polled = []
+
+    async def activity(address, limit=500):
+        polled.append(address)
+        if address == first:
+            raise RateLimited("7")
+        return []
+
+    rig.client.get_activity = AsyncMock(side_effect=activity)
+
+    await rig.engine.poll_once()
+    assert sorted(polled) == [first, second]
+
+    polled.clear()
+    await rig.engine.poll_once()
+    # Hammering an endpoint that just answered 429 is what keeps it 429. The
+    # healthy leader is untouched, so detection for them does not slow down.
+    assert polled == [second]
+
+    rig.client.get_activity = AsyncMock(return_value=[])
+    rig.engine._leader_poll_retry[1] = (0.0, 3)  # its wait has elapsed
+    await rig.engine.poll_once()
+    # One good response clears it: no lingering slowdown after recovery.
+    assert 1 not in rig.engine._leader_poll_retry
+    assert rig.client.get_activity.await_count == 2
+
+
+async def test_backoff_never_touches_execution_requests(rig):
+    rig.client.get_activity = AsyncMock(side_effect=RateLimited("30"))
+    await rig.engine.poll_once()
+    assert rig.engine._poll_paused_for(1) > 0
+
+    # A trade already detected still executes at full speed: the wait belongs
+    # to that leader's activity poll, not to the book or the fill.
+    rig.engine._schedule_copy(1, activity("copy-during-backoff"))
+    await drain(rig.engine)
+    async with rig.sessions() as session:
+        order = await session.scalar(select(PaperOrder))
+        assert order.filled_shares > 0
+    rig.client.get_book.assert_awaited()
