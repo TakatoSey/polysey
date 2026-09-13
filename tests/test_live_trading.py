@@ -65,13 +65,13 @@ class FakeClob:
         self.calls.append(("neg_risk", token_id))
         return False
 
-    def get_fee_rate_bps(self, token_id):
+    def get_fee_exponent(self, token_id):
         self.calls.append(("fee", token_id))
         return 0
 
     def create_market_order(self, args, options=None):
         self.calls.append(("create", args.side, args.token_id, args.amount, args.price))
-        return SimpleNamespace(order="signed", args=args)
+        return SimpleNamespace(order="signed", args=args, timestamp="123", metadata="0x00")
 
     def post_order(self, order, order_type=None):
         self.posted.append((order, order_type))
@@ -88,7 +88,7 @@ class FakeClob:
         self.calls.append(("trades", getattr(params, "id", None)))
         return self.answers.get("trades", [])
 
-    def get_orders(self):
+    def get_open_orders(self):
         return self.answers.get("open_orders", [])
 
     def cancel_all(self):
@@ -209,8 +209,22 @@ async def test_an_accepted_order_without_amounts_is_confirmed_from_the_exchange(
     trader, clob = await trader_for(
         monkeypatch,
         post={"success": True, "orderID": "0xabc", "status": "live"},
-        order={"status": "MATCHED", "size_matched": "8", "price": "0.55"},
-        trades=[{"size": "5", "price": "0.50", "fee": "0.01"}, {"size": "3", "price": "0.60"}],
+        order={
+            "status": "MATCHED",
+            "size_matched": "8",
+            "price": "0.55",
+            "associate_trades": ["trade1", "trade2"],
+        },
+        trades=[
+            {
+                "id": "trade1",
+                "taker_order_id": "0xabc",
+                "size": "5",
+                "price": "0.50",
+                "fee": "0.01",
+            },
+            {"id": "trade2", "taker_order_id": "0xabc", "size": "3", "price": "0.60"},
+        ],
     )
 
     order = await trader.buy("token", D(5), D("0.60"))
@@ -753,7 +767,7 @@ async def test_the_preflight_reports_what_is_missing_without_signing(monkeypatch
     # The log line the trader emits on start comes first; the report is the JSON.
     report = json.loads(printed[printed.index("{") :])
     assert code == 2  # a usable configuration would be 0
-    assert report["usdc_balance"] == "5"
+    assert report["pusd_balance"] == "5"
     assert report["ready_for_live"] is False
     # No allowance is the classic "orders accepted, nothing settles" trap.
     assert any("allowance" in problem for problem in report["blocking_problems"])

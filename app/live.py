@@ -25,7 +25,7 @@ from .config import Settings
 log = structlog.get_logger(__name__)
 
 ZERO = Decimal(0)
-# Fills are settled in USDC with six decimals; shares carry more.
+# pUSD collateral and conditional token balances use six decimals.
 CASH = Decimal("0.000001")
 
 
@@ -40,14 +40,14 @@ def build_client(settings: Settings):
     exchange: nothing below this line knows how the client was created.
     """
     try:
-        from py_clob_client.client import ClobClient
+        from py_clob_client_v2.client import ClobClient
     except ImportError as exc:  # pragma: no cover - depends on the install
         raise LiveTradingUnavailable(
-            "py-clob-client is not installed: pip install '.[live]'"
+            "py-clob-client-v2 is not installed: pip install '.[live]'"
         ) from exc
 
     client = ClobClient(
-        settings.clob_api,
+        host=settings.clob_api,
         chain_id=settings.polygon_chain_id,
         key=settings.polymarket_private_key,
         signature_type=settings.polymarket_signature_type,
@@ -55,8 +55,21 @@ def build_client(settings: Settings):
     )
     # Level 2 credentials are derived from the key itself, so the same wallet
     # always yields the same API key without a secret to store.
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client.set_api_creds(client.create_or_derive_api_key())
     return client
+
+
+def contract_addresses(chain_id: int) -> dict[str, str]:
+    """Use the pinned V2 SDK configuration, never its legacy exchange fields."""
+    from py_clob_client_v2.config import get_contract_config
+
+    config = get_contract_config(chain_id)
+    return {
+        "collateral_contract": config.collateral,
+        "conditional_tokens_contract": config.conditional_tokens,
+        "exchange_contract": config.exchange_v2,
+        "neg_risk_exchange_contract": config.neg_risk_exchange_v2,
+    }
 
 
 def _decimal(value, default: Decimal | None = ZERO) -> Decimal | None:
@@ -146,7 +159,7 @@ class LiveTrader:
             signer=self._account.signer,
             funder=self._account.funder,
             signature_type=self._account.signature_type,
-            usdc=str(cash),
+            pusd=str(cash),
             allowance=str(allowance),
             order_type=self._order_type,
             dry_run=self.settings.live_dry_run,
@@ -156,9 +169,9 @@ class LiveTrader:
             # orders are accepted and then fail to settle.
             log.warning(
                 "live_allowance_below_balance",
-                usdc=str(cash),
+                pusd=str(cash),
                 allowance=str(allowance),
-                hint="approve USDC for the exchange once from the Polymarket UI",
+                hint="check pUSD allowances for the V2 exchanges and the configured funding wallet",
             )
         return self._account
 
@@ -177,28 +190,42 @@ class LiveTrader:
     # ------------------------------------------------------------- exchange state
 
     async def _collateral(self) -> tuple[Decimal, Decimal]:
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         raw = await asyncio.to_thread(self._require().get_balance_allowance, params)
-        return self._usdc(raw, "balance"), self._usdc(raw, "allowance")
+        if not isinstance(raw, dict) or _decimal(raw.get("balance"), None) is None:
+            raise LiveTradingUnavailable("invalid collateral balance response")
+        allowances = raw.get("allowances")
+        if isinstance(allowances, dict):
+            addresses = contract_addresses(self.settings.polygon_chain_id)
+            normalized = {str(k).lower(): v for k, v in allowances.items()}
+            # Both market routes must be usable; old V1 allowances do not count.
+            values = [
+                self._usdc({"allowance": normalized.get(addresses[key].lower(), 0)}, "allowance")
+                for key in ("exchange_contract", "neg_risk_exchange_contract")
+            ]
+            allowance = min(values)
+        else:
+            allowance = self._usdc(raw, "allowance")
+        return self._usdc(raw, "balance"), allowance
 
     @staticmethod
     def _usdc(raw, key: str) -> Decimal:
-        """USDC is reported in its smallest unit; six decimals, not a float."""
+        """pUSD/conditional balances are reported in six-decimal base units."""
         if not isinstance(raw, dict):
             return ZERO
         amount = _decimal(raw.get(key))
         return (amount or ZERO) / Decimal(10**6)
 
     async def cash(self) -> Decimal:
-        """Free USDC according to the exchange."""
+        """pUSD balance reported by the exchange."""
         balance, _allowance = await self._collateral()
         return balance
 
     async def token_shares(self, token_id: str) -> Decimal:
         """Shares of one outcome according to the exchange."""
-        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
 
         params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
         raw = await asyncio.to_thread(self._require().get_balance_allowance, params)
@@ -237,7 +264,7 @@ class LiveTrader:
         return found
 
     async def open_orders(self) -> list[dict]:
-        orders = await asyncio.to_thread(self._require().get_orders)
+        orders = await asyncio.to_thread(self._require().get_open_orders)
         return [row for row in orders or [] if isinstance(row, dict)]
 
     async def cancel_all(self) -> dict:
@@ -261,9 +288,11 @@ class LiveTrader:
         client = self._client
 
         def load():
+            # This public call fills V2 market-info/fee caches, unlike the V1
+            # fee-rate-bps call. Tick/neg-risk are populated by that same lookup.
+            client.get_fee_exponent(token_id)
             client.get_tick_size(token_id)
             client.get_neg_risk(token_id)
-            client.get_fee_rate_bps(token_id)
 
         try:
             await asyncio.to_thread(load)
@@ -301,7 +330,7 @@ class LiveTrader:
         price_limit: Decimal,
         neg_risk: bool | None,
     ) -> LiveOrder:
-        from py_clob_client.clob_types import MarketOrderArgs, PartialCreateOrderOptions
+        from py_clob_client_v2.clob_types import MarketOrderArgs, PartialCreateOrderOptions
 
         client = self._require()
         if side not in {"BUY", "SELL"}:
@@ -316,6 +345,9 @@ class LiveTrader:
             # compute one, and is the only thing bounding what we pay.
             price=float(price_limit),
             order_type=self._order_type,
+            # SDK field retains the old name, but this is an all-in pUSD cap.
+            # Reserve dynamic V2 fees within OUR budget, not the whole wallet.
+            user_usdc_balance=float(amount) if side == "BUY" else 0,
         )
         # Tick size is deliberately left to the client's cached value: it is the
         # market's own minimum, and a smaller one is refused outright.
@@ -324,13 +356,14 @@ class LiveTrader:
         try:
             if self.settings.live_dry_run:
                 signed = await asyncio.to_thread(client.create_market_order, args, options)
+                self._check_v2_signature(signed)
                 log.warning(
                     "live_dry_run_order",
                     side=side,
                     token_id=token_id,
                     amount=str(amount),
                     price_limit=str(price_limit),
-                    order=str(signed)[:400],
+                    signature_type=self.settings.polymarket_signature_type,
                 )
                 return LiveOrder(
                     submitted=False,
@@ -341,6 +374,7 @@ class LiveTrader:
 
             def sign_and_post():
                 signed = client.create_market_order(args, options)
+                self._check_v2_signature(signed)
                 return client.post_order(signed, self._order_type)
 
             raw = await asyncio.to_thread(sign_and_post)
@@ -381,6 +415,11 @@ class LiveTrader:
             order = await self.confirm(order)
         return order
 
+    @staticmethod
+    def _check_v2_signature(signed) -> None:
+        if not hasattr(signed, "timestamp") or not hasattr(signed, "metadata"):
+            raise LiveTradingUnavailable("refusing legacy/non-V2 signed order")
+
     def _parse_submit(self, raw, side: str, submit_ms: float) -> LiveOrder:
         if not isinstance(raw, dict):
             return LiveOrder(submitted=False, error="unreadable_exchange_response")
@@ -401,7 +440,7 @@ class LiveTrader:
         taking = _decimal(raw.get("takingAmount"), None)
         shares = notional = None
         if making is not None and taking is not None:
-            # Maker pays, taker receives: for our BUY we pay USDC and receive
+            # Maker pays, taker receives: for our BUY we pay pUSD and receive
             # shares, for our SELL it is the other way round.
             shares, notional = (taking, making) if side == "BUY" else (making, taking)
         if shares is None or notional is None or shares < 0 or notional < 0:
@@ -444,24 +483,16 @@ class LiveTrader:
                 status = str(raw.get("status") or order.status)
                 matched = _decimal(raw.get("size_matched"), None)
                 if matched is not None and matched > 0:
-                    price, fee = await self._traded_price(order.order_id)
+                    trade_ids = raw.get("associate_trades") or order.raw.get("tradeIDs") or []
+                    price, fee = await self._traded_price(order.order_id, trade_ids, matched)
                     if price is None:
-                        # The order's own price is the limit it matched within.
-                        # Better than inventing one, and the cash reconciliation
-                        # against the exchange corrects the difference.
-                        price = _decimal(raw.get("price"), None)
-                        if price is None or price <= 0:
-                            log.warning(
-                                "live_fill_price_unknown",
-                                order_id=order.order_id,
-                                matched=str(matched),
-                            )
-                            return order
                         log.warning(
-                            "live_fill_price_from_order_limit",
+                            "live_fill_price_unknown",
                             order_id=order.order_id,
-                            price=str(price),
+                            matched=str(matched),
                         )
+                        # A limit is not a fill price. Keep reconciliation pending.
+                        return order
                     return LiveOrder(
                         submitted=True,
                         order_id=order.order_id,
@@ -490,23 +521,39 @@ class LiveTrader:
         log.warning("live_order_unconfirmed", order_id=order.order_id, status=order.status)
         return order
 
-    async def _traded_price(self, order_id: str) -> tuple[Decimal | None, Decimal]:
+    async def _traded_price(
+        self, order_id: str, trade_ids: list, expected_shares: Decimal
+    ) -> tuple[Decimal | None, Decimal]:
         """Size-weighted price and fee of the trades behind one order.
 
         None when the exchange has not reported them: a fill is never recorded
         at a price nobody quoted.
         """
-        from py_clob_client.clob_types import TradeParams
+        from py_clob_client_v2.clob_types import TradeParams
 
+        if not isinstance(trade_ids, list) or not trade_ids:
+            return None, ZERO
         try:
-            trades = await asyncio.to_thread(self._require().get_trades, TradeParams(id=order_id))
+            pages = await asyncio.gather(
+                *(
+                    asyncio.to_thread(self._require().get_trades, TradeParams(id=trade_id))
+                    for trade_id in dict.fromkeys(str(t) for t in trade_ids)
+                )
+            )
         except Exception as exc:
             log.info("live_trades_unavailable", order_id=order_id, error=type(exc).__name__)
             return None, ZERO
         shares = notional = fee = ZERO
-        for trade in trades or []:
+        seen = set()
+        for trade in [row for page in pages for row in page or []]:
             if not isinstance(trade, dict):
                 continue
+            trade_id = trade.get("id")
+            if not trade_id or trade_id in seen or trade.get("taker_order_id") != order_id:
+                continue
+            seen.add(trade_id)
+            if str(trade.get("status", "")).upper() == "FAILED":
+                return None, ZERO
             size = _decimal(trade.get("size")) or ZERO
             price = _decimal(trade.get("price")) or ZERO
             if size <= 0 or price <= 0:
@@ -514,6 +561,6 @@ class LiveTrader:
             shares += size
             notional += size * price
             fee += _decimal(trade.get("fee")) or ZERO
-        if shares <= 0:
+        if shares <= 0 or abs(shares - expected_shares) > CASH:
             return None, ZERO
         return notional / shares, fee.quantize(CASH)

@@ -281,7 +281,7 @@ class TelegramApp:
                 f"Режим: адаптивный · {self.settings.copy_balance_pct * 100:.1f}% базы\n"
                 f"Статистика: {ready_count}/{active_count}\n"
             )
-        balance_label = "USDC на бирже" if self.live else "Баланс"
+        balance_label = "pUSD на бирже" if self.live else "Баланс"
         start_note = "" if self.live else f" · старт ${account.starting_balance:.2f}"
         text = (
             f"<b>POLYSEY</b> · {self._mode_badge()}\n\n"

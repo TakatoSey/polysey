@@ -93,12 +93,13 @@ class Settings(BaseSettings):
     # A deliberate, typed acknowledgement. Live mode refuses to start without it.
     live_confirm: str | None = Field(default=None, alias="LIVE_CONFIRM")
     polymarket_private_key: str | None = Field(default=None, alias="POLYMARKET_PRIVATE_KEY")
-    # The wallet that holds the USDC. For a Polymarket proxy wallet this is the
+    # The wallet that holds pUSD. For a Polymarket proxy wallet this is the
     # proxy address, not the address of the signing key.
     polymarket_funder: str | None = Field(default=None, alias="POLYMARKET_FUNDER")
-    # 0 = EOA signs for itself, 1 = email/Magic proxy wallet, 2 = browser-wallet
-    # proxy. The wrong value produces orders the exchange rejects.
-    polymarket_signature_type: int = Field(default=1, ge=0, le=2, alias="POLYMARKET_SIGNATURE_TYPE")
+    # 0 = EOA, 1 = legacy POLY_PROXY, 2 = Gnosis Safe.
+    # Login method alone does not identify the funding wallet type.
+    # 3 = Deposit Wallet (POLY_1271), using an authorized signer.
+    polymarket_signature_type: int = Field(default=1, ge=0, le=3, alias="POLYMARKET_SIGNATURE_TYPE")
     polygon_chain_id: int = Field(default=137, alias="POLYGON_CHAIN_ID")
     # FAK keeps paper's behaviour: take what is available now, cancel the rest.
     live_order_type: str = Field(default="FAK", alias="LIVE_ORDER_TYPE")
@@ -142,11 +143,11 @@ class Settings(BaseSettings):
         if not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", key):
             problems.append("POLYMARKET_PRIVATE_KEY must be a 32-byte hex key")
         funder = (self.polymarket_funder or "").strip()
-        if self.polymarket_signature_type in (1, 2) and not re.fullmatch(
+        if self.polymarket_signature_type in (1, 2, 3) and not re.fullmatch(
             r"0x[0-9a-fA-F]{40}", funder
         ):
             problems.append(
-                "POLYMARKET_FUNDER must be the proxy wallet address for "
+                "POLYMARKET_FUNDER must be the funding wallet address for "
                 f"POLYMARKET_SIGNATURE_TYPE={self.polymarket_signature_type}"
             )
         if self.live_order_type.upper() not in {"FAK", "FOK"}:

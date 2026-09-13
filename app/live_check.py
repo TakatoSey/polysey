@@ -1,9 +1,8 @@
 """Read-only live-trading preflight: python -m app.live_check [TOKEN_ID]
 
-Signs nothing and sends no order. It answers the questions that decide whether
-live mode will work at all: which wallet is signing, which wallet holds the
-money, whether the exchange can move that money, and what the exchange itself
-says its contract addresses and this market's order rules are.
+Sends no trading order. It signs API-authentication challenges and reads the
+wallet balance and permissions. Contract addresses come from the pinned SDK;
+an optional market check reads current exchange order rules.
 
 Run it on the VPS before switching TRADING_MODE to live, and again after any
 change to the key, the funder or the signature type.
@@ -14,7 +13,7 @@ import asyncio
 import json
 
 from .config import LIVE_ACKNOWLEDGEMENT, get_settings
-from .live import LiveTrader, LiveTradingUnavailable
+from .live import LiveTrader, LiveTradingUnavailable, contract_addresses
 
 
 async def check(token_id: str | None) -> int:
@@ -25,6 +24,9 @@ async def check(token_id: str | None) -> int:
         "signature_type": settings.polymarket_signature_type,
         "chain_id": settings.polygon_chain_id,
         "clob": settings.clob_api,
+        "collateral_symbol": "pUSD",
+        "sdk": "py-clob-client-v2",
+        **contract_addresses(settings.polygon_chain_id),
     }
     problems = settings.live_problems()
     if not settings.live:
@@ -44,37 +46,44 @@ async def check(token_id: str | None) -> int:
     trader = LiveTrader(settings)
     try:
         account = await trader.start()
-    except LiveTradingUnavailable as exc:
-        report["error"] = str(exc)
+    except Exception as exc:
+        report["error"] = (
+            str(exc) if isinstance(exc, LiveTradingUnavailable) else type(exc).__name__
+        )
+        report["ready_for_live"] = False
+        await trader.close()
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 1
     client = trader._client  # noqa: SLF001 - a preflight legitimately looks inside
     report.update(
         signer=account.signer,
         funder=account.funder,
-        usdc_balance=str(account.cash),
+        collateral_balance=str(account.cash),
+        pusd_balance=str(account.cash),
         exchange_allowance=str(account.allowance),
-        collateral_contract=await asyncio.to_thread(client.get_collateral_address),
-        conditional_tokens_contract=await asyncio.to_thread(client.get_conditional_address),
-        exchange_contract=await asyncio.to_thread(client.get_exchange_address, False),
-        neg_risk_exchange_contract=await asyncio.to_thread(client.get_exchange_address, True),
-        server_ok=await asyncio.to_thread(client.get_ok),
     )
     verdict = []
+    try:
+        report["server_ok"] = await asyncio.to_thread(client.get_ok)
+    except Exception as exc:
+        report["server_error"] = type(exc).__name__
+        verdict.append("CLOB health query failed")
     if account.cash <= 0:
-        verdict.append("no USDC in the funding wallet: nothing can be bought")
+        verdict.append(
+            "CLOB reports zero pUSD for this wallet/signature configuration; "
+            "verify wallet type and funder"
+        )
     if account.allowance <= 0:
         verdict.append(
             "the exchange has no allowance over the collateral: orders would be "
-            "accepted and then fail to settle. Trade once in the Polymarket UI "
-            "with this wallet, or approve USDC for the exchange contract above."
+            "unable to execute. Check pUSD approval for the V2 exchanges shown above."
         )
     elif account.allowance < account.cash:
         verdict.append(
             f"allowance {account.allowance} is below the balance {account.cash}: "
             "only part of the balance is usable"
         )
-    if account.signature_type in (1, 2) and account.signer == account.funder:
+    if account.signature_type in (1, 2, 3) and account.signer == account.funder:
         verdict.append(
             "signature type expects a proxy wallet, but the funder equals the "
             "signer. Check POLYMARKET_FUNDER against the address shown in the "
@@ -86,7 +95,7 @@ async def check(token_id: str | None) -> int:
                 "token_id": token_id,
                 "tick_size": await asyncio.to_thread(client.get_tick_size, token_id),
                 "neg_risk": await asyncio.to_thread(client.get_neg_risk, token_id),
-                "fee_rate_bps": await asyncio.to_thread(client.get_fee_rate_bps, token_id),
+                "fee_exponent": await asyncio.to_thread(client.get_fee_exponent, token_id),
                 "shares_held": str(await trader.token_shares(token_id)),
             }
         except Exception as exc:
@@ -96,10 +105,14 @@ async def check(token_id: str | None) -> int:
         open_orders = await trader.open_orders()
         report["open_orders"] = len(open_orders)
     except Exception as exc:
-        report["open_orders_error"] = str(exc)
+        report["open_orders_error"] = type(exc).__name__
+        verdict.append("authenticated open-order query failed")
     await trader.close()
     report["blocking_problems"] = verdict
     report["ready_for_live"] = not verdict
+    report["readiness_scope"] = (
+        "balance/allowance/API reads only; order signature and settlement not tested"
+    )
     print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
     return 0 if not verdict else 2
 

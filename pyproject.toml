@@ -21,7 +21,7 @@ build-backend = "setuptools.build_meta"
 [project.optional-dependencies]
 test = ["pytest>=8,<10", "pytest-asyncio>=0.24,<2", "aiosqlite>=0.20,<1", "ruff>=0.9,<1"]
 # Only TRADING_MODE=live needs these: order signing and the CLOB auth flow.
-live = ["py-clob-client==0.34.6"]
+live = ["py-clob-client-v2==1.1.0"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]
