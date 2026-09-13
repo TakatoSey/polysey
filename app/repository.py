@@ -10,6 +10,7 @@ from .models import (
     Account,
     CopyTrade,
     ExecutionPolicy,
+    InstanceClaim,
     Leader,
     LeaderPosition,
     LeaderSizingProfile,
@@ -37,6 +38,50 @@ async def get_or_create_account(
     session.add(account)
     await session.flush()
     return account
+
+
+class DatabaseBelongsToAnotherBot(RuntimeError):
+    """This database was claimed by a bot in a different mode or wallet."""
+
+
+async def claim_database(session, settings) -> InstanceClaim:
+    """Bind this database to one trading mode and one funding wallet.
+
+    Paper and live must never share a database: the paper ledger's money is
+    invented, and sizing a real order against it would spend money that does
+    not exist. A mode change is allowed only while nothing has been recorded
+    yet, which is exactly the case for a fresh database.
+    """
+    mode = "live" if settings.live else "paper"
+    funder = (settings.polymarket_funder or "").lower() if settings.live else ""
+    claim = await session.get(InstanceClaim, 1)
+    if claim is None:
+        claim = InstanceClaim(id=1, trading_mode=mode, funder=funder)
+        session.add(claim)
+        await session.flush()
+        return claim
+    if claim.trading_mode != mode:
+        traded = await session.scalar(select(CopyTrade.id).limit(1)) or await session.scalar(
+            select(PaperOrder.id).limit(1)
+        )
+        if traded:
+            raise DatabaseBelongsToAnotherBot(
+                f"this database already holds {claim.trading_mode} history, and "
+                f"TRADING_MODE is now {mode}. A live bot needs its own database "
+                "and its own Telegram bot: see docs/live-trading.md. Point "
+                "DATABASE_URL at a separate database, or wipe this one first."
+            )
+        claim.trading_mode, claim.funder = mode, funder
+        return claim
+    if mode == "live" and claim.funder and funder and claim.funder != funder:
+        raise DatabaseBelongsToAnotherBot(
+            f"this database belongs to funding wallet {claim.funder}, but "
+            f"POLYMARKET_FUNDER is now {funder}. Two wallets must not share one "
+            "ledger: attribution and reconciliation would mix them."
+        )
+    if mode == "live" and not claim.funder:
+        claim.funder = funder
+    return claim
 
 
 async def get_execution_policy(session, settings):
@@ -164,12 +209,16 @@ async def apply_fill(
     account: Account,
     *,
     cost_to_release: Decimal | None = None,
+    executed_elsewhere: bool = False,
 ) -> None:
     position = await get_position(session, token_id)
     if side == "BUY":
         total_cost = fill.notional + fill.fee
-        if account.paper_balance < total_cost:
+        if account.paper_balance < total_cost and not executed_elsewhere:
             raise ValueError("insufficient_balance")
+        # A live order the exchange already filled has spent real money. The
+        # ledger has to record it even if its own cash figure lagged behind;
+        # the next exchange read replaces that figure anyway.
         account.paper_balance -= total_cost
         if not position:
             position = Position(

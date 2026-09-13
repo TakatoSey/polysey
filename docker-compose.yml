@@ -3,13 +3,18 @@ services:
     image: postgres:17-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_DB: polycopy
-      POSTGRES_USER: polycopy
-      POSTGRES_PASSWORD: polycopy
+      # Defaults keep an existing paper installation working untouched. A live
+      # instance overrides these in its own .env so the two never share a
+      # database: a paper ledger holds invented money.
+      POSTGRES_DB: ${POSTGRES_DB:-polycopy}
+      POSTGRES_USER: ${POSTGRES_USER:-polycopy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-polycopy}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U polycopy -d polycopy"]
+      test:
+        - CMD-SHELL
+        - pg_isready -U ${POSTGRES_USER:-polycopy} -d ${POSTGRES_DB:-polycopy}
       interval: 5s
       timeout: 5s
       retries: 10

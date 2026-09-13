@@ -8,9 +8,18 @@ from .bot import TelegramApp
 from .config import get_settings
 from .db import SessionLocal, init_db, single_process
 from .engine import CopyEngine
+from .executor import LiveExecutor, PaperExecutor
+from .live import LiveTrader, LiveTradingUnavailable
+from .live_state import LiveState
 from .logging import configure_logging
 from .polymarket import PolymarketClient
-from .repository import add_leader, get_leader, get_or_create_account, initialize_execution
+from .repository import (
+    add_leader,
+    claim_database,
+    get_leader,
+    get_or_create_account,
+    initialize_execution,
+)
 from .rtds import RTDSTradeStream
 
 log = structlog.get_logger(__name__)
@@ -50,9 +59,49 @@ def _request_stop(stopping: asyncio.Event, signal_name: str) -> None:
     stopping.set()
 
 
+async def start_live(settings, client):
+    """Bring up real trading, or refuse to start at all.
+
+    A misconfigured live bot must not fall back to paper: it would look like it
+    is trading while it is not, which is the one failure nobody notices.
+    """
+    trader = LiveTrader(settings)
+    try:
+        account = await trader.start()
+    except LiveTradingUnavailable as exc:
+        log.error("live_trading_unavailable", error=str(exc))
+        raise
+    state = LiveState(trader, client.http, settings)
+    snapshot = await state.start()
+    if not snapshot.read_ok:
+        await state.stop()
+        raise LiveTradingUnavailable(f"exchange state unavailable: {snapshot.error}")
+    log.warning(
+        "trading_mode",
+        mode="live",
+        note="REAL money orders are enabled",
+        funder=account.funder,
+        usdc=str(snapshot.cash),
+        positions=len(snapshot.positions),
+        max_order_usdc=str(settings.live_max_order_usdc),
+        max_daily_loss_usdc=str(settings.live_max_daily_loss_usdc),
+        dry_run=settings.live_dry_run,
+    )
+    return trader, state, LiveExecutor(trader, settings, state)
+
+
 async def run_bot(settings) -> None:
     await init_db()
     async with SessionLocal() as session:
+        # Before anything reads or writes money: this database must belong to
+        # this mode and this wallet.
+        claim = await claim_database(session, settings)
+        log.info(
+            "database_claim",
+            trading_mode=claim.trading_mode,
+            funder=claim.funder or None,
+            claimed_at=str(claim.claimed_at),
+        )
         # Initialize defaults before either the Telegram or trading loops start.
         # Existing account limits are intentionally preserved.
         await get_or_create_account(session, settings.paper_initial_balance, settings=settings)
@@ -65,7 +114,12 @@ async def run_bot(settings) -> None:
         await session.commit()
     client = PolymarketClient(settings)
     await client.start()
-    engine = CopyEngine(settings, client)
+    executor, live_state, trader = PaperExecutor(), None, None
+    if settings.live:
+        trader, live_state, executor = await start_live(settings, client)
+    else:
+        log.info("trading_mode", mode="paper", note="no real orders are sent")
+    engine = CopyEngine(settings, client, executor=executor, live_state=live_state)
     rtds = (
         RTDSTradeStream(engine.on_rtds_trade, engine.tracked_addresses)
         if settings.rtds_enabled
@@ -74,6 +128,8 @@ async def run_bot(settings) -> None:
     if rtds:
         await rtds.start()
     telegram = TelegramApp(settings, engine)
+    # Identity and exclusivity of the Telegram token before any worker starts.
+    await telegram.verify_identity()
     stopping = asyncio.Event()
     install_stop_handlers(stopping)
     workers = {
@@ -95,6 +151,10 @@ async def run_bot(settings) -> None:
         await asyncio.gather(*workers, waiter, return_exceptions=True)
         if rtds:
             await rtds.stop()
+        if live_state is not None:
+            await live_state.stop()
+        if trader is not None:
+            await trader.close()
         await client.close()
         await telegram.close()
         log.info("shutdown_complete")

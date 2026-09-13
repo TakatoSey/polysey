@@ -12,14 +12,17 @@ import structlog
 from aiogram import Bot, Dispatcher
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramConflictError,
     TelegramNetworkError,
     TelegramRetryAfter,
     TelegramServerError,
+    TelegramUnauthorizedError,
 )
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.methods import GetUpdates
 from aiogram.types import CallbackQuery, LinkPreviewOptions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import delete, func, select
@@ -122,6 +125,7 @@ class TelegramApp:
         "/risk TOKEN sl=0.2 tp=0.25 trail=0.1\n"
         "/addbalance 50 — пополнить paper-баланс\n"
         "/reset — стереть сделки и начать тест заново\n"
+        "/kill — снять ордера с биржи и остановить торговлю\n"
         "/pause · /resume"
     )
 
@@ -133,6 +137,27 @@ class TelegramApp:
         self.panel_message_id: int | None = None
         self._slugs: dict[str, tuple[str, str]] = {}
         self._register()
+
+    @property
+    def live(self) -> bool:
+        return bool(self.settings.live)
+
+    def _mode_badge(self) -> str:
+        if not self.live:
+            return "paper"
+        return "🔴 LIVE · dry-run" if self.settings.live_dry_run else "🔴 LIVE · реальные деньги"
+
+    def _live_health(self) -> str:
+        """What the exchange last told us, and how long ago."""
+        state = getattr(self.engine, "live_state", None)
+        snapshot = getattr(state, "snapshot", None)
+        if snapshot is None:
+            return ""
+        if not snapshot.read_ok:
+            return f"\n⚠️ Биржа недоступна: {html.escape(str(snapshot.error or 'нет данных'))}"
+        age = snapshot.age
+        mark = "" if age < 30 else " ⚠️"
+        return f"\nДанные биржи: {age:.0f} с назад{mark}"
 
     def _allowed(self, obj: Message | CallbackQuery) -> bool:
         return bool(obj.from_user and obj.from_user.id == self.settings.telegram_allowed_user_id)
@@ -256,14 +281,17 @@ class TelegramApp:
                 f"Режим: адаптивный · {self.settings.copy_balance_pct * 100:.1f}% базы\n"
                 f"Статистика: {ready_count}/{active_count}\n"
             )
+        balance_label = "USDC на бирже" if self.live else "Баланс"
+        start_note = "" if self.live else f" · старт ${account.starting_balance:.2f}"
         text = (
-            "<b>POLYSEY</b> · paper\n\n"
-            f"Баланс: <b>${account.paper_balance:.2f}</b> · старт ${account.starting_balance:.2f}\n"
+            f"<b>POLYSEY</b> · {self._mode_badge()}\n\n"
+            f"{balance_label}: <b>${account.paper_balance:.2f}</b>{start_note}\n"
             f"PNL: <b>{signed_money(account.realized_pnl)}</b>\n"
             f"Позиции: <b>{len(open_positions)}</b>\n"
             f"Трейдеры: <b>{active_count}</b> из {len(leaders)}\n"
             f"{sizing_status}"
             f"Статус: {state}"
+            f"{self._live_health()}"
             f"{cash_warning}"
         )
         await self._edit_panel(text, self._menu(account.paused), chat_id)
@@ -889,6 +917,25 @@ class TelegramApp:
             f"Резерв кэша: <b>{self.settings.min_cash_reserve_pct * 100:.0f}%</b> капитала\n"
             f"Slippage: <b>{policy.slippage_price * 100:.2f}¢</b>\n"
             f"Уведомления о покупках: <b>{'включены' if account.notify_buys else 'выключены'}</b>"
+            + self._live_settings_text()
+        )
+
+    def _live_settings_text(self) -> str:
+        if not self.live:
+            return "\n\n<b>Режим</b>\npaper · реальные ордера не отправляются"
+        return (
+            "\n\n<b>Режим · 🔴 LIVE</b>\n"
+            f"Максимум ордера: <b>${self.settings.live_max_order_usdc:.2f}</b>\n"
+            f"Лимит убытка в сутки: <b>${self.settings.live_max_daily_loss_usdc:.2f}</b>\n"
+            f"Тип ордера: <b>{html.escape(self.settings.live_order_type.upper())}</b>"
+            + (
+                "\nDry-run: ордера подписываются, но не отправляются"
+                if self.settings.live_dry_run
+                else ""
+            )
+            + "\nБаланс и позиции берутся с биржи; учёт сверяется с ней и при "
+            f"расхождении больше ${self.settings.live_drift_tolerance_usdc:.2f} "
+            "новые покупки останавливаются."
         )
 
     def _sizing_summary(self, account) -> str:
@@ -951,9 +998,11 @@ class TelegramApp:
             text="🔕 Не уведомлять о покупках" if notify_buys else "🔔 Уведомлять о покупках",
             callback_data="notify_buys_toggle",
         )
+        if self.live:
+            builder.button(text="⛔ Стоп торговли", callback_data="kill_prompt")
         builder.button(text="🧪 Сброс базы", callback_data="reset_prompt")
         builder.button(text="⬅️ На главную", callback_data="home")
-        builder.adjust(2, 2, 1, 1, 1)
+        builder.adjust(2, 2, 1, 1, 1, 1)
         return builder.as_markup()
 
     async def _settings_screen(self):
@@ -980,6 +1029,7 @@ class TelegramApp:
         self.dp.message.register(self.setslippage, Command("setslippage"))
         self.dp.message.register(self.addbalance, Command("addbalance"))
         self.dp.message.register(self.reset, Command("reset"))
+        self.dp.message.register(self.kill, Command("kill"))
         self.dp.message.register(self.toggle, Command("pause"))
         self.dp.message.register(self.toggle, Command("resume"))
         self.dp.message.register(self.receive_leader, StateFilter(LeaderForm.address))
@@ -1303,6 +1353,40 @@ class TelegramApp:
         await self._delete_input(message)
         await self._reset_prompt(message.chat.id)
 
+    async def kill(self, message: Message) -> None:
+        if not self._allowed(message):
+            return
+        await self._delete_input(message)
+        await self._kill_prompt(message.chat.id)
+
+    async def _kill_prompt(self, chat_id: int) -> None:
+        builder = InlineKeyboardBuilder()
+        builder.button(text="Да, остановить", callback_data="kill_confirm")
+        builder.button(text="Отмена", callback_data="settings")
+        await self._edit_panel(
+            "<b>Остановить торговлю?</b>\n"
+            "Открытые ордера снимаются с биржи, копирование ставится на паузу.\n\n"
+            "Открытые позиции остаются — их закрытие остаётся за тобой "
+            "(или за следующим сигналом лидера после снятия паузы).",
+            builder.as_markup(),
+            chat_id,
+        )
+
+    async def _kill_trading(self, chat_id: int) -> None:
+        """Pull our orders off the exchange and stop copying."""
+        report = await self.engine.executor.cancel_open_orders()
+        async with SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            account.paused = True
+            await session.commit()
+        log.warning("trading_killed", report=report)
+        await self._edit_panel(
+            f"⛔ <b>Торговля остановлена</b>\n{html.escape(report)}\n\n"
+            "Копирование на паузе. «▶️ Возобновить» на главной включает его снова.",
+            self._back(),
+            chat_id,
+        )
+
     async def _reset_prompt(self, chat_id: int) -> None:
         builder = InlineKeyboardBuilder()
         builder.button(text="Да, стереть", callback_data="reset_confirm")
@@ -1474,6 +1558,10 @@ class TelegramApp:
             await self._edit_panel(details.get(section, "Раздел не найден"), keyboard, chat_id)
         elif data == "stats":
             await self._edit_panel(await self._stats_text(), self._back(), chat_id)
+        elif data == "kill_prompt":
+            await self._kill_prompt(chat_id)
+        elif data == "kill_confirm":
+            await self._kill_trading(chat_id)
         elif data == "reset_prompt":
             await self._reset_prompt(chat_id)
         elif data == "reset_confirm":
@@ -1677,6 +1765,36 @@ class TelegramApp:
         while True:
             first = await self.engine.notifications.get()
             await self._send_notification(self._drain_notifications(first))
+
+    async def verify_identity(self) -> str:
+        """Name this bot, and refuse to share its token with another process.
+
+        aiogram retries a polling conflict forever instead of failing, so two
+        processes on one token quietly steal each other's updates and the panel
+        answers at random. A live bot must have its own token from @BotFather;
+        this is where that is enforced rather than trusted.
+        """
+        try:
+            me = await self.bot.get_me()
+        except TelegramUnauthorizedError as exc:
+            raise RuntimeError("TELEGRAM_BOT_TOKEN is not a valid bot token") from exc
+        try:
+            # A peek at the update queue: the API answers 409 while another
+            # process is long-polling this same token.
+            await self.bot(GetUpdates(offset=-1, limit=1, timeout=0))
+        except TelegramConflictError as exc:
+            raise RuntimeError(
+                f"another process is already polling @{me.username}. Each bot "
+                "instance needs its own token: create a separate bot in "
+                "@BotFather for live trading (see docs/live-trading.md)."
+            ) from exc
+        log.info(
+            "telegram_bot_identity",
+            username=me.username,
+            bot_id=me.id,
+            mode=self._mode_badge(),
+        )
+        return me.username or str(me.id)
 
     async def run(self) -> None:
         await self.dp.start_polling(self.bot)

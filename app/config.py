@@ -1,8 +1,12 @@
+import re
 from decimal import Decimal
 from functools import lru_cache
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Typed by hand into .env, so a live bot can never be started by accident.
+LIVE_ACKNOWLEDGEMENT = "I_UNDERSTAND_REAL_MONEY"
 
 
 class Settings(BaseSettings):
@@ -82,11 +86,72 @@ class Settings(BaseSettings):
     # Read-only compatibility with old .env files; new configurations should
     # use DEFAULT_SLIPPAGE_CENTS.
     default_slippage_bps: int | None = Field(default=None, alias="DEFAULT_SLIPPAGE_BPS")
+    # --- live trading: real money on the Polymarket CLOB ---
+    # "paper" simulates fills locally. "live" signs and submits real orders and
+    # takes cash, positions and fills from the exchange.
+    trading_mode: str = Field(default="paper", alias="TRADING_MODE")
+    # A deliberate, typed acknowledgement. Live mode refuses to start without it.
+    live_confirm: str | None = Field(default=None, alias="LIVE_CONFIRM")
+    polymarket_private_key: str | None = Field(default=None, alias="POLYMARKET_PRIVATE_KEY")
+    # The wallet that holds the USDC. For a Polymarket proxy wallet this is the
+    # proxy address, not the address of the signing key.
+    polymarket_funder: str | None = Field(default=None, alias="POLYMARKET_FUNDER")
+    # 0 = EOA signs for itself, 1 = email/Magic proxy wallet, 2 = browser-wallet
+    # proxy. The wrong value produces orders the exchange rejects.
+    polymarket_signature_type: int = Field(default=1, ge=0, le=2, alias="POLYMARKET_SIGNATURE_TYPE")
+    polygon_chain_id: int = Field(default=137, alias="POLYGON_CHAIN_ID")
+    # FAK keeps paper's behaviour: take what is available now, cancel the rest.
+    live_order_type: str = Field(default="FAK", alias="LIVE_ORDER_TYPE")
+    # Signs orders and logs them without sending anything to the exchange.
+    live_dry_run: bool = Field(default=False, alias="LIVE_DRY_RUN")
+    # Hard ceiling per submitted order, checked after every other sizing limit.
+    live_max_order_usdc: Decimal = Field(default=Decimal("25"), gt=0, alias="LIVE_MAX_ORDER_USDC")
+    # Realized loss since UTC midnight that stops new entries for the day.
+    live_max_daily_loss_usdc: Decimal = Field(
+        default=Decimal("25"), gt=0, alias="LIVE_MAX_DAILY_LOSS_USDC"
+    )
+    live_state_refresh_seconds: float = Field(
+        default=5.0, ge=1, le=120, alias="LIVE_STATE_REFRESH_SECONDS"
+    )
+    # Divergence between our ledger and the exchange that stops new entries
+    # rather than sizing them from numbers we no longer trust.
+    live_drift_tolerance_usdc: Decimal = Field(
+        default=Decimal("1"), ge=0, alias="LIVE_DRIFT_TOLERANCE_USDC"
+    )
+    clob_ws: str = Field(
+        default="wss://ws-subscriptions-clob.polymarket.com", alias="POLYMARKET_CLOB_WS"
+    )
     data_api: str = Field(default="https://data-api.polymarket.com", alias="POLYMARKET_DATA_API")
     clob_api: str = Field(default="https://clob.polymarket.com", alias="POLYMARKET_CLOB")
     gamma_api: str = Field(default="https://gamma-api.polymarket.com", alias="POLYMARKET_GAMMA")
     default_leader_address: str | None = Field(default=None, alias="DEFAULT_LEADER_ADDRESS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    @property
+    def live(self) -> bool:
+        return self.trading_mode.strip().lower() == "live"
+
+    def live_problems(self) -> list[str]:
+        """Everything missing before real orders may be signed, in one place."""
+        if not self.live:
+            return []
+        problems = []
+        if self.live_confirm != LIVE_ACKNOWLEDGEMENT:
+            problems.append(f"LIVE_CONFIRM must be exactly {LIVE_ACKNOWLEDGEMENT}")
+        key = (self.polymarket_private_key or "").strip()
+        if not re.fullmatch(r"(0x)?[0-9a-fA-F]{64}", key):
+            problems.append("POLYMARKET_PRIVATE_KEY must be a 32-byte hex key")
+        funder = (self.polymarket_funder or "").strip()
+        if self.polymarket_signature_type in (1, 2) and not re.fullmatch(
+            r"0x[0-9a-fA-F]{40}", funder
+        ):
+            problems.append(
+                "POLYMARKET_FUNDER must be the proxy wallet address for "
+                f"POLYMARKET_SIGNATURE_TYPE={self.polymarket_signature_type}"
+            )
+        if self.live_order_type.upper() not in {"FAK", "FOK"}:
+            problems.append("LIVE_ORDER_TYPE must be FAK or FOK")
+        return problems
 
 
 @lru_cache
