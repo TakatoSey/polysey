@@ -13,7 +13,7 @@ recorded is the one the exchange reports.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
 import structlog
 
@@ -24,10 +24,35 @@ from .price_limits import DEFAULT_RANGE, PriceRange
 log = structlog.get_logger(__name__)
 
 ZERO = Decimal(0)
+ONE = Decimal(1)
 
 
 def rejected(reason: str) -> Fill:
     return Fill(ZERO, ZERO, ZERO, ZERO, "rejected", reason)
+
+
+def snap_limit(price: Decimal, tick: Decimal, side: str) -> Decimal | None:
+    """Put a price limit onto the market's tick grid, never past our promise.
+
+    The exchange only quotes multiples of the tick, and the signing client
+    rounds a price to the tick's precision in whichever direction is nearest —
+    which for a buy can land above the limit our slippage rule allows. Snapping
+    it down ourselves (up, for a sell floor) keeps the promise exact and cannot
+    exclude a level that was within the limit, because levels sit on the grid.
+
+    None when no valid price exists on that side: the exchange accepts only
+    prices between one tick and one tick below a dollar.
+    """
+    if tick <= ZERO:
+        return price
+    steps = price / tick
+    rounding = ROUND_FLOOR if side == "BUY" else ROUND_CEILING
+    snapped = steps.to_integral_value(rounding=rounding) * tick
+    if side == "BUY":
+        snapped = min(snapped, ONE - tick)
+        return snapped if snapped >= tick else None
+    snapped = max(snapped, tick)
+    return snapped if snapped <= ONE - tick else None
 
 
 class PaperExecutor:
@@ -140,7 +165,11 @@ class LiveExecutor:
                 cap=str(self.settings.live_max_order_usdc),
             )
             return rejected("live_order_cap_exceeded")
-        limit = min(price_range.maximum, reference_price + slippage_price)
+        limit = snap_limit(
+            min(price_range.maximum, reference_price + slippage_price), book.tick_size, "BUY"
+        )
+        if limit is None:
+            return rejected("live_price_outside_tick_grid")
         order = await self.trader.buy(token_id, budget, limit, neg_risk=book.neg_risk or None)
         return self._fill(order, "BUY", token_id, budget)
 
@@ -166,7 +195,9 @@ class LiveExecutor:
         )
         if preflight.shares <= 0:
             return preflight
-        limit = max(Decimal("0.001"), reference_price - slippage_price)
+        limit = snap_limit(max(ZERO, reference_price - slippage_price), book.tick_size, "SELL")
+        if limit is None:
+            return rejected("live_price_outside_tick_grid")
         order = await self.trader.sell(token_id, shares, limit, neg_risk=book.neg_risk or None)
         return self._fill(order, "SELL", token_id, shares)
 

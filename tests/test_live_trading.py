@@ -17,7 +17,7 @@ from test_sizing import copy as copy_trade
 from test_sizing import sizing_rig as _sizing_rig
 
 from app.config import Settings
-from app.executor import LiveExecutor
+from app.executor import LiveExecutor, snap_limit
 from app.live import LiveOrder, LivePosition, LiveTrader
 from app.live_state import LiveState, Snapshot, utc_day
 from app.models import Account, CopyTrade, DailyRisk, PaperOrder, Position
@@ -528,6 +528,50 @@ async def test_an_unconfirmed_order_is_not_recorded_as_a_fill():
     assert fill.shares == D(0)
     assert fill.reason == "live_unconfirmed:0xabc"
     assert state.snapshot.spent_since == D(0)
+
+
+@pytest.mark.parametrize(
+    "price, tick, side, expected",
+    [
+        ("0.487", "0.01", "BUY", D("0.48")),  # never above what slippage allows
+        ("0.55", "0.01", "BUY", D("0.55")),
+        ("0.4875", "0.001", "BUY", D("0.487")),
+        ("0.995", "0.01", "BUY", D("0.99")),  # a dollar is not a tradeable price
+        ("0.005", "0.01", "BUY", None),  # no valid price this low exists
+        ("0.432", "0.01", "SELL", D("0.44")),  # never below our floor
+        ("0.005", "0.01", "SELL", D("0.01")),
+        ("0.999", "0.01", "SELL", None),
+    ],
+)
+def test_a_price_limit_lands_on_the_tick_grid_without_breaking_its_promise(
+    price, tick, side, expected
+):
+    assert snap_limit(D(price), D(tick), side) == expected
+
+
+async def test_an_off_grid_slippage_limit_is_rounded_in_our_favour():
+    trader = FakeTrader()
+    executor = LiveExecutor(trader, live_settings(), None)
+    book = Book(
+        bids=[(D("0.43"), D(1000))],
+        asks=[(D("0.44"), D(1000))],
+        tick_size=D("0.01"),
+        min_order_size=D(1),
+        neg_risk=False,
+    )
+
+    await executor.buy(
+        book=book,
+        token_id="token",
+        budget=D(5),
+        fee_rate=D(0),
+        reference_price=D("0.437"),
+        slippage_price=D("0.05"),
+    )
+
+    # 0.437 + 0.05 = 0.487, which is not a price the exchange quotes. The
+    # signing client would round it to 0.49, above what we allowed.
+    assert trader.sent == [("BUY", "token", D(5), D("0.48"))]
 
 
 # --------------------------------------------------------- the engine, live
