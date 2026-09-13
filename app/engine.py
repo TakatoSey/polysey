@@ -17,10 +17,12 @@ from sqlalchemy.exc import IntegrityError
 from .accounting import Holding, inventory
 from .config import Settings
 from .db import SessionLocal
+from .executor import PaperExecutor
 from .links import market_link
 from .models import (
     BuyIntent,
     CopyTrade,
+    DailyRisk,
     ExitIntent,
     Leader,
     LeaderPosition,
@@ -33,7 +35,6 @@ from .models import (
     SourceObservation,
     SourceReceipt,
 )
-from .paper import execute_buy_fak_by_budget, execute_fak
 from .polymarket import Book, LeaderActivity, PolymarketClient, copy_event_key, receipt_keys
 from .price_limits import DEFAULT_RANGE, PriceRange, leader_price_range
 from .priority import PriorityLock
@@ -76,11 +77,22 @@ class CopyEngine:
         "entry_price_drop",
         "buy_price_out_of_range",
         "market_not_accepting_orders",
+        # Live mode refuses to size an entry from numbers it cannot vouch for.
+        # The signal stays eligible: the state is expected back within seconds.
+        "live_state_unavailable",
+        "live_state_stale",
+        "live_ledger_drift",
     }
 
-    def __init__(self, settings: Settings, client: PolymarketClient):
+    def __init__(
+        self, settings: Settings, client: PolymarketClient, executor=None, live_state=None
+    ):
         self.settings = settings
         self.client = client
+        # Paper simulates the fill; live sends the order and records what the
+        # exchange reports. Everything after the fill is identical.
+        self.executor = executor or PaperExecutor()
+        self.live_state = live_state
         self.stop_event = asyncio.Event()
         self.notifications: asyncio.Queue[str] = asyncio.Queue(maxsize=1000)
         # Network preparation is concurrent; all portfolio mutations remain serialized.
@@ -103,6 +115,8 @@ class CopyEngine:
         # Only for a leader whose own activity request failed: (next_try, failures).
         self._leader_poll_retry: dict[int, tuple[float, int]] = {}
         self._logged_poll_rate: int | None = None
+        self._drift_reported_at = 0.0
+        self._daily_stop_reported = ""
         self.tracked_addresses: set[str] = set()
 
     async def notify(self, message: str) -> None:
@@ -207,21 +221,28 @@ class CopyEngine:
         )
 
     @staticmethod
-    def calculate_own_buy_capacity(account, settings: Settings, fee_rate: Decimal) -> Decimal:
+    def calculate_own_buy_capacity(
+        account, settings: Settings, fee_rate: Decimal, ceiling: Decimal | None = None
+    ) -> Decimal:
         cash_budget = account.paper_balance / (Decimal(1) + fee_rate)
         return min(
             cash_budget,
-            account.max_trade_size,
+            account.max_trade_size if ceiling is None else ceiling,
             account.trade_size,
             cash_budget * settings.copy_balance_pct,
         )
 
     @classmethod
     def calculate_buy_budget(
-        cls, account, settings: Settings, leader_notional: Decimal, fee_rate: Decimal
+        cls,
+        account,
+        settings: Settings,
+        leader_notional: Decimal,
+        fee_rate: Decimal,
+        ceiling: Decimal | None = None,
     ):
         """Size from our cash first, using leader notional as a soft proportional ceiling."""
-        own_budget = cls.calculate_own_buy_capacity(account, settings, fee_rate)
+        own_budget = cls.calculate_own_buy_capacity(account, settings, fee_rate, ceiling)
         if leader_notional <= 0 or own_budget < settings.min_copy_notional:
             return max(Decimal(0), min(own_budget, leader_notional))
         proportional = leader_notional * settings.leader_order_scale
@@ -334,6 +355,14 @@ class CopyEngine:
             ),
             asyncio.create_task(self._repeat(self.retry_buys_once, 0.5)),
         ]
+        if self.live_state is not None:
+            loops.append(
+                asyncio.create_task(
+                    self._repeat(
+                        self.sync_live_state_once, self.settings.live_state_refresh_seconds
+                    )
+                )
+            )
         try:
             await asyncio.gather(*loops)
         finally:
@@ -937,6 +966,11 @@ class CopyEngine:
 
                 book_task = asyncio.create_task(fetch_book())
                 tasks = [market_task, fee_task, book_task]
+                prewarm = getattr(self.executor, "prewarm", None)
+                if prewarm is not None:
+                    # Runs inside the wait we already pay for, so a first order
+                    # on a new market still costs a single request.
+                    tasks.append(asyncio.create_task(prewarm(event.token_id)))
                 results = await asyncio.gather(market_task, fee_task, return_exceptions=True)
                 market, fee_rate = results
                 for result in results:
@@ -1008,6 +1042,123 @@ class CopyEngine:
         reserve = equity * self.settings.min_cash_reserve_pct
         return max(Decimal(0), account.paper_balance - reserve)
 
+    def _tradeable(self, own: Holding, token_id: str) -> Holding:
+        """Our attributed shares, never more than the exchange says exist.
+
+        Attribution per leader is ours to keep; the total is the exchange's.
+        Asking to sell shares the exchange does not see is a rejected order at
+        best, so the smaller of the two is what may be sold.
+        """
+        if self.live_state is None or not self.live_state.snapshot.read_ok:
+            return own
+        available = self.live_state.snapshot.shares_now(token_id)
+        if own.shares <= available:
+            return own
+        log.warning(
+            "live_shares_below_ledger",
+            token_id=token_id,
+            ledger=str(own.shares),
+            exchange=str(available),
+        )
+        share = available / own.shares if own.shares > 0 else Decimal(0)
+        return Holding(shares=available, cost=own.cost * share, realized=own.realized)
+
+    async def _live_entry_block(self, session, account) -> str | None:
+        """Why a live entry must not be sized now, if it must not.
+
+        Exits, stops and payouts are never blocked here: declining to reduce a
+        real position is worse than acting on a slightly stale number.
+        """
+        if self.live_state is None:
+            return None
+        block = self.live_state.entry_block(account.paper_balance)
+        if block:
+            return block
+        return await self._daily_loss_block(session, account)
+
+    async def _daily_loss_block(self, session, account) -> str | None:
+        """Stop opening new entries once the day's realized loss hits the cap."""
+        day = datetime.now(UTC).date().isoformat()
+        risk = await session.get(DailyRisk, day)
+        if risk is None:
+            risk = DailyRisk(day=day, realized_at_start=account.realized_pnl, stopped=False)
+            session.add(risk)
+            await session.flush()
+        loss = risk.realized_at_start - account.realized_pnl
+        if loss < self.settings.live_max_daily_loss_usdc:
+            return None
+        if not risk.stopped:
+            risk.stopped = True
+            log.error(
+                "live_daily_loss_stop",
+                day=day,
+                loss=str(loss),
+                cap=str(self.settings.live_max_daily_loss_usdc),
+            )
+        if self._daily_stop_reported != day:
+            self._daily_stop_reported = day
+            session.info.setdefault("notifications", []).append(
+                "⛔ <b>Дневной лимит убытка достигнут</b>\n\n"
+                f"Реализованный убыток за сутки: <b>${loss:.2f}</b> "
+                f"(лимит ${self.settings.live_max_daily_loss_usdc:.2f}).\n"
+                "Новые покупки остановлены до следующих UTC-суток. "
+                "Продажи, стопы и выплаты продолжают работать."
+            )
+        return "live_daily_loss_stop"
+
+    async def sync_live_state_once(self) -> None:
+        """Make the ledger's cash the exchange's cash, and report divergence.
+
+        The exchange is the authority on money. Our own fills are a projection
+        onto its last reading, and this is where that projection is replaced.
+        """
+        if self.live_state is None:
+            return
+        snapshot = self.live_state.snapshot
+        if not snapshot.read_ok:
+            return
+        messages = []
+        async with self._ledger_lock.hold(0), SessionLocal() as session:
+            account = await get_or_create_account(session, self.settings.paper_initial_balance)
+            ledger_cash = account.paper_balance
+            account.paper_balance = snapshot.cash_now
+            rows = list((await session.scalars(select(Position).where(Position.shares > 0))).all())
+            shares_drift = [
+                (row.token_id, row.shares, snapshot.shares_now(row.token_id))
+                for row in rows
+                if (row.shares - snapshot.shares_now(row.token_id)).copy_abs() > Decimal("0.01")
+            ]
+            cash_drift = (ledger_cash - snapshot.cash_now).copy_abs()
+            await session.commit()
+        for token_id, ours, theirs in shares_drift:
+            log.warning(
+                "live_share_drift", token_id=token_id, ledger=str(ours), exchange=str(theirs)
+            )
+        if cash_drift > self.settings.live_drift_tolerance_usdc:
+            log.warning(
+                "live_cash_drift",
+                ledger=str(ledger_cash),
+                exchange=str(snapshot.cash_now),
+                tolerance=str(self.settings.live_drift_tolerance_usdc),
+            )
+        if (shares_drift or cash_drift > self.settings.live_drift_tolerance_usdc) and (
+            time.monotonic() - self._drift_reported_at > 300
+        ):
+            self._drift_reported_at = time.monotonic()
+            detail = "\n".join(
+                f"• {token_id[:12]}…: у нас {ours:.2f}, на бирже {theirs:.2f}"
+                for token_id, ours, theirs in shares_drift[:5]
+            )
+            messages.append(
+                "⚠️ <b>Расхождение с биржей</b>\n\n"
+                f"Кэш: наш учёт ${ledger_cash:.2f}, биржа ${snapshot.cash_now:.2f}\n"
+                + (f"{detail}\n" if detail else "")
+                + "Новые покупки приостановлены, пока расхождение не сойдётся. "
+                "Продажи и выплаты продолжают работать."
+            )
+        for message in messages:
+            await self.notify(message)
+
     def _entry_decision(
         self,
         entry,
@@ -1033,7 +1184,7 @@ class CopyEngine:
             event_price=event_price,
             cash=cash,
             exposure_room=self.exposure_room(exposure),
-            current_max=account.max_trade_size,
+            current_max=self.order_ceiling(account),
             fee_rate=fee_rate,
             slippage_price=policy.slippage_price,
             min_notional=self.settings.min_copy_notional,
@@ -1056,6 +1207,12 @@ class CopyEngine:
             )
         ).first()
         return (row[0], row[1]) if row else ("", "")
+
+    def order_ceiling(self, account) -> Decimal:
+        """Largest all-in budget one entry may reach in the current mode."""
+        if self.executor.live:
+            return min(account.max_trade_size, self.settings.live_max_order_usdc)
+        return account.max_trade_size
 
     def exposure_room(self, exposure: Decimal) -> Decimal:
         return max(Decimal(0), self.settings.max_outcome_exposure - exposure)
@@ -1379,6 +1536,8 @@ class CopyEngine:
         pending_exit = await session.get(ExitIntent, (leader.id, event.token_id))
         if pending_exit and pending_exit.remaining > 0:
             signal_reason = "exit_pending"
+        elif not signal_reason:
+            signal_reason = await self._live_entry_block(session, account)
         if signal_reason:
             copy_trade.status, copy_trade.skip_reason = "skipped", signal_reason
             self.record_rejection(session, copy_trade, event, signal_reason)
@@ -1430,12 +1589,15 @@ class CopyEngine:
             # the taker fee so apply_fill cannot reject a fill after consuming
             # the whole available balance on notional alone.
             leader_notional = event.size * event.price
+            ceiling = self.order_ceiling(account)
             buy_budget = self.calculate_buy_budget(
-                account, self.settings, leader_notional, fee_rate
+                account, self.settings, leader_notional, fee_rate, ceiling
             )
             existing = await get_position(session, event.token_id)
             existing_exposure = existing.cost_basis if existing else Decimal(0)
-            base_capacity = self.calculate_own_buy_capacity(account, self.settings, fee_rate)
+            base_capacity = self.calculate_own_buy_capacity(
+                account, self.settings, fee_rate, ceiling
+            )
             own_capacity = min(
                 base_capacity,
                 deployable,
@@ -1576,20 +1738,21 @@ class CopyEngine:
                     return
                 if time.monotonic() - prepared.book_at > 0.25:
                     raise ValueError("execution_book_expired")
-                fill = execute_buy_fak_by_budget(
-                    book,
-                    buy_budget,
-                    fee_rate,
+                fill = await self.executor.buy(
+                    book=book,
+                    token_id=event.token_id,
+                    budget=buy_budget,
+                    fee_rate=fee_rate,
                     reference_price=decision.reference_price if decision else event.price,
                     slippage_price=policy.slippage_price,
                     price_range=price_range,
                 )
             else:
-                fill = execute_fak(
-                    book,
-                    event.side,
-                    target_shares,
-                    fee_rate,
+                fill = await self.executor.sell(
+                    book=book,
+                    token_id=event.token_id,
+                    shares=target_shares,
+                    fee_rate=fee_rate,
                     reference_price=event.price,
                     slippage_price=policy.slippage_price,
                 )
@@ -1658,6 +1821,7 @@ class CopyEngine:
                 event.outcome,
                 event.condition_id,
                 account,
+                executed_elsewhere=self.executor.live,
             )
         except ValueError as exc:
             copy_trade.status = "skipped"
@@ -1740,6 +1904,7 @@ class CopyEngine:
         pos = await get_position(session, event.token_id)
         holdings, warnings = await inventory(session, event.token_id)
         own = holdings.get((event.token_id, leader.id), Holding())
+        own = self._tradeable(own, event.token_id)
         newer_buy = await session.scalar(
             select(CopyTrade.id)
             .join(PaperOrder)
@@ -1905,11 +2070,11 @@ class CopyEngine:
                     return
                 shares_before = position.shares
                 policy = await get_execution_policy(session, self.settings)
-                fill = execute_fak(
-                    book,
-                    "SELL",
-                    requested_shares,
-                    prepared.fee_rate,
+                fill = await self.executor.sell(
+                    book=book,
+                    token_id=token_id,
+                    shares=requested_shares,
+                    fee_rate=prepared.fee_rate,
                     reference_price=event.price,
                     slippage_price=policy.slippage_price,
                 )
@@ -2152,6 +2317,11 @@ class CopyEngine:
                 return
             book = prepared.book
             price_range = self._remember_price_range(leader)
+            blocked = await self._live_entry_block(session, account)
+            if blocked:
+                self._delay_buy_intent(intent, blocked)
+                await session.commit()
+                return
             policy = await get_execution_policy(session, self.settings)
             position = await get_position(session, intent.token_id)
             exposure = position.cost_basis if position else Decimal(0)
@@ -2197,25 +2367,28 @@ class CopyEngine:
                 budget = decision.order_budget
                 reference = decision.reference_price
             else:
+                ceiling = self.order_ceiling(account)
                 capacity = self.calculate_own_buy_capacity(
-                    account, self.settings, prepared.fee_rate
+                    account, self.settings, prepared.fee_rate, ceiling
                 )
                 budget = self.calculate_buy_budget(
                     account,
                     self.settings,
                     intent.leader_size * intent.leader_price,
                     prepared.fee_rate,
+                    ceiling,
                 )
                 budget = min(budget, self.exposure_room(exposure))
                 budget = self.ensure_book_minimum_budget(
                     budget, capacity, book, intent.leader_price, policy.slippage_price
                 )
                 reference = intent.leader_price
-            fill = execute_buy_fak_by_budget(
-                book,
-                budget,
-                prepared.fee_rate,
-                reference,
+            fill = await self.executor.buy(
+                book=book,
+                token_id=intent.token_id,
+                budget=budget,
+                fee_rate=prepared.fee_rate,
+                reference_price=reference,
                 slippage_price=policy.slippage_price,
                 price_range=price_range,
             )
@@ -2237,6 +2410,7 @@ class CopyEngine:
                 intent.outcome,
                 intent.condition_id,
                 account,
+                executed_elsewhere=self.executor.live,
             )
             session.add(
                 PaperOrder(
@@ -2360,6 +2534,7 @@ class CopyEngine:
         pos = await get_position(session, intent.token_id)
         holdings, warnings = await inventory(session, intent.token_id)
         own = holdings.get((intent.token_id, intent.leader_id), Holding())
+        own = self._tradeable(own, intent.token_id)
         if not pos or pos.id != intent.position_id or own.shares <= Decimal("0.00000001"):
             intent.remaining, intent.last_reason = 0, "position_closed"
             await finish_exit_signals(
@@ -2374,11 +2549,11 @@ class CopyEngine:
             intent.last_reason = "exit_book_expired"
         else:
             target = min(intent.remaining, own.shares, pos.shares)
-            fill = execute_fak(
-                prepared.book,
-                "SELL",
-                target,
-                prepared.fee_rate,
+            fill = await self.executor.sell(
+                book=prepared.book,
+                token_id=pos.token_id,
+                shares=target,
+                fee_rate=prepared.fee_rate,
                 reference_price=intent.min_price,
                 slippage_price=Decimal(0),
             )
@@ -2477,7 +2652,20 @@ class CopyEngine:
                     slug,
                     event_slug,
                 )
-                account.paper_balance += proceeds
+                if not self.executor.live:
+                    account.paper_balance += proceeds
+                else:
+                    # Redemption happens on-chain, outside this bot. Crediting
+                    # it here would invent money the wallet may not hold yet;
+                    # the next exchange read shows what actually arrived.
+                    self.live_state and self.live_state.invalidate()
+                    log.info(
+                        "live_settlement_recorded",
+                        token_id=position.token_id,
+                        payout=str(payout),
+                        shares=str(position.shares),
+                        note="cash comes from redemption on Polymarket",
+                    )
                 account.realized_pnl += pnl
                 await finish_exit_signals(session, position.token_id, reason="market_settled")
                 await session.execute(
