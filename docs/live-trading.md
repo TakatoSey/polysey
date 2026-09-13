@@ -77,8 +77,20 @@
 
 Paper у тебя уже работает — его трогать не нужно. Live ставится **вторым
 экземпляром**: своя папка, своя база, свой Telegram-бот. Так paper продолжает
-собирать статистику по лидерам, а живой бот не делит с ним ни деньги, ни
-учёт, ни ограничение «один процесс на базу».
+собирать статистику по лидерам, а живой бот не делит с ним ни деньги, ни учёт.
+
+Это не просто рекомендация — бот сам не даст перепутать:
+
+- **свой токен.** На старте бот проверяет, что этим токеном больше никто не
+  опрашивает Telegram, и отказывается запускаться при конфликте. Без этой
+  проверки aiogram молча ретраит 409 бесконечно, а два процесса на одном токене
+  воруют друг у друга апдейты — панель отвечает через раз. В логе видно, кто
+  запустился: `telegram_bot_identity username=... mode=...`;
+- **своя база.** При первом запуске база помечается режимом (`paper`/`live`) и,
+  для live, адресом кошелька. Live-бот, направленный на базу paper-бота с
+  историей, откажется стартовать с понятным сообщением; то же при попытке
+  открыть live-базу другим кошельком. Сменить режим можно только на пустой базе
+  — там нечего смешивать.
 
 ```bash
 # на VPS, рядом с существующей установкой (обычно ~/polycopy)
@@ -88,8 +100,9 @@ cd polylive
 cp .env.example .env
 ```
 
-Новый бот в Telegram: @BotFather → `/newbot` → токен. Свой токен для live —
-это ещё и способ не путать сообщения paper и live в одном чате.
+Новый бот в Telegram: @BotFather → `/newbot` → токен. Это обязательно: тот же
+токен второй процесс использовать не сможет. Заодно сообщения paper и live
+окажутся в разных чатах, а не в одном.
 
 `.env` для live (остальное можно оставить как в paper):
 
@@ -97,8 +110,12 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=<токен нового бота>
 TELEGRAM_ALLOWED_USER_ID=<твой numeric id, тот же>
 
-# ВАЖНО: своя база, а не база paper-бота
-DATABASE_URL=postgresql+asyncpg://polycopy:polycopy@db:5432/polycopy
+# ВАЖНО: своя база, а не база paper-бота. Имя базы задаётся здесь же и
+# подставляется в docker-compose, поэтому меняются все четыре строки вместе.
+DATABASE_URL=postgresql+asyncpg://polylive:polylive@db:5432/polylive
+POSTGRES_DB=polylive
+POSTGRES_USER=polylive
+POSTGRES_PASSWORD=<придумай пароль>
 
 TRADING_MODE=live
 LIVE_CONFIRM=I_UNDERSTAND_REAL_MONEY
@@ -129,8 +146,18 @@ docker compose -p polylive up -d --build
 ```
 
 `-p polylive` даёт свои контейнеры (`polylive-bot-1`, `polylive-db-1`) и свой
-том Postgres. Проверь, что paper остался на месте: `docker compose -p polycopy ps`
-(или `docker ps` — там должны быть контейнеры обоих проектов).
+том Postgres, а `POSTGRES_*` из `.env` — своё имя базы внутри него. Проверь, что
+paper остался на месте: `docker compose -p polycopy ps` (или `docker ps` — там
+должны быть контейнеры обоих проектов).
+
+В логе первого запуска live-бота должно быть три строки, подтверждающие
+разделение:
+
+```
+database_claim        trading_mode=live funder=0x...
+telegram_bot_identity username=polyliveBot mode=🔴 LIVE · dry-run
+trading_mode          mode=live note=REAL money orders are enabled
+```
 
 Права на `.env`: `chmod 600 .env`. В нём приватный ключ.
 

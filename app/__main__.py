@@ -13,7 +13,13 @@ from .live import LiveTrader, LiveTradingUnavailable
 from .live_state import LiveState
 from .logging import configure_logging
 from .polymarket import PolymarketClient
-from .repository import add_leader, get_leader, get_or_create_account, initialize_execution
+from .repository import (
+    add_leader,
+    claim_database,
+    get_leader,
+    get_or_create_account,
+    initialize_execution,
+)
 from .rtds import RTDSTradeStream
 
 log = structlog.get_logger(__name__)
@@ -87,6 +93,15 @@ async def start_live(settings, client):
 async def run_bot(settings) -> None:
     await init_db()
     async with SessionLocal() as session:
+        # Before anything reads or writes money: this database must belong to
+        # this mode and this wallet.
+        claim = await claim_database(session, settings)
+        log.info(
+            "database_claim",
+            trading_mode=claim.trading_mode,
+            funder=claim.funder or None,
+            claimed_at=str(claim.claimed_at),
+        )
         # Initialize defaults before either the Telegram or trading loops start.
         # Existing account limits are intentionally preserved.
         await get_or_create_account(session, settings.paper_initial_balance, settings=settings)
@@ -113,6 +128,8 @@ async def run_bot(settings) -> None:
     if rtds:
         await rtds.start()
     telegram = TelegramApp(settings, engine)
+    # Identity and exclusivity of the Telegram token before any worker starts.
+    await telegram.verify_identity()
     stopping = asyncio.Event()
     install_stop_handlers(stopping)
     workers = {
