@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from typing import NamedTuple
 
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -246,11 +247,45 @@ async def positions(session: AsyncSession) -> list[Position]:
     )
 
 
-async def orders(session: AsyncSession) -> list[PaperOrder]:
-    return list(
+# What each history filter selects, in one place for the screen and the query.
+ORDER_FILTERS: dict[str, tuple[str, ...]] = {
+    "done": ("filled", "partial"),
+    "skip": ("rejected",),
+    "settled": ("settled",),
+}
+
+
+class OrderPage(NamedTuple):
+    rows: list[PaperOrder]
+    page: int
+    pages: int
+    total: int
+
+
+async def orders_page(
+    session: AsyncSession, *, status_filter: str = "all", page: int = 0, per_page: int = 8
+) -> OrderPage:
+    """One page of history, counted over the whole table rather than a window.
+
+    Paging inside the newest 30 rows made everything older unreachable from
+    Telegram and reported a page count for those 30, not for the history.
+    """
+    statuses = ORDER_FILTERS.get(status_filter)
+    condition = PaperOrder.status.in_(statuses) if statuses else None
+    counted = select(func.count()).select_from(PaperOrder)
+    listed = select(PaperOrder)
+    if condition is not None:
+        counted, listed = counted.where(condition), listed.where(condition)
+    total = int(await session.scalar(counted) or 0)
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    rows = list(
         (
             await session.scalars(
-                select(PaperOrder).order_by(PaperOrder.created_at.desc()).limit(30)
+                listed.order_by(PaperOrder.created_at.desc(), PaperOrder.id.desc())
+                .limit(per_page)
+                .offset(page * per_page)
             )
         ).all()
     )
+    return OrderPage(rows, page, pages, total)

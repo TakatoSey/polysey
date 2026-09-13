@@ -52,7 +52,7 @@ from .repository import (
     get_execution_policy,
     get_leaders,
     get_or_create_account,
-    orders,
+    orders_page,
     positions,
     remove_leader,
 )
@@ -661,8 +661,20 @@ class TelegramApp:
             ]
         )
 
-    async def _orders_text_v2(self, page: int = 0, status_filter: str = "all") -> str:
+    async def _orders_screen(self, page: int = 0, status_filter: str = "all"):
+        """Text and keyboard from one read, over the whole history."""
         async with SessionLocal() as session:
+            history = await orders_page(session, status_filter=status_filter, page=page)
+        return (
+            await self._orders_text_v2(history.page, status_filter, history),
+            self._orders_keyboard_v2(history.page, status_filter, history.pages),
+        )
+
+    async def _orders_text_v2(self, page: int = 0, status_filter: str = "all", history=None) -> str:
+        async with SessionLocal() as session:
+            if history is None:
+                history = await orders_page(session, status_filter=status_filter, page=page)
+            page, total_pages, rows = history.page, history.pages, history.rows
             pending = list(
                 (
                     await session.execute(
@@ -674,7 +686,6 @@ class TelegramApp:
                     )
                 ).all()
             )
-            rows: list[PaperOrder] = await orders(session)
             # One bounded lookup; source metadata survives settlement/deletion.
             metadata = {}
             token_ids = {row.token_id for row in rows}
@@ -714,16 +725,7 @@ class TelegramApp:
                 else []
             )
         trades_by_id = {trade.id: trade for trade in trades}
-        mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
-        filtered = [
-            r
-            for r in rows
-            if status_filter == "all" or r.status in mapping.get(status_filter, set())
-        ]
-        per_page = 8
-        total_pages = max(1, (len(filtered) + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        current = filtered[page * per_page : (page + 1) * per_page]
+        current = rows
         labels = {
             "filled": "исполнен",
             "partial": "частично",
@@ -799,7 +801,7 @@ class TelegramApp:
                     + (" · комиссия по оценке" if row.fee_estimated else "")
                 )
         if total_pages > 1:
-            lines.append(f"\nСтраница {page + 1}/{total_pages}")
+            lines.append(f"\nСтраница {page + 1}/{total_pages} · всего {history.total}")
         return "\n".join(lines)
 
     async def _stats_text(self, hours: int = 24) -> str:
@@ -854,16 +856,7 @@ class TelegramApp:
             )
         return "\n".join(lines)
 
-    async def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all"):
-        async with SessionLocal() as session:
-            rows = await orders(session)
-        mapping = {"done": {"filled", "partial"}, "skip": {"rejected"}, "settled": {"settled"}}
-        filtered_count = sum(
-            1
-            for r in rows
-            if status_filter == "all" or r.status in mapping.get(status_filter, set())
-        )
-        total_pages = max(1, (filtered_count + 7) // 8)
+    def _orders_keyboard_v2(self, page: int = 0, status_filter: str = "all", total_pages: int = 1):
         builder = InlineKeyboardBuilder()
         for label, key in [
             ("Все", "all"),
@@ -1033,11 +1026,8 @@ class TelegramApp:
         if not self._allowed(message):
             return
         await self._delete_input(message)
-        await self._edit_panel(
-            await self._orders_text_v2(0, "all"),
-            await self._orders_keyboard_v2(0, "all"),
-            message.chat.id,
-        )
+        text, keyboard = await self._orders_screen(0, "all")
+        await self._edit_panel(text, keyboard, message.chat.id)
 
     async def settings_cmd(self, message: Message) -> None:
         if not self._allowed(message):
@@ -1437,11 +1427,8 @@ class TelegramApp:
             parts = data.split(":")
             page = int(parts[1]) if len(parts) > 1 and parts[1] else 0
             status_filter = parts[2] if len(parts) > 2 else "all"
-            await self._edit_panel(
-                await self._orders_text_v2(page, status_filter),
-                await self._orders_keyboard_v2(page, status_filter),
-                chat_id,
-            )
+            text, keyboard = await self._orders_screen(page, status_filter)
+            await self._edit_panel(text, keyboard, chat_id)
         elif data.startswith("position:"):
             _, raw_id, raw_page = data.split(":")
             builder = InlineKeyboardBuilder()

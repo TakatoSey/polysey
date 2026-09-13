@@ -114,6 +114,7 @@ async def admin_rig(tmp_path, monkeypatch):
         min_copy_notional=D("1.10"),
         max_outcome_exposure=D(50),
         min_cash_reserve_pct=D("0.25"),
+        exit_retry_enabled=True,
     )
     engine = CopyEngine(Settings(_env_file=None), SimpleNamespace())
     # State a wiped database can no longer explain, as a live bot would hold it.
@@ -365,3 +366,72 @@ async def test_stats_flag_fills_whose_fee_was_only_an_estimate(admin_rig):
 
     # One of the two fills paid a fee we estimated ourselves.
     assert "Комиссия по оценке: 1 из 2" in text
+
+
+async def seed_history(sessions, count, rejected=()):
+    """Orders older than the former 30-row window, newest last."""
+    from datetime import UTC, datetime, timedelta
+
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    async with sessions() as session:
+        for index in range(1, count + 1):
+            session.add(
+                PaperOrder(
+                    id=index + 1,
+                    copy_trade_id=1,
+                    token_id="token",
+                    side="BUY",
+                    requested_shares=D(index),
+                    filled_shares=D(0) if index in rejected else D(index),
+                    average_fill_price=D("0.5"),
+                    fee=D(0),
+                    status="rejected" if index in rejected else "filled",
+                    reason="no_liquidity" if index in rejected else None,
+                    created_at=base + timedelta(minutes=index),
+                )
+            )
+        await session.commit()
+
+
+async def test_history_pages_over_everything_stored_not_the_newest_thirty(admin_rig):
+    await seed_history(admin_rig.sessions, 39)
+
+    text, keyboard = await admin_rig.app._orders_screen(0, "all")
+
+    # 40 orders in total: the rig's own plus the 39 seeded.
+    assert "Страница 1/5 · всего 40" in text
+    # Eight rows: the rig's own order plus seeded 39 down to 33.
+    assert "39.00 shares" in text and "33.00 shares" in text
+    assert "32.00 shares" not in text
+    pages = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data.startswith("orders:")
+    ]
+    assert "orders:1:all" in pages
+
+    # The oldest order used to be unreachable from Telegram entirely.
+    last_page, _keyboard = await admin_rig.app._orders_screen(4, "all")
+    assert "Страница 5/5" in last_page
+    assert "1.00 shares" in last_page
+
+
+async def test_a_page_beyond_the_end_clamps_instead_of_showing_nothing(admin_rig):
+    await seed_history(admin_rig.sessions, 9)
+
+    text, _keyboard = await admin_rig.app._orders_screen(99, "all")
+
+    assert "Страница 2/2" in text
+    assert "Записей нет." not in text
+
+
+async def test_the_filter_counts_pages_over_that_filter_only(admin_rig):
+    await seed_history(admin_rig.sessions, 20, rejected=(3, 7, 11))
+
+    skipped, _keyboard = await admin_rig.app._orders_screen(0, "skip")
+    filled, _keyboard = await admin_rig.app._orders_screen(0, "done")
+
+    assert "Страница" not in skipped  # three rejections fit on one page
+    assert skipped.count("Причина") == 3
+    assert "Страница 1/3 · всего 18" in filled
